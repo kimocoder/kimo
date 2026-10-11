@@ -99,101 +99,72 @@ ${C_YELLOW}Usage:${C_RESET}
   ${0##*/} [options] <command> [arguments...]
 
 ${C_YELLOW}Global Options:${C_RESET}
-  --remote                 Connect to remote server (${REMOTE_TUNNEL_URL} tunnel -> 192.168.1.131; \$OLLAMA_REMOTE_URL overrides)
-  --local                  Connect strictly to local daemon (${LOCAL_HOST_URL}; \$OLLAMA_LOCAL_URL overrides)
-  --host <address>         Specify a custom Ollama host (e.g. 127.0.0.1:11438)
-                           Combine with --local to set the local daemon address (--local --host 127.0.0.1:11436),
-                           or with --remote to set the remote address. --local --remote targets both.
-                           Repeat --host to target several hosts: check/hosts/ps/list/search/stop/info query all,
-                           model commands (run/warm/rm/tag/launch...) go to the first host that has the model.
-  --json                   Output responses in structured JSON format
-  --no-color               Disable colored terminal output
-  -h, --help               Show this help message
+  ${C_CYAN}--remote${C_RESET}                     Route to remote server (${REMOTE_TUNNEL_URL} tunnel -> 192.168.1.131)
+  ${C_CYAN}--local${C_RESET}                      Route strictly to local daemon (${LOCAL_HOST_URL})
+  ${C_CYAN}--host <address>${C_RESET}             Specify custom Ollama host (repeatable for multi-host routing)
+  ${C_CYAN}--json${C_RESET}                       Output responses in structured JSON format
+  ${C_CYAN}--no-color${C_RESET}                   Disable colored terminal output
+  ${C_CYAN}-h, --help${C_RESET}                   Show this help message
 
-${C_YELLOW}Commands:${C_RESET}
-  ${C_CYAN}list [filter]${C_RESET}            List all installed models (local & remote). Highlights active VRAM models.
-  ${C_CYAN}search <keyword>${C_RESET}         Keyword search across local & remote catalogs (name/params/capabilities); marks pinned/tuned.
-  ${C_CYAN}ps${C_RESET}                    Display all models currently resident in GPU/CPU VRAM with memory stats.
-  ${C_CYAN}status, health${C_RESET}       Snapshot: tunnel, remote API, VRAM residency, keepalive timer, public endpoint.
-  ${C_CYAN}status-report${C_RESET}        Append the status snapshot to /var/log/ollama-status-report.log.
-  ${C_CYAN}logs [tunnel|keepalive|timer|apache|all]${C_RESET}  Show recent journald output for the ops services.
-  ${C_CYAN}rotate-token${C_RESET}         Generate a new public API token, regenerate the proxy conf, reload Apache (backup in ollama-api.token.bk).
-  ${C_CYAN}stop, unload [model|all]${C_RESET} Free GPU VRAM immediately by unloading active models (keep_alive: 0).
-  ${C_CYAN}warm, preload <model> [dur]${C_RESET} Pre-warm model into GPU VRAM (keep_alive: 24h) to eliminate cold-start.
-  ${C_CYAN}check, ping${C_RESET}              Run connectivity, latency, and health check for local and remote hosts.
-  ${C_CYAN}hosts${C_RESET}                    One row per server: host, port, state, version, models, disk GB, source.
-                           ssh -L tunnels are merged with the server they reach; no --host = discover.
-  ${C_CYAN}info, show <model>${C_RESET}       Display detailed metadata (parameters, context, quant, capabilities).
-  ${C_CYAN}tag, alias <src> <dst>${C_RESET}   Create a tag/alias for an existing model on target host.
-  ${C_CYAN}rm, delete <model>${C_RESET}       Delete a model from the local or remote Ollama server.
-  ${C_CYAN}stream <model> [opts]${C_RESET}  Pin remote model for durable availability (warm + keepalive; --pull for full local copy).
-                                ${C_CYAN}stream --status${C_RESET} (dashboard), ${C_CYAN}stream --test${C_RESET} (smoke probe), ${C_CYAN}stream --resident-only${C_RESET}.
-  ${C_CYAN}tune <model> [opts...]${C_RESET}  Bake per-model defaults (num_ctx, num_batch, num_predict, temp, num_gpu) into run/launch.
-                                  --target <name> also creates a tuned variant via /api/create; --show / --clear for the registry.
-  ${C_CYAN}bench, eval [model]${C_RESET}      Benchmark TTFT, generation tokens/sec throughput, and VRAM residency.
-  ${C_CYAN}run <model> [args...]${C_RESET}    Run an Ollama model directly (auto-connects to remote if remote-only).
-  ${C_CYAN}launch <cli> [opts...]${C_RESET}   Launch an external LLM CLI (claude, codex, qwen, grok, kimi, hermes, agy, etc.)
-                           with automatic Ollama routing and model override (--model <name>).
-                           agy speaks only the Gemini wire format, so a per-session shim is
-                           started on a free localhost port and its modelProvider setting is
-                           patched for the duration of the session, then restored on exit.
-                           grok takes no endpoint flag; its catalog and inference are aimed at
-                           the resolved host via GROK_MODELS_BASE_URL, so --model accepts real
-                           Ollama tags. A tuned num_ctx (tune --ctx) also becomes that model's
-                           context_window in config.toml for the session, reverted on exit.
-                           kimi (Kimi Code CLI) registers an additive, idempotent provider +
-                           model alias in ~/.kimi-code/config.toml for the resolved host (same
-                           pattern as its other custom providers; nothing is reverted on exit)
-                           and launches with -m <alias>. Tuned num_ctx (capped at the probed
-                           runtime num_ctx, so kimi's 85% auto-compaction always fires before
-                           Ollama would truncate history) becomes max_context_size; Ollama's
-                           reported
-                           capabilities (thinking/tools/vision) are mapped; thinking models
-                           declare support_efforts low..max + off_effort none, so the
-                           in-session /effort picker works and reaches the wire as
-                           reasoning_effort (Ollama's non-standard 'reasoning' field is mapped
-                           via reasoning_key). Overrides: KIMO_KIMI_EFFORT / OM_KIMI_EFFORT (default effort),
-                           KIMO_KIMI_EFFORTS / OM_KIMI_EFFORTS, KIMO_KIMI_CAPABILITIES / OM_KIMI_CAPABILITIES,
-                           KIMO_KIMI_REASONING_KEY / OM_KIMI_REASONING_KEY.
-                           Without python3-tomlkit it falls back to the KIMI_MODEL_* env
-                           channel: zero footprint, but /effort is limited to on/off and the
-                           graded effort must be set at launch via KIMO_KIMI_EFFORT=xhigh (or OM_KIMI_EFFORT).
+${C_YELLOW}Model & VRAM Management:${C_RESET}
+  ${C_CYAN}list, ls [filter]${C_RESET}            List installed models (local & remote) with VRAM indicators
+  ${C_CYAN}search, find <keyword>${C_RESET}       Search model catalogs across hosts (name, params, capabilities)
+  ${C_CYAN}ps${C_RESET}                           Display models actively resident in GPU/CPU VRAM with memory stats
+  ${C_CYAN}warm, preload <model> [dur]${C_RESET}  Pre-warm model into GPU VRAM (keep_alive: 24h) to avoid cold-starts
+  ${C_CYAN}stop, unload [model|all]${C_RESET}     Evict models from GPU VRAM immediately (keep_alive: 0)
+  ${C_CYAN}tune <model> [opts...]${C_RESET}       Bake runtime parameters (--ctx, --batch, --temp, --gpu) into registry
+  ${C_CYAN}bench, eval [model]${C_RESET}          Benchmark TTFT, generation throughput (tok/s), and memory usage
+  ${C_CYAN}info, show <model>${C_RESET}           Inspect model metadata, quantization, context size, and template
+  ${C_CYAN}tag, alias <src> <dst>${C_RESET}       Create a model tag or alias on target host
+  ${C_CYAN}rm, delete <model>${C_RESET}           Delete a model from local or remote Ollama server
+  ${C_CYAN}run <model> [args...]${C_RESET}        Run an Ollama model directly (auto-connects to remote if needed)
 
-  ${C_CYAN}install [cli|all|list]${C_RESET} Install external LLM CLIs (claude, kimi, grok, codex, qwen, opencode, openclaw, hermes).
-                           Without arguments, displays the external CLI inventory and installation status.
-                           Supports --update / -u to upgrade and --force / -f to reinstall.
-  ${C_CYAN}update [cli|all]${C_RESET}       Check for updates for all installed CLIs (when called without arguments).
-                           Specify a CLI name to update that CLI (e.g. ${0##*/} update kimi).
-                           Use --apply or 'all' to update all installed CLIs.
+${C_YELLOW}External LLM CLI Hub:${C_RESET}
+  ${C_CYAN}launch <cli> [opts...]${C_RESET}       Launch external agent CLI with automatic Ollama routing & shims
+  ${C_CYAN}install [cli|all|list]${C_RESET}       Install or inspect external LLM CLIs (--update, --force, --list)
+  ${C_CYAN}update [cli|all]${C_RESET}             Check upstream updates across present CLIs (or --apply to upgrade)
+
+${C_YELLOW}Cluster & Remote Operations:${C_RESET}
+  ${C_CYAN}check, ping${C_RESET}                  Probe connectivity, latency, and health across daemons & tunnels
+  ${C_CYAN}hosts${C_RESET}                        Inventory table of reachable servers, models, versions, and disks
+  ${C_CYAN}status, health${C_RESET}               Operational snapshot: tunnel, remote API, VRAM residency, timer
+  ${C_CYAN}stream <model> [opts]${C_RESET}        Pin remote model for durable availability via keepalive daemon
+                                (modes: --status, --test, --resident-only, --repair-all)
+
+${C_YELLOW}Maintenance & Logging:${C_RESET}
+  ${C_CYAN}logs [service|all]${C_RESET}           Show recent journald output (tunnel, keepalive, timer, apache, all)
+  ${C_CYAN}status-report${C_RESET}                Append operational status snapshot to /var/log/ollama-status-report.log
+  ${C_CYAN}rotate-token${C_RESET}                 Generate new public API token, rewrite proxy conf & reload Apache
+
+${C_YELLOW}Supported CLIs (${0##*/} launch):${C_RESET}
+  ${C_BOLD}claude${C_RESET}      Anthropic Claude Code CLI via OpenAI-compatible endpoint bridge
+  ${C_BOLD}grok${C_RESET}        Grok Build TUI; dynamically injects model endpoint and context_window
+  ${C_BOLD}kimi${C_RESET}        Kimi Code CLI; configures host provider, model alias & /effort levels
+  ${C_BOLD}agy${C_RESET}         Google Antigravity CLI; spawns transient Gemini-to-Ollama wire shim
+  ${C_BOLD}codex${C_RESET}       OpenAI Codex CLI routed to local/remote Ollama backend
+  ${C_BOLD}qwen${C_RESET}        Qwen Code CLI routed to local/remote Ollama backend
+  ${C_BOLD}opencode${C_RESET}    OpenCode AI assistant routed to Ollama models
 
 ${C_YELLOW}Examples:${C_RESET}
-  ${0##*/} install
-  ${0##*/} install kimi
-  ${0##*/} install all
-  ${0##*/} update
-  ${0##*/} update kimi
-  ${0##*/} update all
-  ${0##*/} check
-  ${0##*/} status
-  ${0##*/} list nemotron
-  ${0##*/} ps
-  ${0##*/} stop nemotron3:latest
-  ${0##*/} info nemotron3:33b
-  ${0##*/} stream nemotron-3.5-lightning:latest
-  ${0##*/} stream --status
-  ${0##*/} stream --test
-  ${0##*/} stream --all
-  ${0##*/} --remote launch claude --model nemotron3:33b
-  ${0##*/} launch codex --model kalidroid-27b:latest
-  ${0##*/} launch grok --model kalidroid-27b:latest
-  ${0##*/} --remote launch kimi --model kalidroid-27b:latest
-  ${0##*/} --remote launch grok --model nemotron3:33b
-  ${0##*/} tune kalidroid-27b:latest --ctx 32768   # launch grok then honors it
-  ${0##*/} --remote tag nemotron3:33b nemotron3:latest
-  ${0##*/} --local --host 127.0.0.1:11436 check
-  ${0##*/} --local --remote list
-  ${0##*/} --host 127.0.0.1:11436 --host 192.168.1.131:11436 check
-  ${0##*/} --host 127.0.0.1:11434 --host 127.0.0.1:11438 --host 192.168.1.131 hosts
+  ${C_DIM}# Model & VRAM Control:${C_RESET}
+  ${0##*/} ps                                         # Show active GPU models and memory
+  ${0##*/} warm kalidroid-27b:latest                  # Pre-warm model into VRAM (24h keepalive)
+  ${0##*/} stop all                                   # Evict all models to reclaim GPU memory
+  ${0##*/} tune kalidroid-27b:latest --ctx 32768      # Bake 32k context default into registry
+
+  ${C_DIM}# External Agent CLI Hub:${C_RESET}
+  ${0##*/} launch grok --model kalidroid-27b:latest   # Launch Grok TUI with local model
+  ${0##*/} --remote launch claude --model nemotron3   # Route Claude Code to remote GPU server
+  ${0##*/} launch agy --model kalidroid-27b:latest    # Launch Google Antigravity via wire shim
+  ${0##*/} install kimi                               # Install Kimi Code CLI
+  ${0##*/} update                                     # Check updates across all present CLIs
+  ${0##*/} update --apply                             # Upgrade all present CLIs to latest
+
+  ${C_DIM}# Cluster & Multi-Host Management:${C_RESET}
+  ${0##*/} check                                      # Health & latency probe for all endpoints
+  ${0##*/} hosts                                      # Discover reachable cluster nodes
+  ${0##*/} --local --remote list                      # List models across local & remote nodes
+  ${0##*/} stream kalidroid-27b:latest --status       # Inspect model keepalive pinning state
 EOF
 }
 
@@ -2752,15 +2723,61 @@ kimi_register_model() {
     printf '%s' "${alias}"
 }
 
-# -----------------------------------------------------------------------------
-# Command: launch
-# -----------------------------------------------------------------------------
+launch_usage() {
+    cat <<EOF
+${C_BOLD}kimo launch${C_RESET} – Launch external LLM agent CLIs routed to Ollama models
+
+${C_YELLOW}Usage:${C_RESET}
+  ${0##*/} [global-options] launch <cli> [--model <model>] [cli-arguments...]
+
+${C_YELLOW}Supported CLIs:${C_RESET}
+  ${C_CYAN}claude${C_RESET}        Anthropic Claude Code CLI
+  ${C_CYAN}codex${C_RESET}         OpenAI Codex CLI
+  ${C_CYAN}qwen${C_RESET}          Qwen Code CLI
+  ${C_CYAN}grok${C_RESET}          Grok Build CLI / TUI
+  ${C_CYAN}kimi${C_RESET}          Kimi Code CLI
+  ${C_CYAN}agy${C_RESET}           Google Antigravity CLI
+  ${C_CYAN}opencode${C_RESET}      OpenCode AI Assistant
+  ${C_CYAN}openclaw${C_RESET}      OpenClaw CLI
+  ${C_CYAN}hermes${C_RESET}        Hermes Agent CLI
+
+${C_YELLOW}CLI Integration Mechanics:${C_RESET}
+  ${C_BOLD}agy${C_RESET}          Google Antigravity CLI speaks only the Gemini wire protocol. A per-session
+                shim is spawned on a free localhost port and modelProvider is patched
+                for the duration of the session, then cleanly restored on exit.
+  ${C_BOLD}grok${C_RESET}         Grok Build takes no endpoint flag; its catalog and inference are directed
+                to the resolved host via GROK_MODELS_BASE_URL. A tuned num_ctx (tune --ctx)
+                becomes that model's context_window in config.toml, restored on exit.
+  ${C_BOLD}kimi${C_RESET}         Kimi Code registers an additive, idempotent provider and model alias in
+                ~/.kimi-code/config.toml for the resolved host and launches with -m <alias>.
+                Tuned num_ctx (capped at runtime num_ctx for 85% auto-compaction) becomes
+                max_context_size. Thinking models declare support_efforts low..max so the
+                in-session /effort picker works (mapped via reasoning_key).
+  ${C_BOLD}claude${C_RESET}       Directs Claude Code to the target host via ANTHROPIC_BASE_URL.
+  ${C_BOLD}codex/qwen${C_RESET}   Configured with custom Ollama API endpoints and model parameters.
+
+${C_YELLOW}Environment Overrides:${C_RESET}
+  KIMO_KIMI_EFFORT          Default thinking effort (low, medium, high, xhigh, max)
+  KIMO_KIMI_EFFORTS         Supported thinking efforts list (e.g. low,medium,high,max)
+  KIMO_KIMI_CAPABILITIES    Override detected model capabilities (e.g. tool_use,thinking)
+  KIMO_KIMI_REASONING_KEY   Wire parameter name for thinking budget (default: reasoning)
+  KIMO_AGY_CLAIM_DIR        Claim directory for concurrent Antigravity sessions (/tmp/kimo-agy-claims)
+  KIMO_GROK_CLAIM_DIR       Claim directory for concurrent Grok sessions (/tmp/kimo-grok-claims)
+  KIMO_KIMI_CONFIG_LOCK     Lockfile for concurrent Kimi config updates (/tmp/kimo-kimi-config.lock)
+
+${C_YELLOW}Examples:${C_RESET}
+  ${0##*/} launch grok --model kalidroid-27b:latest
+  ${0##*/} --remote launch claude --model nemotron3:33b
+  ${0##*/} launch agy --model kalidroid-27b:latest
+  ${0##*/} --remote launch kimi --model kalidroid-27b:latest
+EOF
+}
+
 cmd_launch() {
     local provider="${1:-}"
-    if [[ -z "${provider}" ]]; then
-        echo "${C_RED}Error: 'launch' requires a provider or CLI name.${C_RESET}" >&2
-        echo "Supported providers: ${!EXTERNAL_CLI_MAP[*]}" >&2
-        exit 1
+    if [[ -z "${provider}" || "${provider}" == "-h" || "${provider}" == "--help" || "${provider}" == "help" ]]; then
+        launch_usage
+        return 0
     fi
     shift
 
@@ -3394,6 +3411,33 @@ _install_single_cli() {
     esac
 }
 
+install_usage() {
+    cat <<EOF
+${C_BOLD}kimo install${C_RESET} – Install and manage external LLM CLIs
+
+${C_YELLOW}Usage:${C_RESET}
+  ${0##*/} install [cli|all|list] [options]
+
+${C_YELLOW}Arguments:${C_RESET}
+  ${C_CYAN}<cli>${C_RESET}        Name of CLI to install (kimi, claude, grok, codex, qwen, opencode, openclaw, hermes)
+  ${C_CYAN}all${C_RESET}          Install or update all supported CLIs in batch
+  ${C_CYAN}list${C_RESET}         Display status and version table of all supported CLIs (default without args)
+
+${C_YELLOW}Options:${C_RESET}
+  ${C_CYAN}-u, --update${C_RESET}  Update the CLI to the latest upstream release
+  ${C_CYAN}-f, --force${C_RESET}   Force reinstallation even if already present
+  ${C_CYAN}-l, --list${C_RESET}    List CLI installation inventory and status
+  ${C_CYAN}-h, --help${C_RESET}    Show this help message
+
+${C_YELLOW}Examples:${C_RESET}
+  ${0##*/} install            # Display inventory and status of all CLIs
+  ${0##*/} install kimi       # Install Kimi Code CLI
+  ${0##*/} install claude     # Install Claude Code CLI
+  ${0##*/} install all        # Install all supported CLIs
+  ${0##*/} install kimi -u    # Update Kimi Code CLI to latest release
+EOF
+}
+
 cmd_install() {
     local target=""
     local opt_force=false
@@ -3402,6 +3446,7 @@ cmd_install() {
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
+            -h|--help|help) install_usage; return 0 ;;
             --force|-f) opt_force=true; shift ;;
             --update|-u) opt_update=true; shift ;;
             --list|-l) opt_list=true; shift ;;
@@ -3564,12 +3609,37 @@ _update_all_present() {
     fi
 }
 
+update_usage() {
+    cat <<EOF
+${C_BOLD}kimo update${C_RESET} – Check and apply updates for installed external CLIs
+
+${C_YELLOW}Usage:${C_RESET}
+  ${0##*/} update [cli|all] [options]
+
+${C_YELLOW}Arguments:${C_RESET}
+  ${C_CYAN}[none]${C_RESET}       Check for updates across only the CLIs currently installed (read-only audit)
+  ${C_CYAN}<cli>${C_RESET}        Update a specific installed CLI to its latest upstream release
+  ${C_CYAN}all${C_RESET}          Update all installed CLIs to their latest versions
+
+${C_YELLOW}Options:${C_RESET}
+  ${C_CYAN}-y, --apply${C_RESET}   Apply available updates to all installed CLIs
+  ${C_CYAN}-c, --check${C_RESET}   Check for updates without installing (default behavior when no CLI is specified)
+  ${C_CYAN}-h, --help${C_RESET}    Show this help message
+
+${C_YELLOW}Examples:${C_RESET}
+  ${0##*/} update             # Check updates for all present CLIs
+  ${0##*/} update qwen        # Update only Qwen Code CLI
+  ${0##*/} update --apply     # Update all installed CLIs with available updates
+EOF
+}
+
 cmd_update() {
     local target=""
     local opt_apply=false
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
+            -h|--help|help) update_usage; return 0 ;;
             --apply|-y|--yes) opt_apply=true; shift ;;
             --check|-c) opt_apply=false; shift ;;
             *)
