@@ -1,0 +1,3184 @@
+#!/usr/bin/env bash
+# kimo – Unified manager for local and remote Ollama instances & external LLM CLIs.
+# Utility for managing models, VRAM, and CLI routing in the Kalidroid environment.
+# -----------------------------------------------------------------------------------
+
+set -euo pipefail
+
+# Remote server configuration
+# NOTE: 192.168.1.131 binds ollama to 127.0.0.1:11434 only, so direct LAN
+# connections are refused by design. The reachable path from this host is the
+# SSH tunnel (ollama-remote-tunnel.service):
+#   127.0.0.1:11438 -> 127.0.0.1:11434 on 192.168.1.131
+# Resolution order: $OLLAMA_REMOTE_URL > tunnel > direct. Probing uses a short
+# timeout so --help / local-only commands never hang.
+REMOTE_HOST_IP="192.168.1.131"
+REMOTE_HOST_PORT="11434"
+REMOTE_DIRECT_URL="http://${REMOTE_HOST_IP}:${REMOTE_HOST_PORT}"
+REMOTE_TUNNEL_URL="http://127.0.0.1:11438"
+REMOTE_DAEMON_URL="http://${REMOTE_HOST_IP}:11436"
+REMOTE_HOST_URL="${OLLAMA_REMOTE_URL:-${REMOTE_TUNNEL_URL}}"
+LOCAL_HOST_URL="${OLLAMA_LOCAL_URL:-http://127.0.0.1:11434}"
+
+# Per-model tuned defaults baked into run/launch. Keyed by exact resolved model
+# name; values mirror Ollama request option names (num_ctx/num_batch/...).
+# Written by 'tune', consumed by 'run' and 'launch'.
+TUNINGS_FILE="/var/lib/ollama/tunings.json"
+
+# Map of default models for external CLIs and native Ollama runs
+declare -A DEFAULT_MODELS=(
+    ["claude"]="kalidroid-27b:latest"
+    ["qwen"]="qwen3.8:latest"
+    ["llama3"]="llama3.2:3b-text-fp16"
+    ["codex"]="kalidroid-27b:latest"
+    ["opencode"]="kalidroid-27b:latest"
+    ["hermes"]="kalidroid-27b:latest"
+    ["openclaw"]="kalidroid-27b:latest"
+    ["agy"]="kalidroid-27b:latest"
+    ["grok"]="kalidroid-27b:latest"
+    ["kimi"]="kalidroid-27b:latest"
+)
+
+# Map of external CLI binary names
+declare -A EXTERNAL_CLI_MAP=(
+    ["claude"]="claude"
+    ["codex"]="codex"
+    ["qwen"]="qwen"
+    ["opencode"]="opencode"
+    ["hermes"]="hermes"
+    ["openclaw"]="openclaw"
+    ["agy"]="agy"
+    ["grok"]="grok"
+    ["kimi"]="kimi"
+)
+
+# grok installs into ~/.grok/bin and reaches PATH only through ~/.bashrc, which a
+# non-interactive caller (cron, systemd, Apache, sh -c) never sources. Without
+# this the 'command -v' gate in cmd_launch misses the binary and silently
+# degrades to 'ollama run' instead of launching grok.
+GROK_BIN_DIR="${GROK_BIN_DIR:-${HOME:-/root}/.grok/bin}"
+if [[ -x "${GROK_BIN_DIR}/grok" && ":${PATH}:" != *":${GROK_BIN_DIR}:"* ]]; then
+    PATH="${GROK_BIN_DIR}:${PATH}"
+    export PATH
+fi
+
+# kimi (Kimi Code CLI) installs into ~/.kimi-code/bin; same non-interactive PATH
+# hazard as grok, so the 'command -v' gate in cmd_launch can find it everywhere.
+KIMI_BIN_DIR="${KIMI_BIN_DIR:-${HOME:-/root}/.kimi-code/bin}"
+if [[ -x "${KIMI_BIN_DIR}/kimi" && ":${PATH}:" != *":${KIMI_BIN_DIR}:"* ]]; then
+    PATH="${KIMI_BIN_DIR}:${PATH}"
+    export PATH
+fi
+
+# Terminal color initialization
+setup_colors() {
+    if [[ -t 1 && "${NO_COLOR:-0}" != "1" && "${FORCE_NO_COLOR:-false}" != "true" ]]; then
+        C_RESET=$'\033[0m'
+        C_BOLD=$'\033[1m'
+        C_DIM=$'\033[2m'
+        C_RED=$'\033[0;31m'
+        C_GREEN=$'\033[0;32m'
+        C_YELLOW=$'\033[0;33m'
+        C_BLUE=$'\033[0;34m'
+        C_MAGENTA=$'\033[0;35m'
+        C_CYAN=$'\033[0;36m'
+        C_WHITE=$'\033[1;37m'
+    else
+        C_RESET=""
+        C_BOLD=""
+        C_DIM=""
+        C_RED=""
+        C_GREEN=""
+        C_YELLOW=""
+        C_BLUE=""
+        C_MAGENTA=""
+        C_CYAN=""
+        C_WHITE=""
+    fi
+}
+
+usage() {
+    cat <<EOF
+${C_BOLD}kimo - Ollama Manager (kimo)${C_RESET} – Unified Local & Remote Model Management & External CLI Hub
+
+${C_YELLOW}Usage:${C_RESET}
+  ${0##*/} [options] <command> [arguments...]
+
+${C_YELLOW}Global Options:${C_RESET}
+  --remote                 Connect to remote server (${REMOTE_TUNNEL_URL} tunnel -> 192.168.1.131; \$OLLAMA_REMOTE_URL overrides)
+  --local                  Connect strictly to local daemon (${LOCAL_HOST_URL}; \$OLLAMA_LOCAL_URL overrides)
+  --host <address>         Specify a custom Ollama host (e.g. 127.0.0.1:11438)
+                           Combine with --local to set the local daemon address (--local --host 127.0.0.1:11436),
+                           or with --remote to set the remote address. --local --remote targets both.
+                           Repeat --host to target several hosts: check/hosts/ps/list/search/stop/info query all,
+                           model commands (run/warm/rm/tag/launch...) go to the first host that has the model.
+  --json                   Output responses in structured JSON format
+  --no-color               Disable colored terminal output
+  -h, --help               Show this help message
+
+${C_YELLOW}Commands:${C_RESET}
+  ${C_CYAN}list [filter]${C_RESET}            List all installed models (local & remote). Highlights active VRAM models.
+  ${C_CYAN}search <keyword>${C_RESET}         Keyword search across local & remote catalogs (name/params/capabilities); marks pinned/tuned.
+  ${C_CYAN}ps${C_RESET}                    Display all models currently resident in GPU/CPU VRAM with memory stats.
+  ${C_CYAN}status, health${C_RESET}       Snapshot: tunnel, remote API, VRAM residency, keepalive timer, public endpoint.
+  ${C_CYAN}status-report${C_RESET}        Append the status snapshot to /var/log/ollama-status-report.log.
+  ${C_CYAN}logs [tunnel|keepalive|timer|apache|all]${C_RESET}  Show recent journald output for the ops services.
+  ${C_CYAN}rotate-token${C_RESET}         Generate a new public API token, regenerate the proxy conf, reload Apache (backup in ollama-api.token.bk).
+  ${C_CYAN}stop, unload [model|all]${C_RESET} Free GPU VRAM immediately by unloading active models (keep_alive: 0).
+  ${C_CYAN}warm, preload <model> [dur]${C_RESET} Pre-warm model into GPU VRAM (keep_alive: 24h) to eliminate cold-start.
+  ${C_CYAN}check, ping${C_RESET}              Run connectivity, latency, and health check for local and remote hosts.
+  ${C_CYAN}hosts${C_RESET}                    One row per server: host, port, state, version, models, disk GB, source.
+                           ssh -L tunnels are merged with the server they reach; no --host = discover.
+  ${C_CYAN}info, show <model>${C_RESET}       Display detailed metadata (parameters, context, quant, capabilities).
+  ${C_CYAN}tag, alias <src> <dst>${C_RESET}   Create a tag/alias for an existing model on target host.
+  ${C_CYAN}rm, delete <model>${C_RESET}       Delete a model from the local or remote Ollama server.
+  ${C_CYAN}stream <model> [opts]${C_RESET}  Pin remote model for durable availability (warm + keepalive; --pull for full local copy).
+                                ${C_CYAN}stream --status${C_RESET} (dashboard), ${C_CYAN}stream --test${C_RESET} (smoke probe), ${C_CYAN}stream --resident-only${C_RESET}.
+  ${C_CYAN}tune <model> [opts...]${C_RESET}  Bake per-model defaults (num_ctx, num_batch, num_predict, temp, num_gpu) into run/launch.
+                                  --target <name> also creates a tuned variant via /api/create; --show / --clear for the registry.
+  ${C_CYAN}bench, eval [model]${C_RESET}      Benchmark TTFT, generation tokens/sec throughput, and VRAM residency.
+  ${C_CYAN}run <model> [args...]${C_RESET}    Run an Ollama model directly (auto-connects to remote if remote-only).
+  ${C_CYAN}launch <cli> [opts...]${C_RESET}   Launch an external LLM CLI (claude, codex, qwen, grok, kimi, hermes, agy, etc.)
+                           with automatic Ollama routing and model override (--model <name>).
+                           agy speaks only the Gemini wire format, so a per-session shim is
+                           started on a free localhost port and its modelProvider setting is
+                           patched for the duration of the session, then restored on exit.
+                           grok takes no endpoint flag; its catalog and inference are aimed at
+                           the resolved host via GROK_MODELS_BASE_URL, so --model accepts real
+                           Ollama tags. A tuned num_ctx (tune --ctx) also becomes that model's
+                           context_window in config.toml for the session, reverted on exit.
+                           kimi (Kimi Code CLI) registers an additive, idempotent provider +
+                           model alias in ~/.kimi-code/config.toml for the resolved host (same
+                           pattern as its other custom providers; nothing is reverted on exit)
+                           and launches with -m <alias>. Tuned num_ctx (capped at the probed
+                           runtime num_ctx, so kimi's 85% auto-compaction always fires before
+                           Ollama would truncate history) becomes max_context_size; Ollama's
+                           reported
+                           capabilities (thinking/tools/vision) are mapped; thinking models
+                           declare support_efforts low..max + off_effort none, so the
+                           in-session /effort picker works and reaches the wire as
+                           reasoning_effort (Ollama's non-standard 'reasoning' field is mapped
+                           via reasoning_key). Overrides: OM_KIMI_EFFORT (default effort),
+                           OM_KIMI_EFFORTS, OM_KIMI_CAPABILITIES, OM_KIMI_REASONING_KEY.
+                           Without python3-tomlkit it falls back to the KIMI_MODEL_* env
+                           channel: zero footprint, but /effort is limited to on/off and the
+                           graded effort must be set at launch via OM_KIMI_EFFORT=xhigh.
+
+${C_YELLOW}Examples:${C_RESET}
+  ${0##*/} check
+  ${0##*/} status
+  ${0##*/} list nemotron
+  ${0##*/} ps
+  ${0##*/} stop nemotron3:latest
+  ${0##*/} info nemotron3:33b
+  ${0##*/} stream nemotron-3.5-lightning:latest
+  ${0##*/} stream --status
+  ${0##*/} stream --test
+  ${0##*/} stream --all
+  ${0##*/} --remote launch claude --model nemotron3:33b
+  ${0##*/} launch codex --model kalidroid-27b:latest
+  ${0##*/} launch grok --model kalidroid-27b:latest
+  ${0##*/} --remote launch kimi --model kalidroid-27b:latest
+  ${0##*/} --remote launch grok --model nemotron3:33b
+  ${0##*/} tune kalidroid-27b:latest --ctx 32768   # launch grok then honors it
+  ${0##*/} --remote tag nemotron3:33b nemotron3:latest
+  ${0##*/} --local --host 127.0.0.1:11436 check
+  ${0##*/} --local --remote list
+  ${0##*/} --host 127.0.0.1:11436 --host 192.168.1.131:11436 check
+  ${0##*/} --host 127.0.0.1:11434 --host 127.0.0.1:11438 --host 192.168.1.131 hosts
+EOF
+}
+
+# -----------------------------------------------------------------------------
+# Global Option Parsing (Permits flags anywhere on command line)
+# -----------------------------------------------------------------------------
+OPT_REMOTE=false
+OPT_LOCAL=false
+OPT_HOST=""
+OPT_HOSTS=()
+OPT_JSON=false
+FORCE_NO_COLOR=false
+POSITIONAL_ARGS=()
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --remote)
+            OPT_REMOTE=true
+            shift
+            ;;
+        --local)
+            OPT_LOCAL=true
+            shift
+            ;;
+        --host)
+            shift
+            if [[ -z "${1:-}" ]]; then
+                echo "Error: --host requires an address argument." >&2
+                exit 1
+            fi
+            OPT_HOSTS+=("$1")
+            shift
+            ;;
+        --host=*)
+            OPT_HOSTS+=("${1#*=}")
+            shift
+            ;;
+        --json)
+            OPT_JSON=true
+            shift
+            ;;
+        --no-color)
+            FORCE_NO_COLOR=true
+            shift
+            ;;
+        -h|--help)
+            if [[ ${#POSITIONAL_ARGS[@]} -eq 0 ]]; then
+                setup_colors
+                usage
+                exit 0
+            else
+                POSITIONAL_ARGS+=("$1")
+                shift
+            fi
+            ;;
+        *)
+            POSITIONAL_ARGS+=("$1")
+            shift
+            ;;
+    esac
+done
+
+setup_colors
+
+if [[ ${#POSITIONAL_ARGS[@]} -eq 0 ]]; then
+    usage
+    exit 1
+fi
+
+COMMAND="${POSITIONAL_ARGS[0]}"
+ARGS=("${POSITIONAL_ARGS[@]:1}")
+
+# Resolve which remote URL is actually reachable (tunnel-first).
+# Honors $OLLAMA_REMOTE_URL when set. Falls back to the tunnel default even
+# when nothing answers so callers always have a stable value to report.
+probe_ollama_url() {
+    # -f: a 401 from a bridge that now requires a token is not "reachable" -
+    # accepting it made every remote model lookup fail and launch fall back to
+    # the Pi, where a 27B load is refused or OOM-killed.
+    curl -sf --connect-timeout 1 -m 2 "$1/api/tags" >/dev/null 2>&1
+}
+resolve_remote_url() {
+    if [[ -n "${OLLAMA_REMOTE_URL:-}" ]]; then
+        echo "${OLLAMA_REMOTE_URL}"
+        return
+    fi
+    if probe_ollama_url "${REMOTE_TUNNEL_URL}"; then
+        echo "${REMOTE_TUNNEL_URL}"
+        return
+    fi
+    if probe_ollama_url "${REMOTE_DIRECT_URL}"; then
+        echo "${REMOTE_DIRECT_URL}"
+        return
+    fi
+    # The Desktop's own Ollama daemon (no bridge, no token; dashboard ep1 uses it).
+    if probe_ollama_url "${REMOTE_DAEMON_URL}"; then
+        echo "${REMOTE_DAEMON_URL}"
+        return
+    fi
+    echo "${REMOTE_TUNNEL_URL}"
+}
+
+normalize_host_url() {
+    local url="${1%/}"
+    if [[ ! "${url}" =~ ^https?:// ]]; then
+        url="http://${url}"
+    fi
+    if [[ ! "${url}" =~ :[0-9]+$ ]]; then
+        url="${url}:11434"
+    fi
+    echo "${url}"
+}
+
+# --host may be repeated; normalize and de-duplicate, keeping the given order.
+if [[ ${#OPT_HOSTS[@]} -gt 0 ]]; then
+    declare -A _seen_hosts=()
+    _norm_hosts=()
+    for _h in "${OPT_HOSTS[@]}"; do
+        _h="$(normalize_host_url "${_h}")"
+        [[ -n "${_seen_hosts[${_h}]:-}" ]] && continue
+        _seen_hosts[${_h}]=1
+        _norm_hosts+=("${_h}")
+    done
+    OPT_HOSTS=("${_norm_hosts[@]}")
+    OPT_HOST="${OPT_HOSTS[0]}"
+fi
+MULTI_HOSTS=""
+[[ -n "${OLLAMA_LOCAL_URL:-}" ]] && LOCAL_HOST_URL="$(normalize_host_url "${OLLAMA_LOCAL_URL}")"
+
+# Determine Active Target Host
+# --host combined with --local/--remote redefines that side's address instead
+# of replacing the mode, so local/remote labels and routing stay intact.
+if [[ ${#OPT_HOSTS[@]} -gt 1 ]]; then
+    if ${OPT_LOCAL} || ${OPT_REMOTE}; then
+        echo "${C_RED}Error: multiple --host values cannot be combined with --local/--remote; use \$OLLAMA_LOCAL_URL / \$OLLAMA_REMOTE_URL.${C_RESET}" >&2
+        exit 1
+    fi
+    TARGET_HOST=""
+    HOST_MODE="multi"
+    MULTI_HOSTS="${OPT_HOSTS[*]}"
+elif ${OPT_LOCAL} && ${OPT_REMOTE}; then
+    if [[ -n "${OPT_HOST}" ]]; then
+        echo "${C_RED}Error: --host is ambiguous with both --local and --remote; use \$OLLAMA_LOCAL_URL / \$OLLAMA_REMOTE_URL.${C_RESET}" >&2
+        exit 1
+    fi
+    TARGET_HOST=""
+    HOST_MODE="auto"
+    REMOTE_HOST_URL="$(resolve_remote_url)"
+elif ${OPT_LOCAL} && [[ -n "${OPT_HOST}" ]]; then
+    LOCAL_HOST_URL="${OPT_HOST}"
+    TARGET_HOST="${LOCAL_HOST_URL}"
+    HOST_MODE="local"
+elif ${OPT_REMOTE} && [[ -n "${OPT_HOST}" ]]; then
+    REMOTE_HOST_URL="${OPT_HOST}"
+    TARGET_HOST="${REMOTE_HOST_URL}"
+    HOST_MODE="remote"
+    if ! probe_ollama_url "${TARGET_HOST}"; then
+        echo "${C_YELLOW}[!] Remote ${TARGET_HOST} unreachable${C_RESET}" >&2
+    fi
+elif [[ -n "${OPT_HOST}" ]]; then
+    TARGET_HOST="${OPT_HOST}"
+    HOST_MODE="custom"
+elif ${OPT_REMOTE}; then
+    REMOTE_HOST_URL="$(resolve_remote_url)"
+    TARGET_HOST="${REMOTE_HOST_URL}"
+    HOST_MODE="remote"
+    if ! probe_ollama_url "${TARGET_HOST}"; then
+        echo "${C_YELLOW}[!] Remote ${TARGET_HOST} unreachable (tunnel ollama-remote-tunnel.service down?)${C_RESET}" >&2
+    fi
+elif ${OPT_LOCAL}; then
+    TARGET_HOST="${LOCAL_HOST_URL}"
+    HOST_MODE="local"
+else
+    TARGET_HOST=""
+    HOST_MODE="auto"
+    # In auto mode every command that touches the remote resolves it lazily via
+    # $REMOTE_HOST_URL; refresh it here when it still points at the default so
+    # a recovered direct path is picked up without an env override.
+    if [[ "${REMOTE_HOST_URL}" == "${REMOTE_TUNNEL_URL}" || "${REMOTE_HOST_URL}" == "${REMOTE_DIRECT_URL}" ]]; then
+        REMOTE_HOST_URL="$(resolve_remote_url)"
+    fi
+fi
+
+# -----------------------------------------------------------------------------
+# Helper Functions
+# -----------------------------------------------------------------------------
+
+# Resolve model name to its exact tag on target host (exact match, :latest, prefix, substring)
+resolve_model_name() {
+    local target="$1"
+    local host_url="${2:-${LOCAL_HOST_URL}}"
+    local tags
+    tags=$(curl -s --connect-timeout 2 -m 4 "${host_url}/api/tags" 2>/dev/null) || return 1
+
+    # 1. Exact match
+    local match
+    match=$(echo "${tags}" | jq -r --arg t "${target}" '.models[].name | select(. == $t)' 2>/dev/null | head -n1)
+    if [[ -n "${match}" ]]; then
+        echo "${match}"
+        return 0
+    fi
+
+    # 2. Check :latest tag
+    match=$(echo "${tags}" | jq -r --arg t "${target}:latest" '.models[].name | select(. == $t)' 2>/dev/null | head -n1)
+    if [[ -n "${match}" ]]; then
+        echo "${match}"
+        return 0
+    fi
+
+    # 3. Check prefix match (e.g. nemotron3 -> nemotron3:33b)
+    match=$(echo "${tags}" | jq -r --arg t "${target}:" '.models[].name | select(startswith($t))' 2>/dev/null | head -n1)
+    if [[ -n "${match}" ]]; then
+        echo "${match}"
+        return 0
+    fi
+
+    # 4. Substring match
+    match=$(echo "${tags}" | jq -r --arg t "${target,,}" '.models[].name | select(ascii_downcase | contains($t))' 2>/dev/null | head -n1)
+    if [[ -n "${match}" ]]; then
+        echo "${match}"
+        return 0
+    fi
+
+    return 1
+}
+
+# Check if model is present locally
+is_local_model() {
+    resolve_model_name "$1" "${LOCAL_HOST_URL}" >/dev/null 2>&1
+}
+
+# Check if model is present on remote host
+is_remote_model() {
+    resolve_model_name "$1" "${REMOTE_HOST_URL}" >/dev/null 2>&1
+}
+
+# Read per-model tuned defaults (JSON) for an exact resolved model name.
+# Prints the JSON object when tuned, empty output otherwise.
+tuned_params() {
+    local model="$1"
+    if [[ ! -f "${TUNINGS_FILE}" ]]; then
+        return 0
+    fi
+    python3 -c '
+import json, sys
+try:
+    d = json.load(open(sys.argv[1])) or {}
+    p = d.get(sys.argv[2])
+except Exception:
+    p = None
+if p:
+    print(json.dumps(p))' "${TUNINGS_FILE}" "${model}"
+}
+
+# -----------------------------------------------------------------------------
+# Command: check / ping
+# -----------------------------------------------------------------------------
+cmd_check() {
+    OM_REMOTE_HOST_URL="${REMOTE_HOST_URL}" OM_LOCAL_HOST_URL="${LOCAL_HOST_URL}" OM_TARGET_HOST="${TARGET_HOST}" OM_HOST_MODE="${HOST_MODE}" OM_OPT_JSON="${OPT_JSON}" OM_MULTI_HOSTS="${MULTI_HOSTS}" OM_REMOTE_HOST_IP="${REMOTE_HOST_IP}" OM_C_RESET="${C_RESET}" OM_C_BOLD="${C_BOLD}" OM_C_GREEN="${C_GREEN}" OM_C_RED="${C_RED}" OM_C_CYAN="${C_CYAN}" OM_C_YELLOW="${C_YELLOW}" \
+        python3 - <<'PYEOF'
+import os as _om_os
+OM_REMOTE_HOST_URL = _om_os.environ["OM_REMOTE_HOST_URL"]
+OM_LOCAL_HOST_URL = _om_os.environ["OM_LOCAL_HOST_URL"]
+OM_TARGET_HOST = _om_os.environ["OM_TARGET_HOST"]
+OM_HOST_MODE = _om_os.environ["OM_HOST_MODE"]
+OM_OPT_JSON = _om_os.environ["OM_OPT_JSON"]
+OM_MULTI_HOSTS = _om_os.environ["OM_MULTI_HOSTS"]
+OM_REMOTE_HOST_IP = _om_os.environ["OM_REMOTE_HOST_IP"]
+OM_C_RESET = _om_os.environ["OM_C_RESET"]
+OM_C_BOLD = _om_os.environ["OM_C_BOLD"]
+OM_C_GREEN = _om_os.environ["OM_C_GREEN"]
+OM_C_RED = _om_os.environ["OM_C_RED"]
+OM_C_CYAN = _om_os.environ["OM_C_CYAN"]
+OM_C_YELLOW = _om_os.environ["OM_C_YELLOW"]
+import urllib.request, json, time, sys
+
+remote_url = OM_REMOTE_HOST_URL
+local_url = OM_LOCAL_HOST_URL
+target = OM_TARGET_HOST
+mode = OM_HOST_MODE
+as_json = OM_OPT_JSON.lower() == "true"
+
+hosts_to_check = []
+if mode == 'multi':
+    hosts_to_check.extend((u.split('://', 1)[-1], u) for u in OM_MULTI_HOSTS.split())
+elif mode == 'custom':
+    hosts_to_check.append(('Custom Host', target))
+elif mode == 'remote':
+    hosts_to_check.append((f'Remote ({OM_REMOTE_HOST_IP})', remote_url))
+elif mode == 'local':
+    hosts_to_check.append(('Local Daemon', local_url))
+else:
+    hosts_to_check.append(('Local Daemon', local_url))
+    hosts_to_check.append((f'Remote ({OM_REMOTE_HOST_IP})', remote_url))
+
+results = []
+for label, url in hosts_to_check:
+    t0 = time.time()
+    try:
+        req = urllib.request.Request(url + '/api/version', headers={'User-Agent': 'ollama_mgr'})
+        with urllib.request.urlopen(req, timeout=2.5) as r:
+            ver = json.loads(r.read().decode('utf-8')).get('version', 'unknown')
+            lat = int((time.time() - t0) * 1000)
+            status = 'online'
+    except Exception as e:
+        results.append({'host': label, 'url': url, 'status': 'offline', 'error': str(e), 'latency_ms': None})
+        continue
+
+    models_cnt = 0
+    try:
+        req = urllib.request.Request(url + '/api/tags', headers={'User-Agent': 'ollama_mgr'})
+        with urllib.request.urlopen(req, timeout=2.5) as r:
+            models_cnt = len(json.loads(r.read().decode('utf-8')).get('models', []))
+    except Exception:
+        pass
+
+    active_cnt = 0
+    vram_bytes = 0
+    try:
+        req = urllib.request.Request(url + '/api/ps', headers={'User-Agent': 'ollama_mgr'})
+        with urllib.request.urlopen(req, timeout=2.5) as r:
+            ps_models = json.loads(r.read().decode('utf-8')).get('models', [])
+            active_cnt = len(ps_models)
+            vram_bytes = sum(m.get('size_vram', 0) for m in ps_models)
+    except Exception:
+        pass
+
+    results.append({
+        'host': label,
+        'url': url,
+        'status': 'online',
+        'latency_ms': lat,
+        'version': ver,
+        'models_count': models_cnt,
+        'active_models': active_cnt,
+        'vram_usage_bytes': vram_bytes,
+        'vram_usage_gb': round(vram_bytes / (1024**3), 2)
+    })
+
+if as_json:
+    print(json.dumps(results, indent=2))
+    sys.exit(0)
+
+C_RESET = OM_C_RESET
+C_BOLD = OM_C_BOLD
+C_GREEN = OM_C_GREEN
+C_RED = OM_C_RED
+C_CYAN = OM_C_CYAN
+C_YELLOW = OM_C_YELLOW
+
+print(f"{C_BOLD}OLLAMA SERVER CONNECTIVITY & HEALTH CHECK:{C_RESET}")
+header_fmt = "{:<24} {:<12} {:<10} {:<12} {:<10} {:<18}"
+print(header_fmt.format("TARGET", "STATUS", "LATENCY", "VERSION", "MODELS", "VRAM USAGE"))
+print("-" * 88)
+
+for r in results:
+    if r['status'] == 'online':
+        st_badge = f"{C_GREEN}● ONLINE{C_RESET}"
+        lat_str = f"{r['latency_ms']} ms"
+        ver_str = r['version']
+        mod_str = str(r['models_count'])
+        if r['active_models'] > 0:
+            vram_str = f"{r['vram_usage_gb']} GB ({r['active_models']} active)"
+        else:
+            vram_str = "Idle (0 loaded)"
+    else:
+        st_badge = f"{C_RED}○ OFFLINE{C_RESET}"
+        lat_str = "-"
+        ver_str = "-"
+        mod_str = "-"
+        vram_str = "-"
+
+    print(f"{r['host']:<24} {st_badge:<21} {lat_str:<10} {ver_str:<12} {mod_str:<10} {vram_str:<18}")
+print()
+PYEOF
+}
+
+# -----------------------------------------------------------------------------
+# Command: hosts
+# -----------------------------------------------------------------------------
+# One row per Ollama server. A localhost port that is an `ssh -L` forward is
+# resolved to the server it reaches, so the tunnel and that server's direct
+# address collapse into a single "tunnel" row instead of showing up twice.
+# Without --host, local listeners on 11430-11449, ssh forwards and the Desktop
+# are discovered; discovered ports that do not speak the Ollama API are dropped.
+cmd_hosts() {
+    OM_REMOTE_HOST_URL="${REMOTE_HOST_URL}" OM_REMOTE_DIRECT_URL="${REMOTE_DIRECT_URL}" OM_LOCAL_HOST_URL="${LOCAL_HOST_URL}" OM_TARGET_HOST="${TARGET_HOST}" OM_HOST_MODE="${HOST_MODE}" OM_OPT_JSON="${OPT_JSON}" OM_MULTI_HOSTS="${MULTI_HOSTS}" OM_C_RESET="${C_RESET}" OM_C_BOLD="${C_BOLD}" OM_C_DIM="${C_DIM}" OM_C_GREEN="${C_GREEN}" OM_C_RED="${C_RED}" OM_C_YELLOW="${C_YELLOW}" OM_C_CYAN="${C_CYAN}" \
+        python3 - <<'PYEOF'
+import os, sys, json, time, socket, subprocess
+import urllib.request, urllib.error, urllib.parse
+from concurrent.futures import ThreadPoolExecutor
+
+env = os.environ
+mode = env["OM_HOST_MODE"]
+as_json = env["OM_OPT_JSON"].lower() == "true"
+C_RESET, C_BOLD, C_DIM = env["OM_C_RESET"], env["OM_C_BOLD"], env["OM_C_DIM"]
+C_GREEN, C_RED, C_YELLOW, C_CYAN = env["OM_C_GREEN"], env["OM_C_RED"], env["OM_C_YELLOW"], env["OM_C_CYAN"]
+
+LOOPBACK = {"127.0.0.1", "localhost", "::1", "0.0.0.0", "::", "*"}
+SCAN_PORTS = range(11430, 11450)
+# ssh options that consume the next argument (or the rest of their cluster).
+SSH_VALUE_OPTS = set("BbcDEeFIiJLlmOoPpQRSWw")
+
+
+def run(argv):
+    try:
+        return subprocess.run(argv, capture_output=True, text=True, timeout=3).stdout
+    except Exception:
+        return ""
+
+
+def local_addresses():
+    addrs = set(LOOPBACK)
+    addrs.update(run(["hostname", "-I"]).split())
+    try:
+        addrs.add(socket.gethostname())
+    except Exception:
+        pass
+    return addrs
+
+
+def resolve_ssh_host(dest):
+    """An ssh destination may be a config alias; ask ssh what it really dials."""
+    host = dest.split("@")[-1]
+    for line in run(["ssh", "-G", dest]).splitlines():
+        key, _, value = line.partition(" ")
+        if key == "hostname" and value:
+            return value.strip()
+    return host
+
+
+def ssh_forwards():
+    """local port -> (host, port) for every running `ssh -L` forward."""
+    forwards = {}
+    for pid in os.listdir("/proc"):
+        if not pid.isdigit():
+            continue
+        try:
+            with open(f"/proc/{pid}/cmdline", "rb") as f:
+                argv = [a.decode(errors="replace") for a in f.read().split(b"\0") if a]
+        except OSError:
+            continue
+        if not argv or os.path.basename(argv[0]) != "ssh":
+            continue
+        specs, dest, i = [], None, 1
+        while i < len(argv):
+            arg = argv[i]
+            if arg.startswith("-") and len(arg) > 1:
+                for j, opt in enumerate(arg[1:], start=1):
+                    if opt in SSH_VALUE_OPTS:
+                        value = arg[j + 1:]
+                        if not value and i + 1 < len(argv):
+                            i += 1
+                            value = argv[i]
+                        if opt == "L":
+                            specs.append(value)
+                        break
+                i += 1
+                continue
+            dest = arg
+            break
+        if not dest or not specs:
+            continue
+        dest_host = None
+        for spec in specs:
+            parts = spec.split(":")
+            if len(parts) == 4:
+                _, lport, host, hport = parts
+            elif len(parts) == 3:
+                lport, host, hport = parts
+            else:
+                continue  # unix-socket or IPv6 forms; not used for Ollama here
+            if not (lport.isdigit() and hport.isdigit()):
+                continue
+            if host in LOOPBACK:
+                dest_host = dest_host or resolve_ssh_host(dest)
+                host = dest_host
+            forwards[int(lport)] = (host, int(hport))
+    return forwards
+
+
+def listening_local_ports():
+    ports = set()
+    for line in run(["ss", "-Htln"]).splitlines():
+        cols = line.split()
+        if len(cols) < 4:
+            continue
+        addr, _, port = cols[3].rpartition(":")
+        addr = addr.strip("[]").split("%")[0]
+        if port.isdigit() and addr in LOOPBACK:
+            ports.add(int(port))
+    return ports
+
+
+def split_url(url):
+    parts = urllib.parse.urlsplit(url if "://" in url else f"http://{url}")
+    host = parts.hostname or ""
+    port = parts.port or (443 if parts.scheme == "https" else 11434)
+    return host, port
+
+
+def get_json(url, path):
+    req = urllib.request.Request(url.rstrip("/") + path, headers={"User-Agent": "ollama_mgr"})
+    with urllib.request.urlopen(req, timeout=2.5) as r:
+        return json.loads(r.read().decode("utf-8"))
+
+
+def probe(url):
+    res = {"url": url, "state": "down", "version": None, "models": None,
+           "disk_bytes": None, "latency_ms": None, "error": None}
+    t0 = time.time()
+    try:
+        ver = get_json(url, "/api/version")
+    except urllib.error.HTTPError as e:
+        res["state"] = "auth" if e.code in (401, 403) else "down"
+        res["error"] = f"HTTP {e.code}"
+        return res
+    except Exception as e:
+        res["error"] = str(getattr(e, "reason", e))
+        return res
+    if not isinstance(ver, dict) or "version" not in ver:
+        res["error"] = "not an Ollama API"
+        return res
+    res.update(state="live", version=ver["version"], latency_ms=int((time.time() - t0) * 1000))
+    try:
+        models = get_json(url, "/api/tags").get("models", [])
+        res["models"] = len(models)
+        res["disk_bytes"] = sum(int(m.get("size") or 0) for m in models)
+    except Exception:
+        pass
+    return res
+
+
+forwards = ssh_forwards()
+local_addrs = local_addresses()
+
+# (url, discovered) - discovered entries are dropped when they don't answer.
+targets = []
+if mode == "multi":
+    targets = [(u, False) for u in env["OM_MULTI_HOSTS"].split()]
+elif mode == "custom":
+    targets = [(env["OM_TARGET_HOST"], False)]
+elif mode == "remote":
+    targets = [(env["OM_REMOTE_HOST_URL"], False)]
+else:
+    targets.append((env["OM_LOCAL_HOST_URL"], False))
+    listening = listening_local_ports()
+    for port in sorted(listening):
+        is_tunnel = port in forwards
+        if mode == "local" and is_tunnel:
+            continue
+        if port in SCAN_PORTS or (is_tunnel and forwards[port][1] in SCAN_PORTS):
+            targets.append((f"http://127.0.0.1:{port}", True))
+    if mode == "auto":
+        targets.append((env["OM_REMOTE_DIRECT_URL"], False))
+
+seen, unique = set(), []
+for url, discovered in targets:
+    host, port = split_url(url)
+    key = ("127.0.0.1" if host in LOOPBACK else host, port)
+    if key in seen:
+        continue
+    seen.add(key)
+    unique.append((url, discovered, host, port))
+
+with ThreadPoolExecutor(max_workers=max(1, min(16, len(unique)))) as pool:
+    probes = list(pool.map(lambda t: probe(t[0]), unique))
+
+rows, by_key = [], {}
+for (url, discovered, host, port), res in zip(unique, probes):
+    if discovered and res["state"] != "live":
+        continue
+    is_local = host in local_addrs
+    if is_local and port in forwards:
+        server, via = forwards[port], "tunnel"
+    else:
+        server, via = ("127.0.0.1" if host in LOOPBACK else host, port), ("local" if is_local else "remote")
+    path = {"url": url, "via": via, "local_port": port if via == "tunnel" else None, **res}
+    row = by_key.get(server)
+    if row is None:
+        row = {"host": server[0], "port": server[1], "paths": []}
+        by_key[server] = row
+        rows.append(row)
+    row["paths"].append(path)
+
+STATE_RANK = {"live": 0, "auth": 1, "down": 2}
+for row in rows:
+    best = min(row["paths"], key=lambda p: STATE_RANK[p["state"]])
+    tunnel_ports = [p["local_port"] for p in row["paths"] if p["via"] == "tunnel"]
+    if tunnel_ports:
+        source = "tunnel"
+    elif any(p["via"] == "local" for p in row["paths"]):
+        source = "local"
+    else:
+        source = "remote"
+    row.update(
+        state=best["state"], version=best["version"], models=best["models"],
+        disk_bytes=best["disk_bytes"],
+        disk_gb=None if best["disk_bytes"] is None else round(best["disk_bytes"] / 1e9, 1),
+        latency_ms=best["latency_ms"], source=source, tunnel_ports=tunnel_ports,
+    )
+
+if as_json:
+    print(json.dumps(rows, indent=2))
+    sys.exit(0)
+
+if not rows:
+    print(f"{C_YELLOW}No Ollama servers found.{C_RESET}")
+    sys.exit(0)
+
+host_w = max(16, *(len(r["host"]) for r in rows)) + 2
+fmt = "  {:<%d} {:<6} {:<9} {:<12} {:<7} {:<8} {}" % host_w
+print(f"{C_BOLD}OLLAMA HOSTS:{C_RESET}")
+print(fmt.format("HOST", "PORT", "STATE", "VERSION", "MODELS", "DISK GB", "SOURCE"))
+STATE_COLOR = {"live": C_GREEN, "auth": C_YELLOW, "down": C_RED}
+for r in rows:
+    # Pad before colouring so ANSI codes don't skew the column widths.
+    state = f"{STATE_COLOR[r['state']]}{r['state']:<9}{C_RESET}"
+    source = r["source"]
+    if r["tunnel_ports"]:
+        source += " " + ",".join(f":{p}" for p in r["tunnel_ports"])
+    line = fmt.format(
+        r["host"], r["port"], "", r["version"] or "-",
+        "-" if r["models"] is None else r["models"],
+        "-" if r["disk_gb"] is None else r["disk_gb"],
+        source,
+    )
+    # Splice the coloured state into the blank STATE cell.
+    cut = 2 + host_w + 1 + 6 + 1
+    print(line[:cut] + state + line[cut + 9:])
+
+notes = []
+for r in rows:
+    for p in r["paths"]:
+        if p["state"] != "live":
+            notes.append(f"  {p['url'].split('://', 1)[-1]}: {p['state']} ({p['error']})")
+    if r["tunnel_ports"]:
+        ports = ",".join(f":{p}" for p in r["tunnel_ports"])
+        notes.append(f"  {r['host']}:{r['port']} is reached through ssh -L 127.0.0.1{ports} (one server, one row)")
+if notes:
+    print(C_DIM + "\n".join(notes) + C_RESET)
+PYEOF
+}
+
+# -----------------------------------------------------------------------------
+# Command: ps / status
+# -----------------------------------------------------------------------------
+cmd_ps() {
+    OM_REMOTE_HOST_URL="${REMOTE_HOST_URL}" OM_LOCAL_HOST_URL="${LOCAL_HOST_URL}" OM_TARGET_HOST="${TARGET_HOST}" OM_HOST_MODE="${HOST_MODE}" OM_OPT_JSON="${OPT_JSON}" OM_MULTI_HOSTS="${MULTI_HOSTS}" OM_REMOTE_HOST_IP="${REMOTE_HOST_IP}" OM_C_RESET="${C_RESET}" OM_C_BOLD="${C_BOLD}" OM_C_GREEN="${C_GREEN}" OM_C_YELLOW="${C_YELLOW}" OM_C_CYAN="${C_CYAN}" OM_C_DIM="${C_DIM}" \
+        python3 - <<'PYEOF'
+import os as _om_os
+OM_REMOTE_HOST_URL = _om_os.environ["OM_REMOTE_HOST_URL"]
+OM_LOCAL_HOST_URL = _om_os.environ["OM_LOCAL_HOST_URL"]
+OM_TARGET_HOST = _om_os.environ["OM_TARGET_HOST"]
+OM_HOST_MODE = _om_os.environ["OM_HOST_MODE"]
+OM_OPT_JSON = _om_os.environ["OM_OPT_JSON"]
+OM_MULTI_HOSTS = _om_os.environ["OM_MULTI_HOSTS"]
+OM_REMOTE_HOST_IP = _om_os.environ["OM_REMOTE_HOST_IP"]
+OM_C_RESET = _om_os.environ["OM_C_RESET"]
+OM_C_BOLD = _om_os.environ["OM_C_BOLD"]
+OM_C_GREEN = _om_os.environ["OM_C_GREEN"]
+OM_C_YELLOW = _om_os.environ["OM_C_YELLOW"]
+OM_C_CYAN = _om_os.environ["OM_C_CYAN"]
+OM_C_DIM = _om_os.environ["OM_C_DIM"]
+import urllib.request, json, time, datetime, sys
+
+remote_url = OM_REMOTE_HOST_URL
+local_url = OM_LOCAL_HOST_URL
+target = OM_TARGET_HOST
+mode = OM_HOST_MODE
+as_json = OM_OPT_JSON.lower() == "true"
+
+hosts_to_query = []
+if mode == 'multi':
+    hosts_to_query.extend((u.split('://', 1)[-1], u) for u in OM_MULTI_HOSTS.split())
+elif mode == 'custom':
+    hosts_to_query.append(('custom', target))
+elif mode == 'remote':
+    hosts_to_query.append((f'remote ({OM_REMOTE_HOST_IP})', remote_url))
+elif mode == 'local':
+    hosts_to_query.append(('local', local_url))
+else:
+    hosts_to_query.append(('local', local_url))
+    hosts_to_query.append((f'remote ({OM_REMOTE_HOST_IP})', remote_url))
+
+all_ps = []
+for label, url in hosts_to_query:
+    try:
+        req = urllib.request.Request(url + '/api/ps', headers={'User-Agent': 'ollama_mgr'})
+        with urllib.request.urlopen(req, timeout=2.5) as r:
+            data = json.loads(r.read().decode('utf-8'))
+            for m in data.get('models', []):
+                m['host_label'] = label
+                m['host_url'] = url
+                all_ps.append(m)
+    except Exception:
+        pass
+
+if as_json:
+    print(json.dumps(all_ps, indent=2))
+    sys.exit(0)
+
+C_RESET = OM_C_RESET
+C_BOLD = OM_C_BOLD
+C_GREEN = OM_C_GREEN
+C_YELLOW = OM_C_YELLOW
+C_CYAN = OM_C_CYAN
+C_DIM = OM_C_DIM
+
+if not all_ps:
+    print(f"{C_DIM}No models currently loaded in VRAM (Local: idle, Remote: idle).{C_RESET}")
+    sys.exit(0)
+
+print(f"{C_BOLD}CURRENTLY LOADED MODELS IN VRAM:{C_RESET}")
+printf_fmt = "{:<22} {:<38} {:<12} {:<24} {:<10} {:<16}"
+print(printf_fmt.format("HOST", "MODEL NAME", "ID", "VRAM / TOTAL", "CONTEXT", "STATUS / UNTIL"))
+print("-" * 124)
+
+for m in all_ps:
+    name = m.get('name', 'unknown')
+    raw_digest = m.get('digest', '')
+    short_id = raw_digest.replace('sha256:', '')[:12] if raw_digest else '-'
+    size_total = m.get('size', 0)
+    size_vram = m.get('size_vram', 0)
+    ctx = str(m.get('context_length') or '-')
+
+    total_gb = size_total / (1024**3)
+    vram_gb = size_vram / (1024**3)
+    if size_total > 0:
+        gpu_pct = int(round((size_vram / size_total) * 100))
+        vram_desc = f"{vram_gb:.1f}/{total_gb:.1f} GB ({gpu_pct}% GPU)"
+    else:
+        vram_desc = f"{vram_gb:.1f} GB"
+
+    expires_at = m.get('expires_at', '')
+    status_desc = "Loaded"
+    if 'Stopping' in str(expires_at):
+        status_desc = f"{C_YELLOW}Stopping...{C_RESET}"
+    elif expires_at:
+        try:
+            exp_clean = expires_at.split('.')[0]
+            if '+' in exp_clean:
+                exp_clean = exp_clean.split('+')[0]
+            exp_dt = datetime.datetime.fromisoformat(exp_clean)
+            now_dt = datetime.datetime.now()
+            diff = (exp_dt - now_dt).total_seconds()
+            if diff > 0:
+                mins = int(diff // 60)
+                secs = int(diff % 60)
+                status_desc = f"{mins}m {secs}s"
+            else:
+                status_desc = f"{C_YELLOW}Stopping...{C_RESET}"
+        except Exception:
+            status_desc = "Active"
+
+    print(printf_fmt.format(m['host_label'], name, short_id, vram_desc, ctx, status_desc))
+print()
+PYEOF
+}
+
+# -----------------------------------------------------------------------------
+# Command: status
+# -----------------------------------------------------------------------------
+cmd_status() {
+    local as_json="${OPT_JSON}"
+
+    local tunnel_state
+    tunnel_state=$(systemctl is-active ollama-remote-tunnel.service 2>/dev/null || echo "unknown")
+    local tunnel_enter
+    tunnel_enter=$(systemctl show ollama-remote-tunnel.service -p ActiveEnterTimestamp --value 2>/dev/null || true)
+
+    local timer_last timer_next svc_start
+    timer_last=$(systemctl show ollama-stream-keepalive.timer -p LastTriggerUSec --value 2>/dev/null || true)
+    timer_next=$(systemctl show ollama-stream-keepalive.timer -p NextElapseUSecRealtime --value 2>/dev/null || true)
+    if [[ -z "${timer_next}" || "${timer_next}" == "n/a" ]]; then
+        timer_next=$(systemctl list-timers ollama-stream-keepalive.timer --no-pager 2>/dev/null | sed -n '2p' | cut -c1-28)
+    fi
+    svc_start=$(systemctl show ollama-stream-keepalive.service -p ExecMainStartTimestamp --value 2>/dev/null || true)
+
+    # Remote daemon via the tunnel (version + latency)
+    local vresp vcode vlat remote_ver
+    vresp=$(curl -s --connect-timeout 2 -m 4 -w '|%{http_code}|%{time_total}' "${REMOTE_HOST_URL}/api/version" 2>/dev/null || true)
+    vcode=$(echo "${vresp}" | awk -F'|' '{print $2}')
+    vlat=$(echo "${vresp}" | awk -F'|' '{print $3}')
+    remote_ver=$(echo "${vresp}" | awk -F'|' '{print $1}' | jq -r '.version? // empty' 2>/dev/null || true)
+
+    # VRAM residency
+    local psresp nloaded rmodel rvram runtil
+    psresp=$(curl -s --connect-timeout 2 -m 4 "${REMOTE_HOST_URL}/api/ps" 2>/dev/null || true)
+    nloaded=$(echo "${psresp}" | jq -r '.models | length' 2>/dev/null || echo 0)
+    rmodel=$(echo "${psresp}" | jq -r '.models[0].name // empty' 2>/dev/null || true)
+    rvram=$(echo "${psresp}" | jq -r '.models[0].size_vram? // 0' 2>/dev/null | awk '{printf "%.1f", $1/1073741824}')
+    runtil=$(echo "${psresp}" | jq -r '.models[0].expires_at? // empty' 2>/dev/null | cut -d. -f1)
+
+    # Public token-gated endpoint (via the local Apache vhost, bypassing NAT hairpin)
+    local tok pubbody pubresp pub_models
+    tok=""
+    if [[ -f /etc/apache2/ollama-api.token ]]; then
+        tok=$(awk '{print $2}' /etc/apache2/ollama-api.token 2>/dev/null || true)
+    fi
+    pubbody=$(curl -s --resolve www.kalidroid.com:443:127.0.0.1 -m 8 -w '\n%{http_code}' -H "Authorization: Bearer ${tok}" "https://www.kalidroid.com/ollama/api/tags" 2>/dev/null || true)
+    pubresp=$(echo "${pubbody}" | tail -n1)
+    pub_models=$(echo "${pubbody}" | head -n-1 | jq -r '.models | length' 2>/dev/null || true)
+    [[ "${pub_models}" == "-" || -z "${pub_models}" ]] && pub_models="0"
+
+    [[ -n "${vlat}" ]] && vlat=$(printf "%.0f" "$(echo "${vlat}" | awk '{print $1*1000}')")
+    if [[ -z "${remote_ver}" ]] && [[ "${vcode}" != "200" ]]; then
+        vcode=""
+    fi
+
+    if [[ "${as_json}" == "true" ]]; then
+        [[ "${vcode}" != "200" ]] && vcode=""
+        jq -n \
+          --arg tunnel "${tunnel_state}" \
+          --arg tunnel_enter "${tunnel_enter:--}" \
+          --arg remote_version "${remote_ver:--}" \
+          --arg remote_latency_ms "${vlat:--}" \
+          --argjson resident_models "${nloaded:-0}" \
+          --arg resident_name "${rmodel:--}" \
+          --arg resident_vram_gb "${rvram:-0}" \
+          --arg resident_until "${runtil:--}" \
+          --arg timer_last "${timer_last:--}" \
+          --arg timer_next "${timer_next:--}" \
+          --arg service_last "${svc_start:--}" \
+          --arg public_url "https://www.kalidroid.com/ollama" \
+          --arg public_http "${pubresp:--}" \
+          --argjson public_models "${pub_models:-0}" \
+          '{tunnel:{service:"ollama-remote-tunnel.service",state:$tunnel,entered:$tunnel_enter},remote:{url:"'"${REMOTE_HOST_URL}"'",version:$remote_version,latency_ms:$remote_latency_ms,resident:{count:$resident_models,name:$resident_name,vram_gb:$resident_vram_gb,until:$resident_until}},keepalive:{timer_last_run:$timer_last,timer_next_run:$timer_next,service_last_start:$service_last},public:{url:$public_url,http:$public_http,models:$public_models}}'
+        exit 0
+    fi
+
+    local tbadge rbadge pbadge
+    if [[ "${tunnel_state}" == "active" ]]; then
+        tbadge="${C_GREEN}${tunnel_state}${C_RESET}"
+    else
+        tbadge="${C_RED}${tunnel_state}${C_RESET}"
+    fi
+    if [[ "${vcode}" == "200" ]]; then
+        rbadge="${C_GREEN}online${C_RESET}"
+    else
+        rbadge="${C_RED}offline${C_RESET}"
+    fi
+    if [[ "${pubresp}" == "200" ]]; then
+        pbadge="${C_GREEN}200 OK${C_RESET}"
+    else
+        pbadge="${C_RED}${pubresp:-no response}${C_RESET}"
+    fi
+
+    echo "${C_BOLD}OLLAMA MANAGER — STATUS${C_RESET}"
+    echo "---------------------------------------------------------------------"
+    printf "  %-38s : %s\n" "Tunnel (ollama-remote-tunnel.service)" "${tbadge} (entered ${tunnel_enter:-?})"
+    printf "  %-38s : %s  %s  ~%sms\n" "Remote API (${REMOTE_HOST_URL})" "${rbadge}" "${remote_ver:--}" "${vlat:--}"
+    if [[ "${nloaded:-0}" -gt 0 ]]; then
+        printf "  %-38s : %s loaded — %s (%s GB, until %s)\n" "VRAM residency" "${C_GREEN}${nloaded}${C_RESET}" "${C_CYAN}${rmodel}${C_RESET}" "${rvram}" "${runtil:-n/a}"
+    else
+        printf "  %-38s : %s\n" "VRAM residency" "${C_DIM}idle (0 loaded)${C_RESET}"
+    fi
+    echo "  Keepalive timer (ollama-stream-keepalive.timer):"
+    printf "      %-28s : %s\n" "last trigger" "${timer_last:-never}"
+    printf "      %-28s : %s\n" "next trigger" "${timer_next:-n/a}"
+    printf "      %-28s : %s\n" "service last start" "${svc_start:-never}"
+    printf "  %-38s : %s  %s models (token: /etc/apache2/ollama-api.token)\n" "Public endpoint https://www.kalidroid.com/ollama" "${pbadge}" "${pub_models}"
+    echo "---------------------------------------------------------------------"
+}
+
+# -----------------------------------------------------------------------------
+# Command: status-report
+# -----------------------------------------------------------------------------
+cmd_status_report() {
+    local logfile="${STATUS_REPORT_LOG:-/var/log/ollama-status-report.log}"
+    local dir
+    dir=$(dirname "${logfile}")
+    mkdir -p "${dir}"
+    {
+        echo "=== status snapshot $(date '+%F %T %Z') ==="
+        cmd_status
+        echo
+    } >> "${logfile}"
+    echo "${C_GREEN}[✓] Appended status snapshot to ${logfile}${C_RESET}"
+}
+
+# -----------------------------------------------------------------------------
+# Command: logs
+# -----------------------------------------------------------------------------
+cmd_logs() {
+    local target="${1:-}"
+    local lines="${LOG_LINES:-60}"
+    case "${target}" in
+        tunnel)
+            journalctl -u ollama-remote-tunnel.service -n "${lines}" --no-pager
+            ;;
+        keepalive|stream|warm)
+            journalctl -u ollama-stream-keepalive.service -n "${lines}" --no-pager
+            ;;
+        timer)
+            journalctl -u ollama-stream-keepalive.timer -n "${lines}" --no-pager
+            ;;
+        apache|web)
+            journalctl -u apache2.service -n "${lines}" --no-pager
+            ;;
+        all|"")
+            cmd_logs tunnel && echo && cmd_logs keepalive
+            ;;
+        *)
+            if journalctl -u "${target}" -n "${lines}" --no-pager 2>/dev/null; then
+                :
+            else
+                echo "${C_RED}Unknown log target '${target}'. Try: tunnel | keepalive | timer | apache | all${C_RESET}" >&2
+                return 1
+            fi
+            ;;
+    esac
+}
+
+# -----------------------------------------------------------------------------
+# Command: rotate-token
+# -----------------------------------------------------------------------------
+cmd_rotate_token() {
+    local force=false
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -y|--yes|--force) force=true; shift ;;
+            *) shift ;;
+        esac
+    done
+
+    local tfile="/etc/apache2/ollama-api.token"
+    if [[ ! -f "${tfile}" ]]; then
+        echo "${C_RED}Error: ${tfile} not found.${C_RESET}" >&2
+        exit 1
+    fi
+    local old
+    old=$(awk '{print $2}' "${tfile}")
+
+    if ! ${force}; then
+        read -r -p "Rotate the public API token? This invalidates https://www.kalidroid.com/ollama auth for all clients. [y/N] " ans
+        [[ "${ans}" == "y" || "${ans}" == "Y" ]] || { echo "Aborted."; exit 0; }
+    fi
+
+    local new
+    new=$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')
+    cp -a "${tfile}" "${tfile}.bk"
+    printf 'token %s\n' "${new}" > "${tfile}"
+    chmod 640 "${tfile}"
+    chown root:www-data "${tfile}" 2>/dev/null || true
+
+    if ! /root/render-ollama-proxy.sh; then
+        cp -a "${tfile}.bk" "${tfile}"
+        echo "${C_RED}[!] Proxy render failed; old token restored.${C_RESET}" >&2
+        exit 1
+    fi
+    if ! apache2ctl configtest >/dev/null 2>&1; then
+        cp -a "${tfile}.bk" "${tfile}"
+        /root/render-ollama-proxy.sh || true
+        echo "${C_RED}[!] Apache configtest failed; rolled back to previous token.${C_RESET}" >&2
+        exit 1
+    fi
+
+    local old_code new_code url="https://www.kalidroid.com/ollama/api/tags"
+    systemctl reload apache2
+    new_code=$(curl -s --resolve www.kalidroid.com:443:127.0.0.1 -m 8 -o /dev/null -w '%{http_code}' -H "Authorization: Bearer ${new}" "${url}" || true)
+    old_code=$(curl -s --resolve www.kalidroid.com:443:127.0.0.1 -m 8 -o /dev/null -w '%{http_code}' -H "Authorization: Bearer ${old}" "${url}" || true)
+    if [[ "${new_code}" != "200" || "${old_code}" == "200" ]]; then
+        cp -a "${tfile}.bk" "${tfile}"
+        /root/render-ollama-proxy.sh || true
+        systemctl reload apache2
+        echo "${C_RED}[!] Live verification failed (new=${new_code:-down}, old=${old_code:-down}); rolled back to previous token.${C_RESET}" >&2
+        exit 1
+    fi
+
+    echo "${C_GREEN}[✓] Token rotated and verified (new: HTTP ${new_code}, old: HTTP ${old_code}). Previous token kept at ${tfile}.bk.${C_RESET}"
+    echo "  endpoint : https://www.kalidroid.com/ollama"
+    echo "  new token: ${new}"
+    echo "  curl     : curl -H 'Authorization: Bearer ${new}' https://www.kalidroid.com/ollama/api/tags"
+}
+cmd_stop() {
+    local target_model="${1:-}"
+
+    OM_REMOTE_HOST_URL="${REMOTE_HOST_URL}" OM_LOCAL_HOST_URL="${LOCAL_HOST_URL}" OM_TARGET_HOST="${TARGET_HOST}" OM_HOST_MODE="${HOST_MODE}" OM_target_model="${target_model}" OM_MULTI_HOSTS="${MULTI_HOSTS}" OM_C_GREEN="${C_GREEN}" OM_C_RESET="${C_RESET}" OM_C_RED="${C_RED}" OM_C_BOLD="${C_BOLD}" OM_C_DIM="${C_DIM}" \
+        python3 - <<'PYEOF'
+import os as _om_os
+OM_REMOTE_HOST_URL = _om_os.environ["OM_REMOTE_HOST_URL"]
+OM_LOCAL_HOST_URL = _om_os.environ["OM_LOCAL_HOST_URL"]
+OM_TARGET_HOST = _om_os.environ["OM_TARGET_HOST"]
+OM_HOST_MODE = _om_os.environ["OM_HOST_MODE"]
+OM_target_model = _om_os.environ["OM_target_model"]
+OM_MULTI_HOSTS = _om_os.environ["OM_MULTI_HOSTS"]
+OM_C_GREEN = _om_os.environ["OM_C_GREEN"]
+OM_C_RESET = _om_os.environ["OM_C_RESET"]
+OM_C_RED = _om_os.environ["OM_C_RED"]
+OM_C_BOLD = _om_os.environ["OM_C_BOLD"]
+OM_C_DIM = _om_os.environ["OM_C_DIM"]
+import urllib.request, json, sys
+
+remote_url = OM_REMOTE_HOST_URL
+local_url = OM_LOCAL_HOST_URL
+target_host = OM_TARGET_HOST
+mode = OM_HOST_MODE
+target_model = OM_target_model.strip()
+
+hosts = []
+if mode == 'multi':
+    hosts.extend((u.split('://', 1)[-1], u) for u in OM_MULTI_HOSTS.split())
+elif mode == 'custom':
+    hosts.append(('custom', target_host))
+elif mode == 'remote':
+    hosts.append(('remote', remote_url))
+elif mode == 'local':
+    hosts.append(('local', local_url))
+else:
+    hosts.append(('local', local_url))
+    hosts.append(('remote', remote_url))
+
+stopped_count = 0
+
+def unload_model(host_label, url, model_name):
+    payload = json.dumps({'model': model_name, 'keep_alive': 0}).encode('utf-8')
+    req = urllib.request.Request(
+        url + '/api/generate',
+        data=payload,
+        headers={'Content-Type': 'application/json', 'User-Agent': 'ollama_mgr'}
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read().decode('utf-8'))
+            print(f"{OM_C_GREEN}[✓] Unloaded model \"{model_name}\" from {host_label} (GPU VRAM freed).{OM_C_RESET}")
+            return True
+    except Exception as e:
+        print(f"{OM_C_RED}[!] Failed to unload \"{model_name}\" on {host_label}: {e}{OM_C_RESET}", file=sys.stderr)
+        return False
+
+# Stop ALL loaded models if target is empty, 'all', or '--all'
+if not target_model or target_model in ['all', '--all']:
+    print(f"{OM_C_BOLD}Scanning active VRAM models to unload...{OM_C_RESET}")
+    for label, url in hosts:
+        try:
+            req = urllib.request.Request(url + '/api/ps', headers={'User-Agent': 'ollama_mgr'})
+            with urllib.request.urlopen(req, timeout=3) as r:
+                models = json.loads(r.read().decode('utf-8')).get('models', [])
+                for m in models:
+                    name = m.get('name')
+                    if name:
+                        if unload_model(label, url, name):
+                            stopped_count += 1
+        except Exception:
+            pass
+    if stopped_count == 0:
+        print(f"{OM_C_DIM}No active models found in VRAM to stop.{OM_C_RESET}")
+else:
+    for label, url in hosts:
+        try:
+            req = urllib.request.Request(url + '/api/tags', headers={'User-Agent': 'ollama_mgr'})
+            with urllib.request.urlopen(req, timeout=3) as r:
+                tags = json.loads(r.read().decode('utf-8')).get('models', [])
+                matched = [m['name'] for m in tags if m['name'] == target_model or m['name'].startswith(target_model + ':')]
+                if matched:
+                    if unload_model(label, url, matched[0]):
+                        stopped_count += 1
+        except Exception:
+            pass
+    if stopped_count == 0:
+        label, url = hosts[0]
+        unload_model(label, url, target_model)
+PYEOF
+}
+
+# -----------------------------------------------------------------------------
+# Command: warm / preload
+# -----------------------------------------------------------------------------
+cmd_warm() {
+    local target_model="${1:-}"
+    if [[ -z "${target_model}" ]]; then
+        echo "${C_RED}Error: 'warm' requires a model name.${C_RESET}" >&2
+        echo "Usage: ${0##*/} warm <model> [duration]" >&2
+        exit 1
+    fi
+    local duration="${2:-24h}"
+    local active_host=""
+    local resolved_model="${target_model}"
+
+    if [[ -n "${TARGET_HOST}" ]]; then
+        active_host="${TARGET_HOST}"
+        local res
+        res=$(resolve_model_name "${target_model}" "${active_host}" || true)
+        [[ -n "${res}" ]] && resolved_model="${res}"
+    else
+        # Desktop GPU first: a model on both hosts must not land on the Pi, which
+        # has no GPU - its bridge refuses anything over the 8 GiB budget, and a
+        # direct load is OOM-killed by ollama-memory-guard.
+        local local_res="" remote_first
+        remote_first=$(resolve_model_name "${target_model}" "${REMOTE_HOST_URL}" || true)
+        [[ -z "${remote_first}" ]] && local_res=$(resolve_model_name "${target_model}" "${LOCAL_HOST_URL}" || true)
+        if [[ -n "${remote_first}" ]]; then
+            resolved_model="${remote_first}"
+            active_host="${REMOTE_HOST_URL}"
+        elif [[ -n "${local_res}" ]]; then
+            resolved_model="${local_res}"
+            active_host="${LOCAL_HOST_URL}"
+        else
+            local remote_res
+            remote_res=$(resolve_model_name "${target_model}" "${REMOTE_HOST_URL}" || true)
+            if [[ -n "${remote_res}" ]]; then
+                resolved_model="${remote_res}"
+                active_host="${REMOTE_HOST_URL}"
+            else
+                active_host="${LOCAL_HOST_URL}"
+            fi
+        fi
+    fi
+
+    echo "${C_CYAN}[*] Pre-warming model '${resolved_model}' into GPU VRAM on ${active_host} (keep_alive: ${duration})...${C_RESET}"
+    local resp
+    resp=$(curl -s -X POST "${active_host}/api/generate" \
+        -H "Content-Type: application/json" \
+        -d "$(jq -nc --arg m "${resolved_model}" --arg k "${duration}" '{model: $m, keep_alive: $k}')")
+
+    if echo "${resp}" | grep -q '"done_reason":"load"'; then
+        echo "${C_GREEN}[✓] Successfully pre-warmed '${resolved_model}' into VRAM (resident for ${duration}).${C_RESET}"
+    else
+        echo "${C_YELLOW}[*] Warm result: ${resp}${C_RESET}"
+    fi
+}
+
+# -----------------------------------------------------------------------------
+# Command: info / show
+# -----------------------------------------------------------------------------
+cmd_info() {
+    local model="${1:-}"
+    if [[ -z "${model}" ]]; then
+        echo "${C_RED}Error: 'info' requires a model name.${C_RESET}" >&2
+        echo "Usage: ${0##*/} info <model>" >&2
+        exit 1
+    fi
+
+    OM_model="${model}" OM_REMOTE_HOST_URL="${REMOTE_HOST_URL}" OM_LOCAL_HOST_URL="${LOCAL_HOST_URL}" OM_TARGET_HOST="${TARGET_HOST}" OM_HOST_MODE="${HOST_MODE}" OM_OPT_JSON="${OPT_JSON}" OM_MULTI_HOSTS="${MULTI_HOSTS}" OM_C_RED="${C_RED}" OM_C_RESET="${C_RESET}" OM_C_BOLD="${C_BOLD}" OM_C_GREEN="${C_GREEN}" OM_C_CYAN="${C_CYAN}" OM_C_YELLOW="${C_YELLOW}" \
+        python3 - <<'PYEOF'
+import os as _om_os
+OM_model = _om_os.environ["OM_model"]
+OM_REMOTE_HOST_URL = _om_os.environ["OM_REMOTE_HOST_URL"]
+OM_LOCAL_HOST_URL = _om_os.environ["OM_LOCAL_HOST_URL"]
+OM_TARGET_HOST = _om_os.environ["OM_TARGET_HOST"]
+OM_HOST_MODE = _om_os.environ["OM_HOST_MODE"]
+OM_OPT_JSON = _om_os.environ["OM_OPT_JSON"]
+OM_MULTI_HOSTS = _om_os.environ["OM_MULTI_HOSTS"]
+OM_C_RED = _om_os.environ["OM_C_RED"]
+OM_C_RESET = _om_os.environ["OM_C_RESET"]
+OM_C_BOLD = _om_os.environ["OM_C_BOLD"]
+OM_C_GREEN = _om_os.environ["OM_C_GREEN"]
+OM_C_CYAN = _om_os.environ["OM_C_CYAN"]
+OM_C_YELLOW = _om_os.environ["OM_C_YELLOW"]
+import urllib.request, json, sys
+
+model_name = OM_model.strip()
+remote_url = OM_REMOTE_HOST_URL
+local_url = OM_LOCAL_HOST_URL
+target_host = OM_TARGET_HOST
+mode = OM_HOST_MODE
+as_json = OM_OPT_JSON.lower() == "true"
+
+hosts = []
+if mode == 'multi':
+    hosts.extend((u.split('://', 1)[-1], u) for u in OM_MULTI_HOSTS.split())
+elif mode == 'custom':
+    hosts.append(('custom', target_host))
+elif mode == 'remote':
+    hosts.append(('remote', remote_url))
+elif mode == 'local':
+    hosts.append(('local', local_url))
+else:
+    hosts.append(('local', local_url))
+    hosts.append(('remote', remote_url))
+
+found_host = None
+found_tag = None
+show_data = None
+
+for label, url in hosts:
+    try:
+        req = urllib.request.Request(url + '/api/tags', headers={'User-Agent': 'ollama_mgr'})
+        with urllib.request.urlopen(req, timeout=3) as r:
+            tags = json.loads(r.read().decode('utf-8')).get('models', [])
+            names = [m['name'] for m in tags]
+            cand = None
+            if model_name in names:
+                cand = model_name
+            elif f"{model_name}:latest" in names:
+                cand = f"{model_name}:latest"
+            else:
+                for n in names:
+                    if n.startswith(f"{model_name}:"):
+                        cand = n
+                        break
+            if cand:
+                show_req = urllib.request.Request(
+                    url + '/api/show',
+                    data=json.dumps({'name': cand}).encode('utf-8'),
+                    headers={'Content-Type': 'application/json', 'User-Agent': 'ollama_mgr'}
+                )
+                with urllib.request.urlopen(show_req, timeout=5) as sr:
+                    show_data = json.loads(sr.read().decode('utf-8'))
+                    found_host = label
+                    found_tag = cand
+                    break
+    except Exception:
+        continue
+
+if not show_data:
+    print(f"{OM_C_RED}Error: Model \"{model_name}\" not found on local or remote Ollama servers.{OM_C_RESET}", file=sys.stderr)
+    sys.exit(1)
+
+if as_json:
+    show_data['source_host'] = found_host
+    show_data['resolved_name'] = found_tag
+    print(json.dumps(show_data, indent=2))
+    sys.exit(0)
+
+C_RESET = OM_C_RESET
+C_BOLD = OM_C_BOLD
+C_GREEN = OM_C_GREEN
+C_CYAN = OM_C_CYAN
+C_YELLOW = OM_C_YELLOW
+
+details = show_data.get('details', {})
+caps = show_data.get('capabilities', [])
+model_info = show_data.get('model_info', {})
+
+ctx_len = '-'
+for k, v in model_info.items():
+    if k.endswith('.context_length'):
+        ctx_len = f"{v:,}"
+        break
+
+param_size = details.get('parameter_size', 'unknown')
+quant = details.get('quantization_level', 'unknown')
+family = details.get('family', 'unknown')
+fmt = details.get('format', 'gguf')
+modified = show_data.get('modified_at', '-')[:19].replace('T', ' ')
+
+print(f"{C_BOLD}MODEL SPECIFICATIONS:{C_RESET} {C_CYAN}{found_tag}{C_RESET} ({found_host})")
+print("=" * 68)
+print(f"  {C_BOLD}Architecture / Family:{C_RESET}   {family} ({fmt})")
+print(f"  {C_BOLD}Parameter Size:{C_RESET}          {param_size}")
+print(f"  {C_BOLD}Quantization Level:{C_RESET}      {quant}")
+print(f"  {C_BOLD}Context Window:{C_RESET}          {ctx_len} tokens")
+params = show_data.get('parameters', '').strip()
+if params:
+    print(f"  {C_BOLD}Runtime Parameters:{C_RESET}")
+    for pl in params.splitlines():
+        print(f"    • {pl.strip()}")
+print(f"  {C_BOLD}Capabilities:{C_RESET}            {', '.join(caps) if caps else 'completion'}")
+print(f"  {C_BOLD}Last Modified:{C_RESET}           {modified}")
+print("=" * 68)
+
+template = show_data.get('template', '').strip()
+if template:
+    print(f"{C_BOLD}Prompt Template Preview:{C_RESET}")
+    for line in template.splitlines()[:6]:
+        print(f"  {line}")
+    if len(template.splitlines()) > 6:
+        print(f"  {C_YELLOW}... [truncated] ...{C_RESET}")
+print()
+PYEOF
+}
+
+# -----------------------------------------------------------------------------
+# Command: list / ls
+# -----------------------------------------------------------------------------
+cmd_list() {
+    local filter_pattern="${1:-}"
+
+    OM_REMOTE_HOST_URL="${REMOTE_HOST_URL}" OM_LOCAL_HOST_URL="${LOCAL_HOST_URL}" OM_TARGET_HOST="${TARGET_HOST}" OM_HOST_MODE="${HOST_MODE}" OM_filter_pattern="${filter_pattern}" OM_OPT_JSON="${OPT_JSON}" OM_MULTI_HOSTS="${MULTI_HOSTS}" OM_C_RESET="${C_RESET}" OM_C_BOLD="${C_BOLD}" OM_C_GREEN="${C_GREEN}" OM_C_YELLOW="${C_YELLOW}" OM_C_CYAN="${C_CYAN}" OM_C_DIM="${C_DIM}" \
+        python3 - <<'PYEOF'
+import os as _om_os
+OM_REMOTE_HOST_URL = _om_os.environ["OM_REMOTE_HOST_URL"]
+OM_LOCAL_HOST_URL = _om_os.environ["OM_LOCAL_HOST_URL"]
+OM_TARGET_HOST = _om_os.environ["OM_TARGET_HOST"]
+OM_HOST_MODE = _om_os.environ["OM_HOST_MODE"]
+OM_filter_pattern = _om_os.environ["OM_filter_pattern"]
+OM_OPT_JSON = _om_os.environ["OM_OPT_JSON"]
+OM_MULTI_HOSTS = _om_os.environ["OM_MULTI_HOSTS"]
+OM_C_RESET = _om_os.environ["OM_C_RESET"]
+OM_C_BOLD = _om_os.environ["OM_C_BOLD"]
+OM_C_GREEN = _om_os.environ["OM_C_GREEN"]
+OM_C_YELLOW = _om_os.environ["OM_C_YELLOW"]
+OM_C_CYAN = _om_os.environ["OM_C_CYAN"]
+OM_C_DIM = _om_os.environ["OM_C_DIM"]
+import urllib.request, json, sys
+
+remote_url = OM_REMOTE_HOST_URL
+local_url = OM_LOCAL_HOST_URL
+target_host = OM_TARGET_HOST
+mode = OM_HOST_MODE
+filter_kw = OM_filter_pattern.strip().lower()
+as_json = OM_OPT_JSON.lower() == "true"
+
+hosts = []
+if mode == 'multi':
+    hosts.extend((u.split('://', 1)[-1], u) for u in OM_MULTI_HOSTS.split())
+elif mode == 'custom':
+    hosts.append(('custom', target_host))
+elif mode == 'remote':
+    hosts.append(('remote', remote_url))
+elif mode == 'local':
+    hosts.append(('local', local_url))
+else:
+    hosts.append(('local', local_url))
+    hosts.append(('remote', remote_url))
+
+active_models = set()
+for label, url in hosts:
+    try:
+        req = urllib.request.Request(url + '/api/ps', headers={'User-Agent': 'ollama_mgr'})
+        with urllib.request.urlopen(req, timeout=2) as r:
+            ps_data = json.loads(r.read().decode('utf-8')).get('models', [])
+            for pm in ps_data:
+                active_models.add(pm.get('name'))
+    except Exception:
+        pass
+
+merged_models = []
+seen_keys = set()
+
+for label, url in hosts:
+    try:
+        req = urllib.request.Request(url + '/api/tags', headers={'User-Agent': 'ollama_mgr'})
+        with urllib.request.urlopen(req, timeout=3) as r:
+            tags_data = json.loads(r.read().decode('utf-8')).get('models', [])
+            for m in tags_data:
+                name = m.get('name')
+                key = (name, label)
+                if key in seen_keys:
+                    continue
+                seen_keys.add(key)
+                m['source_host'] = label
+                m['is_active_vram'] = name in active_models
+                merged_models.append(m)
+    except Exception:
+        pass
+
+if filter_kw:
+    filtered = []
+    for m in merged_models:
+        name = m.get('name', '').lower()
+        family = str((m.get('details') or {}).get('family', '')).lower()
+        if filter_kw in name or filter_kw in family:
+            filtered.append(m)
+    merged_models = filtered
+
+if as_json:
+    print(json.dumps(merged_models, indent=2))
+    sys.exit(0)
+
+C_RESET = OM_C_RESET
+C_BOLD = OM_C_BOLD
+C_GREEN = OM_C_GREEN
+C_YELLOW = OM_C_YELLOW
+C_CYAN = OM_C_CYAN
+C_DIM = OM_C_DIM
+
+if not merged_models:
+    if filter_kw:
+        print(f"{C_YELLOW}No models matching \"{filter_kw}\" found.{C_RESET}")
+    else:
+        print(f"{C_YELLOW}No models found on target host(s).{C_RESET}")
+    sys.exit(0)
+
+merged_models.sort(key=lambda x: x.get('name', ''))
+
+hw = max(10, max(len(m.get('source_host', '')) for m in merged_models))
+fmt = "{:<44} {:<" + str(hw) + "} {:<11} {:<24} {:<14} {:<12}"
+print(f"{C_BOLD}" + fmt.format("NAME", "HOST", "SIZE", "FAMILY / PARAMS", "VRAM STATE", "MODIFIED") + f"{C_RESET}")
+print("-" * (110 + hw))
+
+for m in merged_models:
+    name = m.get('name', '')
+    host = m.get('source_host', '')
+    size_b = m.get('size', 0)
+    size_str = f"{size_b / (1024**3):.1f} GB" if size_b else '-'
+    
+    details = m.get('details') or {}
+    param = details.get('parameter_size') or '-'
+    family = details.get('family') or '-'
+    fam_str = f"{family} ({param})" if family != '-' else param
+    
+    vram_state = f"{C_GREEN}● ACTIVE{C_RESET}" if m.get('is_active_vram') else f"{C_DIM}-{C_RESET}"
+    mod = (m.get('modified_at') or '')[:10]
+    
+    print(fmt.format(name, host, size_str, fam_str, vram_state, mod))
+
+print(f"\n{C_DIM}Total: {len(merged_models)} models | Active in VRAM: {len(active_models)}{C_RESET}\n")
+PYEOF
+}
+
+# -----------------------------------------------------------------------------
+# Command: search <keyword>
+# -----------------------------------------------------------------------------
+cmd_search() {
+    local query="${1:-}"
+    if [[ -z "${query}" ]]; then
+        echo "${C_RED}Error: 'search' requires a keyword.${C_RESET}" >&2
+        echo "Usage: ${0##*/} search <keyword>" >&2
+        exit 1
+    fi
+
+    OM_REMOTE_HOST_URL="${REMOTE_HOST_URL}" OM_LOCAL_HOST_URL="${LOCAL_HOST_URL}" OM_query="${query}" OM_OPT_JSON="${OPT_JSON}" OM_HOST_MODE="${HOST_MODE}" OM_MULTI_HOSTS="${MULTI_HOSTS}" OM_TARGET_HOST="${TARGET_HOST}" OM_C_RESET="${C_RESET}" OM_C_BOLD="${C_BOLD}" OM_C_GREEN="${C_GREEN}" OM_C_YELLOW="${C_YELLOW}" OM_C_DIM="${C_DIM}" \
+        python3 - <<'PYEOF'
+import os as _om_os
+OM_REMOTE_HOST_URL = _om_os.environ["OM_REMOTE_HOST_URL"]
+OM_LOCAL_HOST_URL = _om_os.environ["OM_LOCAL_HOST_URL"]
+OM_query = _om_os.environ["OM_query"]
+OM_OPT_JSON = _om_os.environ["OM_OPT_JSON"]
+OM_HOST_MODE = _om_os.environ["OM_HOST_MODE"]
+OM_MULTI_HOSTS = _om_os.environ["OM_MULTI_HOSTS"]
+OM_TARGET_HOST = _om_os.environ["OM_TARGET_HOST"]
+OM_C_RESET = _om_os.environ["OM_C_RESET"]
+OM_C_BOLD = _om_os.environ["OM_C_BOLD"]
+OM_C_GREEN = _om_os.environ["OM_C_GREEN"]
+OM_C_YELLOW = _om_os.environ["OM_C_YELLOW"]
+OM_C_DIM = _om_os.environ["OM_C_DIM"]
+import urllib.request, json, sys
+
+remote_url = OM_REMOTE_HOST_URL
+local_url = OM_LOCAL_HOST_URL
+query = str(OM_query).strip().lower()
+as_json = OM_OPT_JSON.lower() == "true"
+
+def fetch(url, path, timeout=3):
+    try:
+        req = urllib.request.Request(url + path, headers={'User-Agent': 'ollama_mgr'})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read().decode('utf-8'))
+    except Exception:
+        return {}
+
+mode = OM_HOST_MODE
+if mode == 'multi':
+    hosts = [(u.split('://', 1)[-1], u) for u in OM_MULTI_HOSTS.split()]
+elif mode == 'custom':
+    hosts = [('custom', OM_TARGET_HOST)]
+else:
+    hosts = [('local', local_url), ('remote', remote_url)]
+
+active = set()
+for _, url in hosts:
+    for m in fetch(url, '/api/ps').get('models', []):
+        if m.get('name'):
+            active.add(m['name'])
+
+pins = {}
+try:
+    with open('/var/lib/ollama/streamed-models.json') as f:
+        pins = json.load(f) or {}
+except Exception:
+    pins = {}
+
+tuned = {}
+try:
+    with open('/var/lib/ollama/tunings.json') as f:
+        tuned = json.load(f) or {}
+except Exception:
+    tuned = {}
+
+rows = []
+for label, url in hosts:
+    for m in fetch(url, '/api/tags').get('models', []):
+        name = m.get('name', '')
+        details = m.get('details') or {}
+        family = str(details.get('family', '')).lower()
+        param = str(details.get('parameter_size', '')).lower()
+        caps = str(' '.join(details.get('capabilities') or [])).lower()
+        hay = f"{name} {family} {param} {caps}".lower()
+        if query not in hay:
+            continue
+        rows.append({
+            'name': name,
+            'host': label,
+            'size_gb': m.get('size', 0) / (1024 ** 3),
+            'param': details.get('parameter_size', '-'),
+            'active': name in active,
+            'pinned': name in pins,
+            'tuned': name in tuned,
+        })
+
+if as_json:
+    print(json.dumps(rows, indent=2))
+    sys.exit(0)
+
+C_RESET = OM_C_RESET
+C_BOLD = OM_C_BOLD
+C_GREEN = OM_C_GREEN
+C_YELLOW = OM_C_YELLOW
+C_DIM = OM_C_DIM
+
+if not rows:
+    print(f"{C_YELLOW}No models matching \"{query}\" found.{C_RESET}")
+    sys.exit(0)
+
+hw = max(8, max(len(r['host']) for r in rows))
+fmt = "{:<44} {:<" + str(hw) + "} {:<9} {:<14} {:<9} {:<9} {:<7}"
+print(f"{C_BOLD}" + fmt.format("NAME", "HOST", "SIZE", "PARAMS", "VRAM", "PINNED", "TUNED") + f"{C_RESET}")
+print("-" * (96 + hw))
+for r in sorted(rows, key=lambda x: x['name']):
+    vram = f"{C_GREEN}● ACTIVE{C_RESET}" if r['active'] else f"{C_DIM}-{C_RESET}"
+    pin = f"{C_GREEN}yes{C_RESET}" if r['pinned'] else f"{C_DIM}-{C_RESET}"
+    tun = f"{C_YELLOW}yes{C_RESET}" if r['tuned'] else f"{C_DIM}-{C_RESET}"
+    print(fmt.format(r['name'], r['host'], f"{r['size_gb']:.1f} GB", r['param'], vram, pin, tun))
+
+print(f"\n{C_DIM}Matches: {len(rows)}{C_RESET}\n")
+PYEOF
+}
+
+# -----------------------------------------------------------------------------
+# Command: tag / alias
+# -----------------------------------------------------------------------------
+cmd_tag() {
+    local src="${1:-}"
+    local dst="${2:-}"
+
+    if [[ -z "${src}" || -z "${dst}" ]]; then
+        echo "${C_RED}Error: 'tag' requires <source> and <destination> model names.${C_RESET}" >&2
+        echo "Usage: ${0##*/} tag <source_model> <target_tag>" >&2
+        exit 1
+    fi
+
+    local target_host="${TARGET_HOST}"
+    if [[ -z "${target_host}" ]]; then
+        if is_remote_model "${src}" && ! is_local_model "${src}"; then
+            target_host="${REMOTE_HOST_URL}"
+        else
+            target_host="${LOCAL_HOST_URL}"
+        fi
+    fi
+
+    echo "Creating alias on ${target_host}: '${dst}' -> '${src}'..."
+    local resp
+    resp=$(curl -s -w "%{http_code}" -X POST "${target_host}/api/copy" \
+        -H "Content-Type: application/json" \
+        -d "$(jq -nc --arg s "${src}" --arg d "${dst}" '{source: $s, destination: $d}')")
+
+    local code="${resp: -3}"
+    if [[ "${code}" == "200" ]]; then
+        echo "${C_GREEN}[✓] Successfully created tag '${dst}' pointing to '${src}' on ${target_host}.${C_RESET}"
+    else
+        echo "${C_RED}[!] Failed to create tag (HTTP ${code}): ${resp%???}${C_RESET}" >&2
+        exit 1
+    fi
+}
+
+# -----------------------------------------------------------------------------
+# Command: rm / delete
+# -----------------------------------------------------------------------------
+cmd_rm() {
+    local target_model="${1:-}"
+    if [[ -z "${target_model}" ]]; then
+        echo "${C_RED}Error: 'rm' requires a model name.${C_RESET}" >&2
+        echo "Usage: ${0##*/} rm <model>" >&2
+        exit 1
+    fi
+
+    local target_host="${TARGET_HOST}"
+    if [[ -z "${target_host}" ]]; then
+        if is_local_model "${target_model}"; then
+            target_host="${LOCAL_HOST_URL}"
+        else
+            target_host="${REMOTE_HOST_URL}"
+        fi
+    fi
+
+    echo "Deleting model '${target_model}' from ${target_host}..."
+    local resp
+    resp=$(curl -s -w "%{http_code}" -X DELETE "${target_host}/api/delete" \
+        -H "Content-Type: application/json" \
+        -d "$(jq -nc --arg n "${target_model}" '{name: $n}')")
+
+    local code="${resp: -3}"
+    if [[ "${code}" == "200" ]]; then
+        echo "${C_GREEN}[✓] Successfully deleted model '${target_model}' from ${target_host}.${C_RESET}"
+    else
+        echo "${C_RED}[!] Failed to delete model (HTTP ${code}): ${resp%???}${C_RESET}" >&2
+        exit 1
+    fi
+}
+
+# -----------------------------------------------------------------------------
+# Command: tune
+# -----------------------------------------------------------------------------
+cmd_tune() {
+    local source_model="${1:-}"
+    if [[ -z "${source_model}" ]]; then
+        echo "${C_RED}Error: 'tune' requires a model name.${C_RESET}" >&2
+        echo "Usage: ${0##*/} tune <model> [--ctx <N>] [--batch <N>] [--predict <N>] [--temp <F>] [--num-gpu <N>] [--target <name>]" >&2
+        echo "       ${0##*/} tune <model> --show | --clear" >&2
+        exit 1
+    fi
+    shift
+
+    local opt_ctx=""
+    local opt_batch=""
+    local opt_predict=""
+    local opt_temp=""
+    local opt_num_gpu=""
+    local opt_target=""
+    local opt_show=false
+    local opt_clear=false
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --ctx) opt_ctx="$2"; shift 2 ;;
+            --batch) opt_batch="$2"; shift 2 ;;
+            --predict) opt_predict="$2"; shift 2 ;;
+            --temp|--temperature) opt_temp="$2"; shift 2 ;;
+            --num-gpu|--gpu) opt_num_gpu="$2"; shift 2 ;;
+            --target|--name) opt_target="$2"; shift 2 ;;
+            --show|--preview) opt_show=true; shift ;;
+            --clear|--unset) opt_clear=true; shift ;;
+            *) echo "${C_RED}Unknown tune option: $1${C_RESET}" >&2; exit 1 ;;
+        esac
+    done
+
+    local active_host=""
+    local resolved_source="${source_model}"
+    if [[ -n "${TARGET_HOST}" ]]; then
+        active_host="${TARGET_HOST}"
+        local res
+        res=$(resolve_model_name "${source_model}" "${active_host}" || true)
+        [[ -n "${res}" ]] && resolved_source="${res}"
+    else
+        local local_res
+        local_res=$(resolve_model_name "${source_model}" "${LOCAL_HOST_URL}" || true)
+        if [[ -n "${local_res}" ]]; then
+            resolved_source="${local_res}"
+            active_host="${LOCAL_HOST_URL}"
+        else
+            local remote_res
+            remote_res=$(resolve_model_name "${source_model}" "${REMOTE_HOST_URL}" || true)
+            if [[ -n "${remote_res}" ]]; then
+                resolved_source="${remote_res}"
+                active_host="${REMOTE_HOST_URL}"
+            else
+                active_host="${LOCAL_HOST_URL}"
+            fi
+        fi
+    fi
+
+    local target_name="${opt_target:-${resolved_source}}"
+
+    # Inspect or clear the baked per-model defaults (registry only).
+    if ${opt_show} || ${opt_clear}; then
+        if ${opt_show}; then
+            local cur
+            cur=$(tuned_params "${resolved_source}" || true)
+            if [[ -n "${cur}" ]]; then
+                echo "${C_CYAN}Tuned defaults for '${resolved_source}':${C_RESET}"
+                echo "${cur}" | python3 -m json.tool | sed 's/^/    /'
+            else
+                echo "${C_DIM}No tuned defaults registered for '${resolved_source}'.${C_RESET}"
+            fi
+        fi
+        if ${opt_clear}; then
+            python3 -c '
+import json, os, sys
+f = sys.argv[1]
+m = sys.argv[2]
+if not os.path.exists(f):
+    sys.exit(0)
+d = json.load(open(f)) or {}
+removed = d.pop(m, None)
+if removed is not None:
+    tmp = f + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(d, fh, indent=2, sort_keys=True)
+        fh.write("\n")
+    os.replace(tmp, f)
+    print("removed:" + m)
+else:
+    print("absent")' "${TUNINGS_FILE}" "${resolved_source}" || true
+            echo "${C_GREEN}[✓] Cleared tuned defaults for '${resolved_source}'.${C_RESET}"
+        fi
+        exit 0
+    fi
+
+    echo "${C_CYAN}[*] Tuning model '${resolved_source}' on ${active_host}...${C_RESET}"
+
+    OM_active_host="${active_host}" OM_resolved_source="${resolved_source}" OM_target_name="${target_name}" OM_TUNINGS_FILE="${TUNINGS_FILE}" OM_opt_ctx="${opt_ctx}" OM_opt_batch="${opt_batch}" OM_opt_predict="${opt_predict}" OM_opt_temp="${opt_temp}" OM_opt_num_gpu="${opt_num_gpu}" \
+        python3 - <<'PYEOF'
+import os as _om_os
+OM_active_host = _om_os.environ["OM_active_host"]
+OM_resolved_source = _om_os.environ["OM_resolved_source"]
+OM_target_name = _om_os.environ["OM_target_name"]
+OM_TUNINGS_FILE = _om_os.environ["OM_TUNINGS_FILE"]
+OM_opt_ctx = _om_os.environ["OM_opt_ctx"]
+OM_opt_batch = _om_os.environ["OM_opt_batch"]
+OM_opt_predict = _om_os.environ["OM_opt_predict"]
+OM_opt_temp = _om_os.environ["OM_opt_temp"]
+OM_opt_num_gpu = _om_os.environ["OM_opt_num_gpu"]
+import json
+import os
+import sys
+import urllib.request
+
+host = OM_active_host
+source = OM_resolved_source
+target = OM_target_name
+tunings_file = OM_TUNINGS_FILE
+
+params = {}
+if OM_opt_ctx:
+    params["num_ctx"] = int(OM_opt_ctx)
+if OM_opt_batch:
+    params["num_batch"] = int(OM_opt_batch)
+if OM_opt_predict:
+    params["num_predict"] = int(OM_opt_predict)
+if OM_opt_temp:
+    params["temperature"] = float(OM_opt_temp)
+if OM_opt_num_gpu:
+    params["num_gpu"] = int(OM_opt_num_gpu)
+
+if not params:
+    print("\033[0;31mError: No tuning options specified (e.g. --ctx 65536, --batch 2048, --predict 8192).\033[0m", file=sys.stderr)
+    sys.exit(1)
+
+# 1) Persist as per-model defaults so 'run'/'launch' apply them automatically
+#    (baked per-model tuning; the base model manifest is left untouched).
+tunings = {}
+if os.path.exists(tunings_file):
+    try:
+        with open(tunings_file, "r", encoding="utf-8") as f:
+            tunings = json.load(f) or {}
+    except Exception:
+        tunings = {}
+tunings[source] = params
+tmp = tunings_file + ".tmp"
+with open(tmp, "w", encoding="utf-8") as f:
+    json.dump(tunings, f, indent=2, sort_keys=True)
+    f.write("\n")
+os.replace(tmp, tunings_file)
+
+print(f"\033[0;32m[✓] Registered tuned defaults for '{source}' (applies to run/launch):\033[0m")
+for k, v in params.items():
+    print(f"    • {k}: {v}")
+
+# 2) Optionally create a standalone tuned variant when --target is given.
+if target != source:
+    payload = {
+        "name": target,
+        "from": source,
+        "parameters": params,
+        "stream": False
+    }
+    req = urllib.request.Request(
+        f"{host}/api/create",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"}
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=45) as resp:
+            res = json.loads(resp.read().decode("utf-8"))
+            if res.get("status") == "success":
+                print(f"\033[0;32m[✓] Created tuned variant '{target}' on {host}. (registry kept under '{source}')\033[0m")
+            else:
+                print(f"\033[0;31m[!] Failed to create variant: {res}\033[0m", file=sys.stderr)
+                sys.exit(1)
+    except Exception as e:
+        print(f"\033[0;31m[!] HTTP error: {e}\033[0m", file=sys.stderr)
+        sys.exit(1)
+else:
+    print("\033[0;36m[*] No --target given: defaults baked for run/launch (base model untouched).\033[0m")
+PYEOF
+}
+
+# -----------------------------------------------------------------------------
+# Command: bench / eval
+# -----------------------------------------------------------------------------
+cmd_bench() {
+    local target_model="${1:-}"
+    local predict_tokens=60
+
+    if [[ "${1:-}" == "--predict" && -n "${2:-}" ]]; then
+        predict_tokens="$2"
+        target_model=""
+    elif [[ "${2:-}" == "--predict" && -n "${3:-}" ]]; then
+        predict_tokens="$3"
+    fi
+
+    local active_host=""
+    local resolved_model="${target_model}"
+
+    if [[ -n "${TARGET_HOST}" ]]; then
+        active_host="${TARGET_HOST}"
+    else
+        active_host="${REMOTE_HOST_URL}"
+    fi
+
+    if [[ -z "${resolved_model}" ]]; then
+        local vram_model
+        vram_model=$(curl -s --connect-timeout 2 -m 3 "${active_host}/api/ps" | jq -r '.models[0].name // empty' 2>/dev/null || true)
+        if [[ -n "${vram_model}" ]]; then
+            resolved_model="${vram_model}"
+        else
+            resolved_model="kalidroid-27b:latest"
+        fi
+    fi
+
+    local res
+    res=$(resolve_model_name "${resolved_model}" "${active_host}" || true)
+    [[ -n "${res}" ]] && resolved_model="${res}"
+
+    echo "${C_CYAN}[*] Benchmarking '${resolved_model}' on ${active_host} (generating ${predict_tokens} tokens)...${C_RESET}"
+
+    OM_active_host="${active_host}" OM_resolved_model="${resolved_model}" OM_predict_tokens="${predict_tokens}" \
+        python3 - <<'PYEOF'
+import os as _om_os
+OM_active_host = _om_os.environ["OM_active_host"]
+OM_resolved_model = _om_os.environ["OM_resolved_model"]
+OM_predict_tokens = _om_os.environ["OM_predict_tokens"]
+import json
+import urllib.request
+import sys
+import time
+
+host = OM_active_host
+model = OM_resolved_model
+tokens_to_predict = int(OM_predict_tokens)
+
+prompt = "Explain the fundamental architecture differences between CPU and GPU memory bandwidth in 3 concise paragraphs."
+
+payload = {
+    "model": model,
+    "prompt": prompt,
+    "stream": False,
+    "options": {
+        "num_predict": tokens_to_predict,
+        "temperature": 0.2
+    }
+}
+
+req = urllib.request.Request(
+    f"{host}/api/generate",
+    data=json.dumps(payload).encode("utf-8"),
+    headers={"Content-Type": "application/json"}
+)
+
+start_wall = time.time()
+try:
+    with urllib.request.urlopen(req, timeout=120) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+except Exception as e:
+    print(f"\033[0;31m[!] Benchmark failed: {e}\033[0m", file=sys.stderr)
+    sys.exit(1)
+end_wall = time.time()
+
+gpu_pct_str = "N/A"
+vram_used_str = "N/A"
+try:
+    ps_req = urllib.request.Request(f"{host}/api/ps")
+    with urllib.request.urlopen(ps_req, timeout=5) as ps_resp:
+        ps_data = json.loads(ps_resp.read().decode("utf-8"))
+        for m in ps_data.get("models", []):
+            if m.get("name") == model or m.get("model") == model or f"{m.get('name')}:latest" == model:
+                vram_b = m.get("size_vram", 0)
+                tot_b = m.get("size", 1)
+                vram_used_str = f"{vram_b / (1024**3):.2f} GB"
+                pct = (vram_b / tot_b) * 100 if tot_b else 0
+                gpu_pct_str = f"{pct:.1f}% GPU"
+                break
+except Exception:
+    pass
+
+p_count = data.get("prompt_eval_count", 0)
+p_dur_ns = data.get("prompt_eval_duration", 1)
+e_count = data.get("eval_count", 0)
+e_dur_ns = data.get("eval_duration", 1)
+
+prompt_tps = (p_count / (p_dur_ns / 1e9)) if p_dur_ns > 0 else 0
+eval_tps = (e_count / (e_dur_ns / 1e9)) if e_dur_ns > 0 else 0
+ttft_ms = (p_dur_ns / 1e6)
+
+C_RESET = "\033[0m"
+C_BOLD = "\033[1m"
+C_GREEN = "\033[0;32m"
+C_YELLOW = "\033[0;33m"
+C_CYAN = "\033[0;36m"
+C_MAGENTA = "\033[0;35m"
+
+print()
+print(f"{C_BOLD}BENCHMARK RESULTS: {model}{C_RESET}")
+print("═" * 60)
+print(f"  Target Host:           {host}")
+print(f"  Memory Allocation:     {C_MAGENTA}{vram_used_str} ({gpu_pct_str}){C_RESET}")
+print(f"  Prompt Prefill Tokens: {p_count} tokens")
+print(f"  Time To First Token:   {C_YELLOW}{ttft_ms:.1f} ms{C_RESET}")
+print(f"  Prompt Prefill Speed:  {C_GREEN}{prompt_tps:.2f} tokens/sec{C_RESET}")
+print(f"  Generated Tokens:      {e_count} tokens")
+print(f"  Generation Speed:      {C_GREEN}{eval_tps:.2f} tokens/sec{C_RESET}")
+print(f"  Total Elapsed Time:    {end_wall - start_wall:.2f}s")
+print("═" * 60)
+PYEOF
+}
+
+# -----------------------------------------------------------------------------
+# Command: stream
+# -----------------------------------------------------------------------------
+cmd_stream() {
+    if [[ -z "${1:-}" ]]; then
+        echo "${C_RED}Error: 'stream' requires a model name (or command flag).${C_RESET}" >&2
+        echo "Usage: ${0##*/} stream <model> [--pull] [--keepalive DUR] [--no-warm] [--dry-run] [--json]" >&2
+        echo "       ${0##*/} stream --status [--json]      (show tunnel health, latency, VRAM footprint, countdowns)" >&2
+        echo "       ${0##*/} stream --test [model] [--json](run 1-token generation smoke test across tunnel)" >&2
+        echo "       ${0##*/} stream --all                  (pin & keep every hosted model available; rotate-warms)" >&2
+        echo "       ${0##*/} stream --repair-all           (reconcile + rotate-warm pins; keepalive timer)" >&2
+        echo "       ${0##*/} stream --resident-only        (refresh keepalive only for active VRAM models; zero thrashing)" >&2
+        echo "       ${0##*/} stream --unpin <model>        (remove a model pin from state file)" >&2
+        echo "       ${0##*/} stream --unload <model>       (immediately evict model from remote VRAM; keep_alive: 0)" >&2
+        echo "       ${0##*/} stream --list-pinned          (display pinned model catalog JSON)" >&2
+        exit 1
+    fi
+    # Forward the resolved remote so stream_model.py never falls back to the
+    # unreachable direct IP when the caller already selected a host.
+    local extra_flags=()
+    [[ "${OPT_JSON:-false}" == "true" ]] && extra_flags+=("--json")
+    local stream_remote=""
+    case "${HOST_MODE}" in
+        custom|remote) stream_remote="${TARGET_HOST}" ;;
+        local)         stream_remote="${REMOTE_HOST_URL}" ;;
+    esac
+    # resolve_remote_url() probes without the bridge token, so the tunnel's 401
+    # makes it fall through to the Desktop daemon (:11436) - which then gets
+    # saved as the pin's remote_url and bypasses bridge auth. Pins must go
+    # through the tunnel (stream_model.py sends the token), so only forward a
+    # remote the caller chose explicitly via --host or $OLLAMA_REMOTE_URL.
+    if [[ -n "${stream_remote}" && -z "${OPT_HOST}" && -z "${OLLAMA_REMOTE_URL:-}" ]]; then
+        stream_remote="${REMOTE_TUNNEL_URL}"
+    fi
+    if [[ -n "${stream_remote}" ]]; then
+        exec python3 /root/stream_model.py --remote "${stream_remote}" "${extra_flags[@]}" "$@"
+    fi
+    exec python3 /root/stream_model.py "${extra_flags[@]}" "$@"
+}
+
+# -----------------------------------------------------------------------------
+# Command: run
+# -----------------------------------------------------------------------------
+cmd_run() {
+    local model="${1:-}"
+    if [[ -z "${model}" ]]; then
+        echo "${C_RED}Error: 'run' requires a model name.${C_RESET}" >&2
+        echo "Usage: ${0##*/} run <model> [args...]" >&2
+        exit 1
+    fi
+    shift
+
+    local active_host=""
+    local resolved_model="${model}"
+
+    if [[ -n "${TARGET_HOST}" ]]; then
+        active_host="${TARGET_HOST}"
+        local res
+        res=$(resolve_model_name "${model}" "${active_host}" || true)
+        [[ -n "${res}" ]] && resolved_model="${res}"
+    else
+        # Desktop GPU first: a model on both hosts must not land on the Pi, which
+        # has no GPU - its bridge refuses anything over the 8 GiB budget, and a
+        # direct load is OOM-killed by ollama-memory-guard.
+        local local_res="" remote_first
+        remote_first=$(resolve_model_name "${model}" "${REMOTE_HOST_URL}" || true)
+        [[ -z "${remote_first}" ]] && local_res=$(resolve_model_name "${model}" "${LOCAL_HOST_URL}" || true)
+        if [[ -n "${remote_first}" ]]; then
+            resolved_model="${remote_first}"
+            active_host="${REMOTE_HOST_URL}"
+        elif [[ -n "${local_res}" ]]; then
+            resolved_model="${local_res}"
+            active_host="${LOCAL_HOST_URL}"
+        else
+            local remote_res
+            remote_res=$(resolve_model_name "${model}" "${REMOTE_HOST_URL}" || true)
+            if [[ -n "${remote_res}" ]]; then
+                echo "${C_YELLOW}Model '${model}' found on remote server. Auto-streaming from ${REMOTE_HOST_IP} (using ${remote_res})...${C_RESET}"
+                resolved_model="${remote_res}"
+                active_host="${REMOTE_HOST_URL}"
+            else
+                active_host="${LOCAL_HOST_URL}"
+            fi
+        fi
+    fi
+
+    # Unload conflicting active models from target host to prevent CUDA memory collision
+    local loaded_models
+    loaded_models=$(curl -s --connect-timeout 2 -m 3 "${active_host}/api/ps" | jq -r '.models[].name' 2>/dev/null || true)
+    if [[ -n "${loaded_models}" ]]; then
+        for lm in ${loaded_models}; do
+            if [[ "${lm}" != "${resolved_model}" && "${lm}:latest" != "${resolved_model}" ]]; then
+                echo "${C_YELLOW}[*] Unloading active model '${lm}' from ${active_host} to prevent CUDA memory collision...${C_RESET}"
+                curl -s -m 5 -X POST "${active_host}/api/generate" -H "Content-Type: application/json" -d "$(jq -nc --arg m "${lm}" '{model: $m, keep_alive: 0}')" >/dev/null 2>&1 || true
+                sleep 1
+            fi
+        done
+    fi
+
+    # Apply per-model tuned defaults baked in via 'tune' (raw resolved model).
+    local tp
+    tp=$(tuned_params "${resolved_model}" || true)
+    if [[ -n "${tp}" ]]; then
+        local nctx nbatch npredict ntemp
+        nctx=$(echo "${tp}" | jq -r '.num_ctx? // empty')
+        nbatch=$(echo "${tp}" | jq -r '.num_batch? // empty')
+        npredict=$(echo "${tp}" | jq -r '.num_predict? // empty')
+        ntemp=$(echo "${tp}" | jq -r '.temperature? // empty')
+        if [[ -n "${nctx}" ]]; then
+            export OLLAMA_CONTEXT_LENGTH="${nctx}"
+        fi
+        echo "${C_DIM}[*] Tuned defaults for '${resolved_model}': num_ctx=${nctx:--} num_batch=${nbatch:--} num_predict=${npredict:--} temperature=${ntemp:--}${C_RESET}"
+    fi
+
+    export OLLAMA_HOST="${active_host}"
+    export OLLAMA_BASE_URL="${active_host}"
+    export OPENAI_API_BASE="${active_host}/v1"
+    export OPENAI_BASE_URL="${active_host}/v1"
+    export OPENAI_API_KEY="${OPENAI_API_KEY:-ollama}"
+    export API_BASE="${active_host}/v1"
+    export ANTHROPIC_BASE_URL="${active_host}"
+    export ANTHROPIC_API_BASE="${active_host}/v1"
+    export ANTHROPIC_API_KEY="${ANTHROPIC_API_KEY:-ollama}"
+
+    echo "${C_CYAN}Running model: ${resolved_model} on ${active_host}...${C_RESET}"
+    exec ollama run "${resolved_model}" "$@"
+}
+
+# -----------------------------------------------------------------------------
+# Antigravity CLI (agy) support
+# -----------------------------------------------------------------------------
+# agy has exactly one overridable endpoint: with `modelProvider: "gemini"` in
+# its settings.json it calls
+#   {GOOGLE_GEMINI_BASE_URL}/v1beta/models/{model}:streamGenerateContent
+# and it has no OpenAI-compatible or native-Ollama transport at all. Passing
+# --model alone therefore does nothing: agy rejects the unknown id with a
+# warning and quietly runs a Google model instead, while this script's banner
+# claims an Ollama model and host. A per-session shim translates the Gemini
+# wire format to /api/chat against whichever host the model resolved to.
+AGY_SETTINGS="${AGY_SETTINGS:-${HOME:-/root}/.gemini/antigravity-cli/settings.json}"
+GEMINI_SHIM_PATHS=(
+    "/opt/ollama/ollama-gemini-shim.py"
+    "/root/OLLAMA/ollama-gemini-shim.py"
+)
+# One claim file per launcher, so a second concurrent `launch agy` does not
+# have its settings reverted by the first one exiting.
+AGY_CLAIM_DIR="${AGY_CLAIM_DIR:-${TMPDIR:-/tmp}/ollama-mgr-agy}"
+AGY_SHIM_PID=""
+AGY_SHIM_PORT=""
+AGY_SHIM_OUT=""
+AGY_SHIM_ERR=""
+AGY_CLAIM_FILE=""
+AGY_SETTINGS_CREATED=0
+AGY_PROVIDER_PRESET=0
+AGY_PROVIDER_PREV=""
+AGY_HAD_MODEL=false
+AGY_MODEL_PREV=""
+AGY_LAUNCHED_MODEL=""
+
+find_gemini_shim() {
+    local cand
+    for cand in "${GEMINI_SHIM_PATHS[@]}"; do
+        [[ -f "${cand}" ]] && { echo "${cand}"; return 0; }
+    done
+    return 1
+}
+
+_agy_write_settings() {
+    # Rewrites settings.json through a jq filter. All arguments go to jq
+    # verbatim, so callers pass values with --arg rather than interpolating
+    # them into the program - the same mistake the 2026-09-24 audit found in
+    # this script's Python heredocs.
+    #
+    # cat > rather than mv: keeps the inode, so settings.json stays 0600 and
+    # keeps its owner instead of inheriting mktemp's.
+    local tmp
+    tmp=$(mktemp) || return 1
+    if jq "$@" "${AGY_SETTINGS}" >"${tmp}" 2>/dev/null; then
+        cat "${tmp}" >"${AGY_SETTINGS}"
+        rm -f "${tmp}"
+        return 0
+    fi
+    rm -f "${tmp}"
+    return 1
+}
+
+agy_patch_settings() {
+    local model="$1"
+    if [[ ! -f "${AGY_SETTINGS}" ]]; then
+        mkdir -p "$(dirname "${AGY_SETTINGS}")" || return 1
+        printf '{}' >"${AGY_SETTINGS}" || return 1
+        chmod 600 "${AGY_SETTINGS}" 2>/dev/null || true
+        AGY_SETTINGS_CREATED=1
+    elif [[ ! -s "${AGY_SETTINGS}" ]]; then
+        printf '{}' >"${AGY_SETTINGS}" || return 1
+    fi
+
+    if ! jq -e . "${AGY_SETTINGS}" >/dev/null 2>&1; then
+        echo "${C_RED}Error: ${AGY_SETTINGS} is not valid JSON; refusing to edit it.${C_RESET}" >&2
+        return 1
+    fi
+
+    AGY_PROVIDER_PREV=$(jq -r '.modelProvider // empty' "${AGY_SETTINGS}")
+    [[ "${AGY_PROVIDER_PREV}" == "gemini" ]] && AGY_PROVIDER_PRESET=1
+    AGY_HAD_MODEL=$(jq 'has("model")' "${AGY_SETTINGS}")
+    AGY_MODEL_PREV=$(jq -r '.model // empty' "${AGY_SETTINGS}")
+    AGY_LAUNCHED_MODEL="${model}"
+
+    # modelProvider alone is not enough: agy validates --model against its own
+    # catalogue and rejects anything unregistered, so the Ollama id has to be
+    # declared as a custom model too. Without this the launch dies with
+    # "model <id> is not recognized as a known model or custom model in settings".
+    _agy_write_settings --arg m "${model}" '
+        .modelProvider = "gemini"
+        | .customModelsConfig.customModels[$m] = {modelName: $m}
+    ' || return 1
+
+    mkdir -p "${AGY_CLAIM_DIR}" 2>/dev/null || true
+    AGY_CLAIM_FILE="${AGY_CLAIM_DIR}/$$"
+    : >"${AGY_CLAIM_FILE}" 2>/dev/null || AGY_CLAIM_FILE=""
+}
+
+_agy_other_session_active() {
+    # Claims left behind by a SIGKILLed launcher must not pin the key forever,
+    # so a claim only counts while its owner is still alive.
+    local f pid
+    for f in "${AGY_CLAIM_DIR}"/*; do
+        [[ -e "${f}" ]] || continue
+        pid="${f##*/}"
+        if [[ ! "${pid}" =~ ^[0-9]+$ ]]; then
+            rm -f "${f}"
+            continue
+        fi
+        kill -0 "${pid}" 2>/dev/null && return 0
+        rm -f "${f}"
+    done
+    return 1
+}
+
+agy_restore_settings() {
+    [[ -n "${AGY_CLAIM_FILE}" ]] && rm -f "${AGY_CLAIM_FILE}"
+    if [[ "${AGY_SETTINGS_CREATED}" == "1" ]]; then
+        rm -f "${AGY_SETTINGS}"
+        AGY_SETTINGS_CREATED=0
+        return 0
+    fi
+    [[ -f "${AGY_SETTINGS}" ]] || return 0
+    # agy rewrites settings.json while it runs (selected model, permissions),
+    # so only the keys this script added are touched - never a saved copy.
+    _agy_other_session_active && return 0
+
+    # .model is only put back if it still holds the value agy persisted for the
+    # model we launched with; if the operator picked something else mid-session
+    # via /model, that choice is theirs and stays.
+    _agy_write_settings \
+        --arg m "${AGY_LAUNCHED_MODEL}" \
+        --arg prev_provider "${AGY_PROVIDER_PREV}" \
+        --arg prev_model "${AGY_MODEL_PREV}" \
+        --argjson had_model "${AGY_HAD_MODEL}" \
+        --argjson keep_provider "$([[ "${AGY_PROVIDER_PRESET}" == "1" ]] && echo true || echo false)" '
+        (if .customModelsConfig.customModels then del(.customModelsConfig.customModels[$m]) else . end)
+        | (if ((.customModelsConfig.customModels // {}) | length) == 0 then del(.customModelsConfig) else . end)
+        | (if $keep_provider then . else (if $prev_provider == "" then del(.modelProvider) else .modelProvider = $prev_provider end) end)
+        | (if (.model == $m) then (if $had_model then .model = $prev_model else del(.model) end) else . end)
+    ' || true
+    AGY_PROVIDER_PREV=""
+    AGY_LAUNCHED_MODEL=""
+}
+
+agy_cleanup() {
+    local rc=$?
+    trap - EXIT INT TERM HUP
+    if [[ -n "${AGY_SHIM_PID}" ]]; then
+        kill "${AGY_SHIM_PID}" 2>/dev/null || true
+        wait "${AGY_SHIM_PID}" 2>/dev/null || true
+        AGY_SHIM_PID=""
+    fi
+    agy_restore_settings
+    rm -f "${AGY_SHIM_OUT}" "${AGY_SHIM_ERR}"
+    exit "${rc}"
+}
+
+# Starts the shim on a kernel-assigned port and sets AGY_SHIM_PORT once the
+# listener answers /healthz. Must not be called in a command substitution: the
+# background python has to stay a child of this shell or agy_cleanup can
+# neither wait on it nor kill it, and every launch would leak a listener.
+agy_start_shim() {
+    local shim="$1" upstream="$2" model="$3" tries=0
+    AGY_SHIM_PORT=""
+    AGY_SHIM_OUT=$(mktemp) || return 1
+    AGY_SHIM_ERR=$(mktemp) || return 1
+    python3 -u "${shim}" --host 127.0.0.1 --port 0 --upstream "${upstream}" \
+        --default-model "${model}" --print-port >"${AGY_SHIM_OUT}" 2>"${AGY_SHIM_ERR}" &
+    AGY_SHIM_PID=$!
+
+    while ((tries++ < 100)); do
+        AGY_SHIM_PORT=$(head -n1 "${AGY_SHIM_OUT}" 2>/dev/null || true)
+        [[ "${AGY_SHIM_PORT}" =~ ^[0-9]+$ ]] && break
+        if ! kill -0 "${AGY_SHIM_PID}" 2>/dev/null; then
+            echo "${C_RED}Error: Gemini shim exited before binding a port:${C_RESET}" >&2
+            sed 's/^/    /' "${AGY_SHIM_ERR}" >&2 2>/dev/null || true
+            AGY_SHIM_PID=""
+            return 1
+        fi
+        sleep 0.05
+    done
+    if [[ ! "${AGY_SHIM_PORT}" =~ ^[0-9]+$ ]]; then
+        echo "${C_RED}Error: Gemini shim did not announce a port in time.${C_RESET}" >&2
+        AGY_SHIM_PORT=""
+        return 1
+    fi
+
+    tries=0
+    until curl -sf -m 2 "http://127.0.0.1:${AGY_SHIM_PORT}/healthz" >/dev/null 2>&1; do
+        if ((tries++ >= 40)); then
+            echo "${C_RED}Error: Gemini shim on port ${AGY_SHIM_PORT} never became healthy.${C_RESET}" >&2
+            return 1
+        fi
+        if ! kill -0 "${AGY_SHIM_PID}" 2>/dev/null; then
+            echo "${C_RED}Error: Gemini shim died during startup:${C_RESET}" >&2
+            sed 's/^/    /' "${AGY_SHIM_ERR}" >&2 2>/dev/null || true
+            return 1
+        fi
+        sleep 0.05
+    done
+}
+
+# -----------------------------------------------------------------------------
+# Grok Build TUI (grok) support
+# -----------------------------------------------------------------------------
+# grok takes its endpoint from GROK_MODELS_BASE_URL (see the grok case in
+# cmd_launch), so routing itself needs no config edit. Its context window does:
+# that value drives auto-compaction, is settable only per model in config.toml,
+# and a model prefetched from {base}/models that defines none defaults to 200k.
+# For a tuned Ollama model that is wrong by an order of magnitude - grok
+# compacts far too late and the request overflows the real window. So a tuned
+# num_ctx is written to [model."<tag>"].context_window for the session and
+# undone on exit.
+#
+# The table is deliberately partial. Verified 2026-10-08 against grok 1.0.46: a
+# [model."<tag>"] carrying only context_window keeps the base_url prefetched
+# from GROK_MODELS_BASE_URL, so the merge does not break routing.
+#
+# GROK_CONFIG_PATH was checked first and is NOT an alternate config file - a
+# model defined through it never reaches 'grok models', and -m rejects it as
+# "unknown model id". Editing the real file is unavoidable, hence the surgical
+# revert below rather than a whole-file backup.
+GROK_CONFIG="${GROK_CONFIG:-${HOME:-/root}/.grok/config.toml}"
+# One claim file per launcher, so a second concurrent 'launch grok' does not
+# have its override reverted by the first one exiting.
+GROK_CLAIM_DIR="${GROK_CLAIM_DIR:-${TMPDIR:-/tmp}/ollama-mgr-grok}"
+GROK_CLAIM_FILE=""
+GROK_CTX_MODEL=""
+GROK_CTX_TABLE_PREV=false
+GROK_CTX_KEY_PREV=false
+GROK_CTX_VALUE_PREV=""
+GROK_CTX_TRAIL_PREV=1
+
+# Rewrites config.toml through tomlkit so the user's formatting, comments and
+# key order survive. stdlib tomllib is read-only, so there is no writer
+# fallback: without tomlkit the override is skipped with a warning and grok
+# still runs. Values reach Python through argv, never interpolated into the
+# program - the same mistake the 2026-09-24 audit found in this script's
+# heredocs. Exits 3 when tomlkit is missing, 4 on unparseable TOML, 5 if absent.
+_grok_write_config() {
+    python3 - "$@" <<'PY'
+import sys
+
+try:
+    import tomlkit
+except ImportError:
+    sys.exit(3)
+
+mode, path, key = sys.argv[1], sys.argv[2], sys.argv[3]
+try:
+    with open(path, "r", encoding="utf-8") as fh:
+        src = fh.read()
+    doc = tomlkit.parse(src)
+except FileNotFoundError:
+    sys.exit(5)
+except Exception:
+    sys.exit(4)
+
+models = doc.get("model")
+
+if mode == "set":
+    existed = models is not None and key in models
+    had = bool(existed and "context_window" in models[key])
+    prev = str(models[key]["context_window"]) if had else ""
+    if models is None:
+        models = tomlkit.table()
+        doc["model"] = models
+    if key not in models:
+        models[key] = tomlkit.table()
+    models[key]["context_window"] = int(sys.argv[4])
+else:
+    existed = sys.argv[4] == "1"
+    had = sys.argv[5] == "1"
+    if models is None or key not in models:
+        sys.exit(0)
+    tbl = models[key]
+    if had:
+        tbl["context_window"] = int(sys.argv[6])
+    elif "context_window" in tbl:
+        del tbl["context_window"]
+    # Drop the table - and the [model] parent - only when this launcher created
+    # them and nothing else has been added since.
+    if not existed and len(tbl) == 0:
+        del models[key]
+    if not existed and len(models) == 0:
+        del doc["model"]
+
+rendered = tomlkit.dumps(doc)
+if mode == "clear":
+    # Deleting the table leaves the separator newline tomlkit added behind, so
+    # put the file back to the trailing-newline count it had before the set.
+    trail = int(sys.argv[7]) if len(sys.argv) > 7 and sys.argv[7].isdigit() else 1
+    rendered = rendered.rstrip("\n") + "\n" * trail
+
+# Written through the original inode so config.toml keeps its mode and owner
+# instead of inheriting mktemp's - why _agy_write_settings uses cat > too.
+with open(path, "w", encoding="utf-8") as fh:
+    fh.write(rendered)
+
+if mode == "set":
+    print("TABLE=%d" % existed)
+    print("KEY=%d" % had)
+    print("PREV=%s" % prev)
+    print("TRAIL=%d" % (len(src) - len(src.rstrip("\n"))))
+PY
+}
+
+_grok_config_error() {
+    case "$1" in
+        3)
+            echo "${C_YELLOW}[!] python3 tomlkit is unavailable; grok keeps its 200k context default.${C_RESET}" >&2
+            echo "    Install it (pip install tomlkit) for a tuned num_ctx to reach grok." >&2
+            ;;
+        4)
+            echo "${C_RED}Error: ${GROK_CONFIG} is not valid TOML; refusing to edit it.${C_RESET}" >&2
+            ;;
+        5)
+            echo "${C_YELLOW}[!] ${GROK_CONFIG} not found; skipping the context_window override.${C_RESET}" >&2
+            ;;
+        *)
+            echo "${C_RED}Error: could not write ${GROK_CONFIG}.${C_RESET}" >&2
+            ;;
+    esac
+}
+
+# Writes the override and records enough prior state to undo exactly this change.
+grok_patch_context() {
+    local model="$1" ctx="$2" state k v rc=0
+    [[ "${ctx}" =~ ^[0-9]+$ ]] || return 1
+    state=$(_grok_write_config set "${GROK_CONFIG}" "${model}" "${ctx}") || rc=$?
+    if ((rc != 0)); then
+        _grok_config_error "${rc}"
+        return "${rc}"
+    fi
+    while IFS='=' read -r k v; do
+        case "${k}" in
+            TABLE)
+                if [[ "${v}" == "1" ]]; then GROK_CTX_TABLE_PREV=true; fi
+                ;;
+            KEY)
+                if [[ "${v}" == "1" ]]; then GROK_CTX_KEY_PREV=true; fi
+                ;;
+            PREV)
+                GROK_CTX_VALUE_PREV="${v}"
+                ;;
+            TRAIL)
+                GROK_CTX_TRAIL_PREV="${v}"
+                ;;
+        esac
+    done <<<"${state}"
+    GROK_CTX_MODEL="${model}"
+
+    mkdir -p "${GROK_CLAIM_DIR}" 2>/dev/null || true
+    GROK_CLAIM_FILE="${GROK_CLAIM_DIR}/$$"
+    : >"${GROK_CLAIM_FILE}" 2>/dev/null || GROK_CLAIM_FILE=""
+}
+
+_grok_other_session_active() {
+    # Claims left behind by a SIGKILLed launcher must not pin the override
+    # forever, so a claim only counts while its owner is still alive.
+    local f pid
+    for f in "${GROK_CLAIM_DIR}"/*; do
+        [[ -e "${f}" ]] || continue
+        pid="${f##*/}"
+        if [[ ! "${pid}" =~ ^[0-9]+$ ]]; then
+            rm -f "${f}"
+            continue
+        fi
+        kill -0 "${pid}" 2>/dev/null && return 0
+        rm -f "${f}"
+    done
+    return 1
+}
+
+grok_restore_config() {
+    [[ -n "${GROK_CLAIM_FILE}" ]] && rm -f "${GROK_CLAIM_FILE}"
+    [[ -n "${GROK_CTX_MODEL}" ]] || return 0
+    if [[ ! -f "${GROK_CONFIG}" ]]; then
+        GROK_CTX_MODEL=""
+        return 0
+    fi
+    # grok rewrites config.toml while it runs, so reverting from a whole-file
+    # backup would throw those edits away: only the key owned here is undone.
+    _grok_other_session_active && return 0
+    local tflag=0 kflag=0
+    [[ "${GROK_CTX_TABLE_PREV}" == true ]] && tflag=1
+    [[ "${GROK_CTX_KEY_PREV}" == true ]] && kflag=1
+    _grok_write_config clear "${GROK_CONFIG}" "${GROK_CTX_MODEL}" "${tflag}" "${kflag}" "${GROK_CTX_VALUE_PREV}" "${GROK_CTX_TRAIL_PREV}" >/dev/null 2>&1 || true
+    GROK_CLAIM_FILE=""
+    GROK_CTX_MODEL=""
+    GROK_CTX_TABLE_PREV=false
+    GROK_CTX_KEY_PREV=false
+    GROK_CTX_VALUE_PREV=""
+    GROK_CTX_TRAIL_PREV=1
+}
+
+grok_cleanup() {
+    # grok is run rather than exec'd so this teardown can happen; there is no
+    # shim process to reap, unlike agy.
+    grok_restore_config
+}
+
+# -----------------------------------------------------------------------------
+# Kimi Code CLI (kimi) support
+# -----------------------------------------------------------------------------
+# kimi resolves models as ALIASES declared under [models] in its config.toml;
+# only such aliases can carry support_efforts/off_effort, which is what unlocks
+# the in-session /effort picker with real graded efforts. The KIMI_MODEL_* env
+# channel (see the fallback in cmd_launch) synthesizes an alias that cannot
+# declare efforts, so /effort there is limited to on/off - and both encode as
+# *silent* (no reasoning_effort on the wire).
+#
+# Registration here is additive and idempotent - a provider per Ollama host and
+# an alias per model, exactly like the xai/groq/alibaba entries users keep in
+# that file - so, unlike grok/agy, there is nothing to revert on exit.
+KIMI_CONFIG="${KIMI_CONFIG:-${KIMI_CODE_HOME:-${HOME:-/root}/.kimi-code}/config.toml}"
+# Serializes concurrent 'launch kimi' upserts so two read-modify-write cycles
+# cannot drop each other's entries.
+KIMI_CONFIG_LOCK="${KIMI_CONFIG_LOCK:-${TMPDIR:-/tmp}/ollama-mgr-kimi-config.lock}"
+
+# Upserts providers[pid] and models[alias] through tomlkit so the user's
+# formatting, comments and key order survive (same contract as
+# _grok_write_config: values travel via argv, never interpolated into the
+# program). Exits 3 when tomlkit is missing, 4 on unparseable TOML.
+# argv: path pid base_url alias model ctx caps efforts default_effort off_effort reasoning_key display_name
+_kimi_write_config() {
+    python3 - "$@" <<'PY'
+import sys
+
+try:
+    import tomlkit
+except ImportError:
+    sys.exit(3)
+
+path, pid, base_url, alias, model = sys.argv[1:6]
+ctx, caps, efforts, default_effort, off_effort, reasoning_key, display_name = sys.argv[6:13]
+
+try:
+    with open(path, "r", encoding="utf-8") as fh:
+        doc = tomlkit.parse(fh.read())
+except FileNotFoundError:
+    doc = tomlkit.document()
+except Exception:
+    sys.exit(4)
+
+providers = doc.get("providers")
+if providers is None:
+    providers = tomlkit.table()
+    doc["providers"] = providers
+if pid not in providers:
+    providers[pid] = tomlkit.table()
+prov = providers[pid]
+prov["type"] = "openai"
+prov["base_url"] = base_url
+# Static placeholder, never the caller's real key: this provider points at the
+# LAN/tunnel Ollama host and forwarding a real secret there would leak it off
+# this box. Ollama ignores the value.
+prov["api_key"] = "ollama"
+
+models = doc.get("models")
+if models is None:
+    models = tomlkit.table()
+    doc["models"] = models
+if alias not in models:
+    models[alias] = tomlkit.table()
+mdl = models[alias]
+mdl["provider"] = pid
+mdl["model"] = model
+if ctx:
+    mdl["max_context_size"] = int(ctx)
+if caps:
+    mdl["capabilities"] = caps.split(",")
+if efforts:
+    mdl["support_efforts"] = efforts.split(",")
+if default_effort:
+    mdl["default_effort"] = default_effort
+if off_effort:
+    mdl["off_effort"] = off_effort
+if reasoning_key:
+    mdl["reasoning_key"] = reasoning_key
+if display_name:
+    mdl["display_name"] = display_name
+
+# Written through the original inode so config.toml keeps its mode and owner.
+with open(path, "w", encoding="utf-8") as fh:
+    fh.write(tomlkit.dumps(doc))
+PY
+}
+
+_kimi_config_error() {
+    case "$1" in
+        3)
+            echo "${C_YELLOW}[!] python3 tomlkit is unavailable; falling back to kimi's KIMI_MODEL_* env channel${C_RESET}" >&2
+            echo "    (graded /effort needs a config alias - pip install tomlkit to unlock it)." >&2
+            ;;
+        4)
+            echo "${C_YELLOW}[!] ${KIMI_CONFIG} is not valid TOML; refusing to edit it - using the env channel.${C_RESET}" >&2
+            ;;
+        *)
+            echo "${C_YELLOW}[!] could not write ${KIMI_CONFIG}; using the env channel.${C_RESET}" >&2
+            ;;
+    esac
+}
+
+# Upserts the host provider + model alias and prints the alias on success.
+# argv: host_url model ctx caps efforts default_effort off_effort reasoning_key
+kimi_register_model() {
+    local host_url="$1" model="$2" ctx="$3" caps="$4" efforts="$5" default_effort="$6" off_effort="$7" reasoning_key="$8"
+    local slug pid alias rc=0
+    slug="${host_url#*://}"
+    slug="${slug//[^a-zA-Z0-9]/-}"
+    pid="ollama-${slug}"
+    alias="${pid}/${model}"
+    if command -v flock >/dev/null 2>&1; then
+        # FD form, not 'flock <file> <cmd>': the command form execs a binary and
+        # _kimi_write_config is a shell function.
+        exec 9>"${KIMI_CONFIG_LOCK}"
+        flock 9
+        _kimi_write_config "${KIMI_CONFIG}" "${pid}" "${host_url}/v1" \
+            "${alias}" "${model}" "${ctx}" "${caps}" "${efforts}" "${default_effort}" \
+            "${off_effort}" "${reasoning_key}" "${model} (ollama)" || rc=$?
+        exec 9>&-
+    else
+        _kimi_write_config "${KIMI_CONFIG}" "${pid}" "${host_url}/v1" \
+            "${alias}" "${model}" "${ctx}" "${caps}" "${efforts}" "${default_effort}" \
+            "${off_effort}" "${reasoning_key}" "${model} (ollama)" || rc=$?
+    fi
+    if ((rc != 0)); then
+        _kimi_config_error "${rc}"
+        return 1
+    fi
+    printf '%s' "${alias}"
+}
+
+# -----------------------------------------------------------------------------
+# Command: launch
+# -----------------------------------------------------------------------------
+cmd_launch() {
+    local provider="${1:-}"
+    if [[ -z "${provider}" ]]; then
+        echo "${C_RED}Error: 'launch' requires a provider or CLI name.${C_RESET}" >&2
+        echo "Supported providers: ${!EXTERNAL_CLI_MAP[*]}" >&2
+        exit 1
+    fi
+    shift
+
+    local target_model="${DEFAULT_MODELS[$provider]:-}"
+    local cli_passthrough_args=()
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --model)
+                shift
+                if [[ -z "${1:-}" ]]; then
+                    echo "${C_RED}Error: --model requires a model name argument.${C_RESET}" >&2
+                    exit 1
+                fi
+                target_model="$1"
+                shift
+                ;;
+            --model=*)
+                target_model="${1#*=}"
+                shift
+                ;;
+            *)
+                cli_passthrough_args+=("$1")
+                shift
+                ;;
+        esac
+    done
+
+    if [[ -z "${target_model}" ]]; then
+        target_model="${provider}"
+    fi
+
+    local active_host=""
+    local resolved_model="${target_model}"
+
+    if [[ -n "${TARGET_HOST}" ]]; then
+        active_host="${TARGET_HOST}"
+        local res
+        res=$(resolve_model_name "${target_model}" "${active_host}" || true)
+        [[ -n "${res}" ]] && resolved_model="${res}"
+    else
+        # Desktop GPU first: a model on both hosts must not land on the Pi, which
+        # has no GPU - its bridge refuses anything over the 8 GiB budget, and a
+        # direct load is OOM-killed by ollama-memory-guard.
+        local local_res="" remote_first
+        remote_first=$(resolve_model_name "${target_model}" "${REMOTE_HOST_URL}" || true)
+        [[ -z "${remote_first}" ]] && local_res=$(resolve_model_name "${target_model}" "${LOCAL_HOST_URL}" || true)
+        if [[ -n "${remote_first}" ]]; then
+            resolved_model="${remote_first}"
+            active_host="${REMOTE_HOST_URL}"
+        elif [[ -n "${local_res}" ]]; then
+            resolved_model="${local_res}"
+            active_host="${LOCAL_HOST_URL}"
+        else
+            local remote_res
+            remote_res=$(resolve_model_name "${target_model}" "${REMOTE_HOST_URL}" || true)
+            if [[ -n "${remote_res}" ]]; then
+                echo "${C_YELLOW}Model '${target_model}' found on remote GPU server. Routing to ${REMOTE_HOST_IP} (using ${remote_res})...${C_RESET}"
+                resolved_model="${remote_res}"
+                active_host="${REMOTE_HOST_URL}"
+            else
+                active_host="${LOCAL_HOST_URL}"
+            fi
+        fi
+    fi
+
+    # Unload conflicting active models from target host to prevent CUDA memory collision
+    local loaded_models
+    loaded_models=$(curl -s --connect-timeout 2 -m 3 "${active_host}/api/ps" | jq -r '.models[].name' 2>/dev/null || true)
+    if [[ -n "${loaded_models}" ]]; then
+        for lm in ${loaded_models}; do
+            if [[ "${lm}" != "${resolved_model}" && "${lm}:latest" != "${resolved_model}" ]]; then
+                echo "${C_YELLOW}[*] Unloading active model '${lm}' from ${active_host} to prevent CUDA memory collision...${C_RESET}"
+                curl -s -m 5 -X POST "${active_host}/api/generate" -H "Content-Type: application/json" -d "$(jq -nc --arg m "${lm}" '{model: $m, keep_alive: 0}')" >/dev/null 2>&1 || true
+                sleep 1
+            fi
+        done
+    fi
+
+    export OLLAMA_HOST="${active_host}"
+    export OLLAMA_BASE_URL="${active_host}"
+    export OPENAI_API_BASE="${active_host}/v1"
+    export OPENAI_BASE_URL="${active_host}/v1"
+    export OPENAI_API_KEY="${OPENAI_API_KEY:-ollama}"
+    export API_BASE="${active_host}/v1"
+    export ANTHROPIC_BASE_URL="${active_host}"
+    export ANTHROPIC_API_BASE="${active_host}/v1"
+    export ANTHROPIC_API_KEY="${ANTHROPIC_API_KEY:-ollama}"
+    export CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT="${CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT:-1}"
+    export CLAUDE_CODE_AUTO_COMPACT_WINDOW="${CLAUDE_CODE_AUTO_COMPACT_WINDOW:-100000}"
+    export CLAUDE_CODE_MAX_OUTPUT_TOKENS="${CLAUDE_CODE_MAX_OUTPUT_TOKENS:-8192}"
+    export CLAUDE_DISABLE_TELEMETRY="${CLAUDE_DISABLE_TELEMETRY:-1}"
+    export DO_NOT_TRACK="${DO_NOT_TRACK:-1}"
+    export DISABLE_AUTO_UPDATER="${DISABLE_AUTO_UPDATER:-1}"
+    export ENABLE_CLAUDEAI_MCP_SERVERS="${ENABLE_CLAUDEAI_MCP_SERVERS:-false}"
+
+    local cli_cmd="${EXTERNAL_CLI_MAP[$provider]:-}"
+
+    # Apply per-model tuned defaults baked in via 'tune' (raw resolved model).
+    local tp
+    tp=$(tuned_params "${resolved_model}" || true)
+    if [[ -n "${tp}" ]]; then
+        local nctx
+        nctx=$(echo "${tp}" | jq -r '.num_ctx? // empty')
+        if [[ -n "${nctx}" ]]; then
+            export OLLAMA_CONTEXT_LENGTH="${nctx}"
+        fi
+        echo "${C_DIM}[*] Tuned defaults for '${resolved_model}': $(echo "${tp}" | jq -c .)${C_RESET}"
+    fi
+
+    if [[ -n "${cli_cmd}" ]] && command -v "${cli_cmd}" >/dev/null 2>&1; then
+        echo "${C_GREEN}[*] Launching external CLI '${cli_cmd}' (Model: ${resolved_model}, Host: ${active_host})...${C_RESET}"
+        case "${cli_cmd}" in
+            claude)
+                export CLAUDE_CODE_EFFORT_LEVEL="${CLAUDE_CODE_EFFORT_LEVEL:-low}"
+                exec "${cli_cmd}" --model "${resolved_model}" "${cli_passthrough_args[@]}"
+                ;;
+            codex)
+                export CODEX_OSS_BASE_URL="${active_host}/v1"
+                exec "${cli_cmd}" --oss --local-provider ollama --model "${resolved_model}" "${cli_passthrough_args[@]}"
+                ;;
+            qwen)
+                export OPENAI_MODEL="${resolved_model}"
+                export QWEN_MODEL="${resolved_model}"
+                export OPENAI_BASE_URL="${active_host}/v1"
+                export OPENAI_API_KEY="${OPENAI_API_KEY:-ollama}"
+                exec "${cli_cmd}" --openai-base-url "${active_host}/v1" --openai-api-key "${OPENAI_API_KEY:-ollama}" --auth-type openai --model "${resolved_model}" "${cli_passthrough_args[@]}"
+                ;;
+            grok)
+                # grok (xAI's Grok Build TUI) exposes no --base-url/--provider flag.
+                # GROK_MODELS_BASE_URL redirects BOTH the startup catalog fetch
+                # ({base}/models) and inference, which is what makes --model accept
+                # real Ollama tags. Routing alone edits nothing; only the
+                # context_window override below does, and that is reverted on exit.
+                local grok_rc=0 grok_ctx=""
+                export GROK_MODELS_BASE_URL="${active_host}/v1"
+                # Deliberately forced rather than ${XAI_API_KEY:-ollama}: grok sends
+                # this as 'Authorization: Bearer' to GROK_MODELS_BASE_URL/models, and
+                # active_host may be the LAN/tunnel Desktop - forwarding a real xAI
+                # key there would leak it off this box. Ollama ignores the value.
+                export XAI_API_KEY="ollama"
+
+                # A tuned num_ctx cannot reach grok through the environment, so it
+                # goes into config.toml as this model's context_window. Read from the
+                # tuning itself rather than $OLLAMA_CONTEXT_LENGTH, which a caller
+                # may have set for unrelated reasons.
+                if [[ -n "${tp:-}" ]]; then
+                    grok_ctx=$(echo "${tp}" | jq -r '.num_ctx? // empty') || grok_ctx=""
+                fi
+                if [[ -n "${grok_ctx}" ]] && grok_patch_context "${resolved_model}" "${grok_ctx}"; then
+                    echo "${C_DIM}[*] grok context_window=${grok_ctx} for '${resolved_model}' (reverted on exit)${C_RESET}"
+                    trap grok_cleanup EXIT INT TERM HUP
+                fi
+
+                # No exec here: grok_cleanup must run once the session ends.
+                "${cli_cmd}" --model "${resolved_model}" "${cli_passthrough_args[@]}" || grok_rc=$?
+                exit "${grok_rc}"
+                ;;
+            kimi)
+                # kimi (Kimi Code CLI). Two routing paths, tried in order:
+                # 1. config.toml alias (preferred): kimi_register_model upserts a
+                #    provider for the resolved host and an alias for the resolved
+                #    tag - additive and idempotent, kept across sessions like the
+                #    user's other providers, so (unlike grok/agy) nothing is
+                #    reverted on exit. Only a config alias can declare
+                #    support_efforts/off_effort, which unlocks the in-session
+                #    /effort picker with graded efforts that reach the wire as
+                #    reasoning_effort. Launched with -m <alias>.
+                # 2. KIMI_MODEL_* env channel (fallback when tomlkit is missing
+                #    or the config is unwritable): synthesizes a temporary
+                #    in-memory provider; zero footprint, but efforts are locked
+                #    to on/off and the graded effort is chosen at launch time.
+                # One /api/show probe feeds both: the model's native context
+                # length and its real capability list.
+                local kimi_show="" kimi_caps="" kimi_ctx="" kimi_alias=""
+                kimi_show=$(curl -s --connect-timeout 2 -m 5 "${active_host}/api/show" \
+                    -d "$(jq -nc --arg m "${resolved_model}" '{model: $m}')") || kimi_show=""
+                if [[ -n "${tp:-}" ]]; then
+                    kimi_ctx=$(echo "${tp}" | jq -r '.num_ctx? // empty') || kimi_ctx=""
+                fi
+                # The runtime num_ctx (Modelfile PARAMETER, in .parameters) is what
+                # the Ollama server actually enforces - NOT model_info's
+                # *.context_length, which is only the architecture maximum.
+                # Declaring the larger number is fatal for agent sessions: kimi
+                # auto-compacts at 85% of the DECLARED window, so with 262144
+                # declared it stays passive while Ollama silently truncates the
+                # oldest messages past 131072 - and once truncation eats the
+                # initial user prompt of a subagent run, every remaining
+                # user-role message is a <tool_response> wrapper, which
+                # kalidroid's Jinja template rejects with a hard 500 ("No user
+                # query found in messages."). Cap the declaration at the runtime
+                # value so compaction always fires first. A tuned --ctx larger
+                # than the runtime is unenforceable here anyway: the /v1 path
+                # carries no per-request num_ctx.
+                local kimi_runtime_ctx=""
+                if [[ -n "${kimi_show}" ]]; then
+                    kimi_runtime_ctx=$(echo "${kimi_show}" | jq -r '(.parameters // "") | if test("num_ctx") then (capture("num_ctx\\s+(?<v>[0-9]+)") | .v) else empty end' 2>/dev/null) || kimi_runtime_ctx=""
+                fi
+                if [[ "${kimi_runtime_ctx}" =~ ^[0-9]+$ ]]; then
+                    if [[ ! "${kimi_ctx}" =~ ^[0-9]+$ ]] || ((kimi_ctx > kimi_runtime_ctx)); then
+                        kimi_ctx="${kimi_runtime_ctx}"
+                    fi
+                fi
+                if [[ -z "${kimi_ctx}" && -n "${kimi_show}" ]]; then
+                    # No tuning and no runtime num_ctx: fall back to the
+                    # architecture maximum - the best observable estimate.
+                    kimi_ctx=$(echo "${kimi_show}" | jq -r '[.model_info // {} | to_entries[] | select(.key | endswith("context_length")) | .value] | max // empty' 2>/dev/null) || kimi_ctx=""
+                fi
+
+                # Capabilities decide whether kimi enables thinking at all: with
+                # no 'thinking' tag the effort is locked to 'off' ("Unsupported
+                # thinking effort ... Available: off"). Map Ollama's own
+                # capability list (thinking/tools/vision) rather than guessing;
+                # tool_use-only is the fallback when the probe fails.
+                if [[ -n "${kimi_show}" ]]; then
+                    kimi_caps=$(echo "${kimi_show}" | jq -r '[(.capabilities // [])[] | if . == "thinking" then "thinking" elif . == "tools" then "tool_use" elif . == "vision" then "image_in" else empty end] | join(",")' 2>/dev/null) || kimi_caps=""
+                fi
+                kimi_caps="${OM_KIMI_CAPABILITIES:-${kimi_caps:-tool_use}}"
+                local kimi_efforts="" kimi_off="" kimi_rkey="" kimi_deff=""
+                if [[ ",${kimi_caps}," == *",thinking,"* ]]; then
+                    # kalidroid's template maps high/max -> xhigh and raises on
+                    # anything outside low/medium/xhigh, so all five kimi efforts
+                    # are safe there; override via OM_KIMI_EFFORTS for models
+                    # whose templates are pickier.
+                    kimi_efforts="${OM_KIMI_EFFORTS:-low,medium,high,xhigh,max}"
+                    # Verified against Ollama 0.40 /v1: reasoning_effort=none is
+                    # intercepted before the chat template and genuinely
+                    # disables reasoning - so /effort 'off' is real, not silent.
+                    kimi_off="none"
+                    # Ollama's OpenAI layer returns reasoning under 'reasoning',
+                    # not the 'reasoning_content' kimi auto-detects - without
+                    # this override thinking output is silently dropped.
+                    kimi_rkey="${OM_KIMI_REASONING_KEY:-reasoning}"
+                    kimi_deff="${OM_KIMI_EFFORT:-high}"
+                fi
+                export KIMI_DISABLE_TELEMETRY="${KIMI_DISABLE_TELEMETRY:-1}"
+                export KIMI_CODE_NO_AUTO_UPDATE="${KIMI_CODE_NO_AUTO_UPDATE:-1}"
+                kimi_alias=$(kimi_register_model "${active_host}" "${resolved_model}" "${kimi_ctx}" \
+                    "${kimi_caps}" "${kimi_efforts}" "${kimi_deff}" "${kimi_off}" "${kimi_rkey}") || kimi_alias=""
+                if [[ -n "${kimi_alias}" ]]; then
+                    # Nested-launch guard: a kimi session started by this script
+                    # exports KIMI_MODEL_* to all its children. A stale inherited
+                    # env model must not be synthesized alongside the alias.
+                    unset KIMI_MODEL_NAME KIMI_MODEL_API_KEY KIMI_MODEL_PROVIDER_TYPE \
+                        KIMI_MODEL_BASE_URL KIMI_MODEL_MAX_CONTEXT_SIZE KIMI_MODEL_CAPABILITIES \
+                        KIMI_MODEL_REASONING_KEY KIMI_MODEL_THINKING_EFFORT
+                    echo "${C_DIM}[*] kimi alias '${kimi_alias}' -> ${active_host}/v1 (context ${kimi_ctx:-kimi default}${kimi_efforts:+, efforts off|${kimi_efforts}})${C_RESET}"
+                    exec "${cli_cmd}" -m "${kimi_alias}" "${cli_passthrough_args[@]}"
+                fi
+
+                # --- Fallback: KIMI_MODEL_* env channel (no config footprint) ---
+                export KIMI_MODEL_NAME="${resolved_model}"
+                export KIMI_MODEL_PROVIDER_TYPE="openai"
+                export KIMI_MODEL_BASE_URL="${active_host}/v1"
+                # Deliberately forced rather than ${OPENAI_API_KEY:-ollama}: the
+                # key is sent as 'Authorization: Bearer' to KIMI_MODEL_BASE_URL,
+                # and active_host may be the LAN/tunnel Desktop - forwarding a
+                # real key there would leak it off this box. Ollama ignores the
+                # value. KIMI_MODEL_API_KEY is mandatory for the env model.
+                export KIMI_MODEL_API_KEY="ollama"
+                if [[ -n "${kimi_ctx}" ]]; then
+                    export KIMI_MODEL_MAX_CONTEXT_SIZE="${kimi_ctx}"
+                else
+                    unset KIMI_MODEL_MAX_CONTEXT_SIZE
+                fi
+                export KIMI_MODEL_CAPABILITIES="${kimi_caps}"
+                if [[ ",${kimi_caps}," == *",thinking,"* ]]; then
+                    export KIMI_MODEL_REASONING_KEY="${kimi_rkey}"
+                    # The env model cannot declare support_efforts, so the
+                    # in-session /effort picker only offers on/off - and both
+                    # encode as *silent* (no reasoning_effort field). A concrete
+                    # effort must ride in env instead; it is sent verbatim:
+                    #   OM_KIMI_EFFORT=xhigh ollama-mgr --remote launch kimi ...
+                    export KIMI_MODEL_THINKING_EFFORT="${OM_KIMI_EFFORT:-high}"
+                else
+                    # A stale inherited effort on a non-thinking model makes kimi
+                    # fail the request outright ("does not support thinking").
+                    unset KIMI_MODEL_REASONING_KEY KIMI_MODEL_THINKING_EFFORT
+                fi
+                echo "${C_DIM}[*] kimi on '${resolved_model}' via ${active_host}/v1 (context ${KIMI_MODEL_MAX_CONTEXT_SIZE:-kimi default}, caps ${KIMI_MODEL_CAPABILITIES}${KIMI_MODEL_THINKING_EFFORT:+, thinking effort ${KIMI_MODEL_THINKING_EFFORT}})${C_RESET}"
+                exec "${cli_cmd}" "${cli_passthrough_args[@]}"
+                ;;
+            agy)
+                # No exec here: the shim must be reaped and modelProvider
+                # removed from agy's settings once the session ends.
+                local shim rc=0
+                if ! shim=$(find_gemini_shim); then
+                    echo "${C_RED}Error: Gemini shim not found (looked in: ${GEMINI_SHIM_PATHS[*]}).${C_RESET}" >&2
+                    echo "agy speaks only the Gemini wire format, so it cannot reach ${active_host} without it." >&2
+                    exit 1
+                fi
+                if ! command -v jq >/dev/null 2>&1; then
+                    echo "${C_RED}Error: jq is required to patch ${AGY_SETTINGS}.${C_RESET}" >&2
+                    exit 1
+                fi
+                if ! agy_start_shim "${shim}" "${active_host}" "${resolved_model}"; then
+                    exit 1
+                fi
+                echo "${C_DIM}[*] Gemini shim on 127.0.0.1:${AGY_SHIM_PORT} -> ${active_host} (pid ${AGY_SHIM_PID})${C_RESET}"
+
+                if ! agy_patch_settings "${resolved_model}"; then
+                    echo "${C_RED}Error: could not register ${resolved_model} in ${AGY_SETTINGS}; agy would fall back to Google.${C_RESET}" >&2
+                    exit 1
+                fi
+                trap agy_cleanup EXIT INT TERM HUP
+
+                export GEMINI_API_KEY="${GEMINI_API_KEY:-ollama}"
+                export GOOGLE_GEMINI_BASE_URL="http://127.0.0.1:${AGY_SHIM_PORT}"
+                echo "${C_DIM}[*] agy now runs on ${resolved_model} via the Gemini wire format.${C_RESET}"
+
+                "${cli_cmd}" --model "${resolved_model}" "${cli_passthrough_args[@]}" || rc=$?
+                exit "${rc}"
+                ;;
+            *)
+                exec "${cli_cmd}" --model "${resolved_model}" "${cli_passthrough_args[@]}"
+                ;;
+        esac
+    elif [[ -n "${cli_cmd}" ]]; then
+        echo "${C_YELLOW}[!] External CLI '${cli_cmd}' not found in PATH.${C_RESET}"
+        echo "${C_CYAN}[*] Falling back to native 'ollama run ${resolved_model}'...${C_RESET}"
+        exec ollama run "${resolved_model}" "${cli_passthrough_args[@]}"
+    else
+        echo "${C_CYAN}[*] Executing provider '${provider}' via 'ollama run ${resolved_model}'...${C_RESET}"
+        exec ollama run "${resolved_model}" "${cli_passthrough_args[@]}"
+    fi
+}
+
+# -----------------------------------------------------------------------------
+# Main Dispatcher
+# -----------------------------------------------------------------------------
+# With several --host values, read-only/aggregate commands query every host;
+# commands that act on one model go to the first host that has it (else the
+# first --host).
+if [[ "${HOST_MODE}" == "multi" ]]; then
+    case "${COMMAND}" in
+        check|ping|hosts|ps|list|ls|search|find|stop|unload|info|show|status|health|status-report|report|logs|log|rotate-token|rotate|help|-h|--help) ;;
+        *)
+            _model="${ARGS[0]:-}"
+            if [[ "${COMMAND}" == "launch" ]]; then
+                _model=""
+                for ((_i = 0; _i < ${#ARGS[@]}; _i++)); do
+                    case "${ARGS[_i]}" in
+                        --model) _model="${ARGS[_i+1]:-}"; break ;;
+                        --model=*) _model="${ARGS[_i]#*=}"; break ;;
+                    esac
+                done
+            fi
+            TARGET_HOST="${OPT_HOSTS[0]}"
+            if [[ -n "${_model}" && "${_model}" != -* ]]; then
+                for _h in "${OPT_HOSTS[@]}"; do
+                    if resolve_model_name "${_model}" "${_h}" >/dev/null 2>&1; then
+                        TARGET_HOST="${_h}"
+                        break
+                    fi
+                done
+            fi
+            HOST_MODE="custom"
+            echo "${C_DIM}[*] Multiple --host: routing '${COMMAND}' to ${TARGET_HOST}${C_RESET}" >&2
+            ;;
+    esac
+fi
+
+case "${COMMAND}" in
+    check|ping)
+        cmd_check
+        ;;
+    hosts)
+        cmd_hosts
+        ;;
+    ps)
+        cmd_ps
+        ;;
+    status|health)
+        cmd_status
+        ;;
+    status-report|report)
+        cmd_status_report
+        ;;
+    logs|log)
+        cmd_logs "${ARGS[0]:-}"
+        ;;
+    rotate-token|rotate)
+        cmd_rotate_token "${ARGS[@]}"
+        ;;
+    stop|unload)
+        cmd_stop "${ARGS[0]:-}"
+        ;;
+    warm|preload)
+        cmd_warm "${ARGS[0]:-}" "${ARGS[1]:-}"
+        ;;
+    tune|set-ctx|param)
+        cmd_tune "${ARGS[@]}"
+        ;;
+    bench|eval|benchmark)
+        cmd_bench "${ARGS[@]}"
+        ;;
+    list|ls)
+        cmd_list "${ARGS[0]:-}"
+        ;;
+    search|find)
+        cmd_search "${ARGS[@]}"
+        ;;
+    info|show)
+        cmd_info "${ARGS[0]:-}"
+        ;;
+    tag|alias|cp)
+        cmd_tag "${ARGS[0]:-}" "${ARGS[1]:-}"
+        ;;
+    rm|delete)
+        cmd_rm "${ARGS[0]:-}"
+        ;;
+    stream)
+        cmd_stream "${ARGS[@]}"
+        ;;
+    run)
+        cmd_run "${ARGS[@]}"
+        ;;
+    launch)
+        cmd_launch "${ARGS[@]}"
+        ;;
+    help|-h|--help)
+        usage
+        ;;
+    *)
+        echo "${C_RED}Error: Unknown command '${COMMAND}'.${C_RESET}" >&2
+        usage
+        exit 1
+        ;;
+esac
