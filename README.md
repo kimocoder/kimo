@@ -23,6 +23,7 @@
   - **Grok Build CLI** (`grok`)
   - **Kimi Code CLI** (`kimi`)
   - **Google Antigravity CLI** (`agy`)
+  - **Cyberstrike AI Pentesting CLI** (`cyberstrike`)
   - **Hermes / OpenClaw**
 
 ---
@@ -186,6 +187,7 @@ kimo install grok       # Installs Grok Build CLI (x.ai)
 kimo install codex      # Installs Codex CLI (npm)
 kimo install qwen       # Installs Qwen Code CLI (npm)
 kimo install opencode   # Installs OpenCode CLI
+kimo install cyberstrike # Installs Cyberstrike AI Pentesting CLI (cyberstrike.io)
 kimo install openclaw   # Installs OpenClaw CLI
 kimo install hermes     # Installs Hermes Agent CLI
 
@@ -347,6 +349,9 @@ kimo --remote launch grok --model kalidroid-27b:latest
 
 # Launch Google Antigravity CLI via automatic Gemini-to-Ollama wire shim
 kimo launch agy --model kalidroid-27b:latest
+
+# Launch Cyberstrike AI pentesting agent routed to Ollama models
+kimo launch cyberstrike --model kalidroid-27b:latest
 ```
 
 ### Environment Overrides

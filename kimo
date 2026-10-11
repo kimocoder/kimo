@@ -86,6 +86,7 @@ declare -A DEFAULT_MODELS=(
     ["agy"]="kalidroid-27b:latest"
     ["grok"]="kalidroid-27b:latest"
     ["kimi"]="kalidroid-27b:latest"
+    ["cyberstrike"]="kalidroid-27b:latest"
 )
 
 # Map of external CLI binary names
@@ -99,14 +100,16 @@ declare -A EXTERNAL_CLI_MAP=(
     ["agy"]="agy"
     ["grok"]="grok"
     ["kimi"]="kimi"
+    ["cyberstrike"]="cyberstrike"
 )
 
-# grok, kimi, opencode, etc. install into user directories that reach PATH only
+# grok, kimi, opencode, cyberstrike, etc. install into user directories that reach PATH only
 # through ~/.bashrc, which a non-interactive caller (cron, systemd, Apache, sh -c)
 # never sources. Ensure all CLI binary directories are present in PATH.
 GROK_BIN_DIR="${GROK_BIN_DIR:-${HOME:-/root}/.grok/bin}"
 KIMI_BIN_DIR="${KIMI_BIN_DIR:-${HOME:-/root}/.kimi-code/bin}"
-for _dir in "${GROK_BIN_DIR}" "${KIMI_BIN_DIR}" "${HOME:-/root}/.local/bin" "${HOME:-/root}/.opencode/bin" "${HOME:-/root}/.cargo/bin" "${HOME:-/root}/.npm-global/bin" "/usr/local/bin"; do
+CYBERSTRIKE_BIN_DIR="${CYBERSTRIKE_BIN_DIR:-${HOME:-/root}/.cyberstrike/bin}"
+for _dir in "${GROK_BIN_DIR}" "${KIMI_BIN_DIR}" "${CYBERSTRIKE_BIN_DIR}" "${HOME:-/root}/.local/share/cyberstrike/bin" "${HOME:-/root}/.local/bin" "${HOME:-/root}/.opencode/bin" "${HOME:-/root}/.cargo/bin" "${HOME:-/root}/.npm-global/bin" "/usr/local/bin"; do
     if [[ -d "${_dir}" && ":${PATH}:" != *":${_dir}:"* ]]; then
         PATH="${_dir}:${PATH}"
     fi
@@ -200,20 +203,25 @@ ${C_YELLOW}Supported CLIs (${0##*/} launch):${C_RESET}
   ${C_BOLD}codex${C_RESET}       OpenAI Codex CLI routed to local/remote Ollama backend
   ${C_BOLD}qwen${C_RESET}        Qwen Code CLI routed to local/remote Ollama backend
   ${C_BOLD}opencode${C_RESET}    OpenCode AI assistant routed to Ollama models
+  ${C_BOLD}cyberstrike${C_RESET} Cyberstrike AI pentesting agent (cyberstrike.io); configures ollama provider
 
 ${C_YELLOW}Examples:${C_RESET}
   ${C_DIM}# Model & VRAM Control:${C_RESET}
   ${0##*/} ps                                         # Show active GPU models and memory
   ${0##*/} top                                        # Live real-time VRAM residency monitor
   ${0##*/} pull qwen2.5:32b                           # Pull model with streaming progress & speed
+  ${0##*/} sync llama3:latest                         # Synchronize model across local & remote
   ${0##*/} warm kalidroid-27b:latest                  # Pre-warm model into VRAM (24h keepalive)
   ${0##*/} stop all                                   # Evict all models to reclaim GPU memory
   ${0##*/} tune kalidroid-27b:latest --ctx 32768      # Bake 32k context default into registry
+  ${0##*/} bench kalidroid-27b:latest -n 30           # Benchmark TTFT & tok/s throughput
 
   ${C_DIM}# External Agent CLI Hub:${C_RESET}
   ${0##*/} launch grok --model kalidroid-27b:latest   # Launch Grok TUI with local model
   ${0##*/} --remote launch claude --model nemotron3   # Route Claude Code to remote GPU server
+  ${0##*/} launch cyberstrike --model kalidroid-27b   # Launch Cyberstrike with Ollama routing
   ${0##*/} launch agy --model kalidroid-27b:latest    # Launch Google Antigravity via wire shim
+  ${0##*/} install cyberstrike                        # Install Cyberstrike CLI (cyberstrike.io)
   ${0##*/} install kimi                               # Install Kimi Code CLI
   ${0##*/} update                                     # Check updates across all present CLIs
   ${0##*/} update --apply                             # Upgrade all present CLIs to latest
@@ -3449,6 +3457,7 @@ ${C_YELLOW}Supported CLIs:${C_RESET}
   ${C_CYAN}opencode${C_RESET}      OpenCode AI Assistant
   ${C_CYAN}openclaw${C_RESET}      OpenClaw CLI
   ${C_CYAN}hermes${C_RESET}        Hermes Agent CLI
+  ${C_CYAN}cyberstrike${C_RESET}   Cyberstrike AI Penetration Testing Agent (cyberstrike.io)
 
 ${C_YELLOW}CLI Integration Mechanics:${C_RESET}
   ${C_BOLD}agy${C_RESET}          Google Antigravity CLI speaks only the Gemini wire protocol. A per-session
@@ -3464,6 +3473,9 @@ ${C_YELLOW}CLI Integration Mechanics:${C_RESET}
                 in-session /effort picker works (mapped via reasoning_key).
   ${C_BOLD}claude${C_RESET}       Directs Claude Code to the target host via ANTHROPIC_BASE_URL.
   ${C_BOLD}codex/qwen${C_RESET}   Configured with custom Ollama API endpoints and model parameters.
+  ${C_BOLD}cyberstrike${C_RESET}  Cyberstrike AI-Powered Penetration Testing Agent. Automatically registers
+                 and routes the Ollama endpoint via 'cyberstrike provider' and CYBERSTRIKE_CONFIG_CONTENT,
+                 addressing targets via the 'ollama/<model>' format.
 
 ${C_YELLOW}Environment Overrides:${C_RESET}
   KIMO_KIMI_EFFORT          Default thinking effort (low, medium, high, xhigh, max)
@@ -3477,6 +3489,7 @@ ${C_YELLOW}Environment Overrides:${C_RESET}
 ${C_YELLOW}Examples:${C_RESET}
   ${0##*/} launch grok --model kalidroid-27b:latest
   ${0##*/} --remote launch claude --model nemotron3:33b
+  ${0##*/} launch cyberstrike --model kalidroid-27b:latest
   ${0##*/} launch agy --model kalidroid-27b:latest
   ${0##*/} --remote launch kimi --model kalidroid-27b:latest
 EOF
@@ -3800,6 +3813,34 @@ cmd_launch() {
                 "${cli_cmd}" --model "${resolved_model}" "${cli_passthrough_args[@]}" || rc=$?
                 exit "${rc}"
                 ;;
+            cyberstrike)
+                # Cyberstrike AI-Powered Penetration Testing Agent (cyberstrike.io)
+                # Registers/updates custom OpenAI-compatible provider 'ollama' and routes
+                # inference using provider/model format (ollama/<model>).
+                local cs_cfg_dir="${XDG_CONFIG_HOME:-${HOME:-/root}/.config}/cyberstrike"
+                local cs_cfg_file="${cs_cfg_dir}/cyberstrike.jsonc"
+                mkdir -p "${cs_cfg_dir}" 2>/dev/null || true
+
+                local need_provider_add=true
+                if [[ -f "${cs_cfg_file}" ]] && grep -q "${active_host}/v1" "${cs_cfg_file}" 2>/dev/null; then
+                    need_provider_add=false
+                fi
+                if ${need_provider_add}; then
+                    cyberstrike provider add --name ollama --url "${active_host}/v1" --scope global >/dev/null 2>&1 || true
+                fi
+
+                export OPENAI_API_BASE="${active_host}/v1"
+                export OPENAI_BASE_URL="${active_host}/v1"
+                export OLLAMA_HOST="${active_host}"
+                export CYBERSTRIKE_CONFIG_CONTENT="$(jq -nc \
+                    --arg api "${active_host}/v1" \
+                    --arg m "${resolved_model}" \
+                    '{provider: {ollama: {name: "ollama", api: $api, models: {($m): {name: $m}}}}}' 2>/dev/null || true)"
+
+                local cs_model="${resolved_model}"
+                [[ "${cs_model}" != *"/"* ]] && cs_model="ollama/${cs_model}"
+                exec "${cli_cmd}" --model "${cs_model}" "${cli_passthrough_args[@]}"
+                ;;
             *)
                 exec "${cli_cmd}" --model "${resolved_model}" "${cli_passthrough_args[@]}"
                 ;;
@@ -3841,7 +3882,7 @@ _install_list_status() {
     local fmt="  %-12s %-20s %-14s %-32s %s"
     printf "${C_CYAN}${fmt}${C_RESET}\n" "CLI" "STATUS" "VERSION" "BINARY PATH" "DEFAULT MODEL"
     echo "  ------------------------------------------------------------------------------------------------------"
-    local clis=("claude" "codex" "qwen" "grok" "kimi" "opencode" "agy" "openclaw" "hermes")
+    local clis=("claude" "codex" "qwen" "grok" "kimi" "opencode" "cyberstrike" "agy" "openclaw" "hermes")
     for c in "${clis[@]}"; do
         local bin="${EXTERNAL_CLI_MAP[$c]:-$c}"
         local dmodel="${DEFAULT_MODELS[$c]:-n/a}"
@@ -4112,9 +4153,66 @@ _install_single_cli() {
             echo "${C_DIM}    Ensure ~/.local/bin or antigravity-cli/bin is in your PATH.${C_RESET}"
             return 1
             ;;
+        cyberstrike)
+            local cur_bin
+            cur_bin=$(command -v cyberstrike 2>/dev/null || true)
+            if [[ -n "${cur_bin}" && "${force}" != "true" && "${update}" != "true" ]]; then
+                local ver
+                ver=$(_get_cli_version cyberstrike)
+                echo "${C_GREEN}[✓] Cyberstrike CLI is already installed (${ver}) at ${cur_bin}.${C_RESET}"
+                echo "${C_DIM}    Run '${0##*/} install cyberstrike --update' to update to latest version.${C_RESET}"
+                return 0
+            fi
+            echo "${C_CYAN}[*] Installing Cyberstrike CLI (via cyberstrike.io/install.sh)...${C_RESET}"
+            local installed=false
+            if command -v curl >/dev/null 2>&1; then
+                curl -fsSL https://cyberstrike.io/install.sh 2>/dev/null | bash && installed=true
+            fi
+            if ! ${installed}; then
+                echo "${C_YELLOW}[*] Falling back to direct GitHub release download...${C_RESET}"
+                local raw_os os="linux" arch
+                raw_os=$(uname -s)
+                case "${raw_os}" in
+                    Darwin*) os="darwin" ;;
+                    Linux*)  os="linux" ;;
+                esac
+                arch=$(uname -m)
+                [[ "${arch}" == "aarch64" ]] && arch="arm64"
+                [[ "${arch}" == "x86_64" ]] && arch="x64"
+                local cs_ver
+                cs_ver=$(curl -fsSL --connect-timeout 3 -m 5 https://api.github.com/repos/CyberStrikeus/CyberStrike/releases/latest 2>/dev/null | grep -oE '"tag_name": *"v[0-9.]+"' | grep -oE '[0-9.]+' | head -n 1 || echo "1.1.16")
+                local cs_tar="cyberstrike-${os}-${arch}.tar.gz"
+                local dl_url="https://github.com/CyberStrikeus/CyberStrike/releases/download/v${cs_ver}/${cs_tar}"
+                local tmp_dir
+                tmp_dir=$(mktemp -d 2>/dev/null || echo "/tmp/cyberstrike-install")
+                mkdir -p "${tmp_dir}"
+                if curl -fsSL "${dl_url}" -o "${tmp_dir}/${cs_tar}" 2>/dev/null && tar -xzf "${tmp_dir}/${cs_tar}" -C "${tmp_dir}" 2>/dev/null; then
+                    local target_dir="/usr/local/bin"
+                    [[ ! -w "${target_dir}" ]] && target_dir="${HOME:-/root}/.cyberstrike/bin"
+                    mkdir -p "${target_dir}"
+                    cp -f "${tmp_dir}/cyberstrike" "${target_dir}/cyberstrike" 2>/dev/null || cp -f "${tmp_dir}/cyberstrike" "/usr/bin/cyberstrike" 2>/dev/null || true
+                    chmod +x "${target_dir}/cyberstrike" 2>/dev/null || true
+                    [[ -f "${tmp_dir}/hackbrowser-worker.js" ]] && cp -f "${tmp_dir}/hackbrowser-worker.js" "${target_dir}/" 2>/dev/null || true
+                    installed=true
+                fi
+                rm -rf "${tmp_dir}" 2>/dev/null || true
+            fi
+            for _cs_dir in "${HOME:-/root}/.cyberstrike/bin" "${HOME:-/root}/.local/share/cyberstrike/bin" "/usr/local/bin"; do
+                [[ -d "${_cs_dir}" && ":${PATH}:" != *":${_cs_dir}:"* ]] && export PATH="${_cs_dir}:${PATH}"
+            done
+            if command -v cyberstrike >/dev/null 2>&1; then
+                local new_ver
+                new_ver=$(_get_cli_version cyberstrike)
+                echo "${C_GREEN}[✓] Successfully installed Cyberstrike CLI (${new_ver})!${C_RESET}"
+                echo "${C_CYAN}[*] Launch anytime with: ${0##*/} launch cyberstrike${C_RESET}"
+            else
+                echo "${C_RED}[!] Cyberstrike installation failed or binary not found in PATH.${C_RESET}" >&2
+                return 1
+            fi
+            ;;
         *)
             echo "${C_RED}Error: Unknown CLI '${cli}'.${C_RESET}" >&2
-            echo "Supported CLIs: kimi, claude, grok, codex, qwen, opencode, openclaw, hermes, agy, all" >&2
+            echo "Supported CLIs: kimi, claude, grok, codex, qwen, opencode, cyberstrike, openclaw, hermes, agy, all" >&2
             return 1
             ;;
     esac
@@ -4128,7 +4226,7 @@ ${C_YELLOW}Usage:${C_RESET}
   ${0##*/} install [cli|all|list] [options]
 
 ${C_YELLOW}Arguments:${C_RESET}
-  ${C_CYAN}<cli>${C_RESET}        Name of CLI to install (kimi, claude, grok, codex, qwen, opencode, openclaw, hermes)
+  ${C_CYAN}<cli>${C_RESET}        Name of CLI to install (kimi, claude, grok, codex, qwen, opencode, cyberstrike, openclaw, hermes)
   ${C_CYAN}all${C_RESET}          Install or update all supported CLIs in batch
   ${C_CYAN}list${C_RESET}         Display status and version table of all supported CLIs (default without args)
 
@@ -4176,7 +4274,7 @@ cmd_install() {
     if [[ "${target}" == "all" ]]; then
         echo "${C_BOLD}Installing / Updating All External LLM CLIs...${C_RESET}"
         echo "====================================================================="
-        local clis=("kimi" "claude" "grok" "codex" "qwen" "opencode" "openclaw" "hermes")
+        local clis=("kimi" "claude" "grok" "codex" "qwen" "opencode" "cyberstrike" "openclaw" "hermes")
         local failed=()
         for c in "${clis[@]}"; do
             echo ""
@@ -4231,6 +4329,9 @@ _get_cli_latest_version() {
         agy)
             latest=""
             ;;
+        cyberstrike)
+            latest=$(curl -fsSL --connect-timeout 2 -m 4 https://api.github.com/repos/CyberStrikeus/CyberStrike/releases/latest 2>/dev/null | grep -oE '"tag_name": *"v[0-9.]+"' | grep -oE '[0-9.]+' | head -n 1 || true)
+            ;;
     esac
     echo "${latest:-}"
 }
@@ -4241,7 +4342,7 @@ _check_updates_for_present_clis() {
     printf "${C_CYAN}${fmt}${C_RESET}\n" "CLI" "CURRENT" "LATEST" "STATUS"
     echo "  --------------------------------------------------------------------------------------"
 
-    local clis=("claude" "codex" "qwen" "grok" "kimi" "opencode" "agy" "openclaw" "hermes")
+    local clis=("claude" "codex" "qwen" "grok" "kimi" "opencode" "cyberstrike" "agy" "openclaw" "hermes")
     local present_count=0
     local updates_available=()
 
@@ -4289,7 +4390,7 @@ _check_updates_for_present_clis() {
 _update_all_present() {
     echo "${C_BOLD}Updating All Present External CLIs...${C_RESET}"
     echo "====================================================================="
-    local clis=("claude" "codex" "qwen" "grok" "kimi" "opencode" "agy" "openclaw" "hermes")
+    local clis=("claude" "codex" "qwen" "grok" "kimi" "opencode" "cyberstrike" "agy" "openclaw" "hermes")
     local updated_count=0
     local failed=()
 
@@ -4782,7 +4883,7 @@ cmd_doctor() {
     echo ""
     # 5. External LLM CLI Hub Inventory
     echo "${C_YELLOW}[5/5] External LLM CLI Hub Inventory:${C_RESET}"
-    local clis=("claude" "codex" "qwen" "grok" "kimi" "opencode" "agy" "openclaw" "hermes")
+    local clis=("claude" "codex" "qwen" "grok" "kimi" "opencode" "cyberstrike" "agy" "openclaw" "hermes")
     for c in "${clis[@]}"; do
         local bin="${EXTERNAL_CLI_MAP[$c]:-$c}"
         if command -v "${bin}" >/dev/null 2>&1; then
@@ -4851,7 +4952,7 @@ _kimo() {
 
     local commands="list ls search find ps top warm preload stop unload tune set-ctx param bench eval benchmark info show tag alias rm delete pull download sync run launch install setup update upgrade doctor diagnose diag config cfg completion version status health hosts check ping stream logs rotate-token help"
     local global_opts="--remote --local --host --json --no-color -v --version -h --help"
-    local supported_clis="claude grok kimi agy codex qwen opencode"
+    local supported_clis="claude grok kimi agy codex qwen opencode cyberstrike openclaw hermes"
     local config_subcmds="get set unset list file help"
     local config_keys="default_host preferred_cli vram_reserve_mb timeout_sec"
     local log_services="tunnel keepalive timer apache all"
@@ -5070,7 +5171,7 @@ _kimo() {
             case $words[1] in
                 launch|install|update)
                     local -a clis
-                    clis=(claude grok kimi agy codex qwen opencode all)
+                    clis=(claude grok kimi agy codex qwen opencode cyberstrike openclaw hermes all)
                     _describe -t clis 'supported CLIs' clis
                     ;;
                 config)
