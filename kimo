@@ -181,6 +181,7 @@ ${C_YELLOW}Cluster & Remote Operations:${C_RESET}
   ${C_CYAN}hosts${C_RESET}                        Inventory table of reachable servers, models, versions, and disks
   ${C_CYAN}status, health${C_RESET}               Operational snapshot: tunnel, remote API, VRAM residency, timer
   ${C_CYAN}doctor${C_RESET}                       Run system, cluster, and CLI ecosystem health diagnostics
+  ${C_CYAN}sync <model|--all>${C_RESET}           Replicate and synchronize models across cluster hosts
   ${C_CYAN}stream <model> [opts]${C_RESET}        Pin remote model for durable availability via keepalive daemon
                                 (modes: --status, --test, --resident-only, --repair-all)
 
@@ -226,6 +227,7 @@ ${C_YELLOW}Examples:${C_RESET}
   ${C_DIM}# Cluster & Multi-Host Management:${C_RESET}
   ${0##*/} check                                      # Health & latency probe for all endpoints
   ${0##*/} hosts                                      # Discover reachable cluster nodes
+  ${0##*/} sync granite4.2:latest                     # Replicate model across cluster hosts
   ${0##*/} --local --remote list                      # List models across local & remote nodes
   ${0##*/} stream kalidroid-27b:latest --status       # Inspect model keepalive pinning state
 EOF
@@ -433,7 +435,7 @@ resolve_model_name() {
     local target="$1"
     local host_url="${2:-${LOCAL_HOST_URL}}"
     local tags
-    tags=$(curl -s --connect-timeout 2 -m 4 "${host_url}/api/tags" 2>/dev/null) || return 1
+    tags=$(curl -s --connect-timeout 3 -m 8 "${host_url}/api/tags" 2>/dev/null) || return 1
 
     # 1. Exact match
     local match
@@ -2061,15 +2063,89 @@ PYEOF
 # Command: bench / eval
 # -----------------------------------------------------------------------------
 cmd_bench() {
-    local target_model="${1:-}"
+    local target_model=""
     local predict_tokens=60
+    local temperature=0.2
+    local custom_prompt=""
+    local opt_json=false
 
-    if [[ "${1:-}" == "--predict" && -n "${2:-}" ]]; then
-        predict_tokens="$2"
-        target_model=""
-    elif [[ "${2:-}" == "--predict" && -n "${3:-}" ]]; then
-        predict_tokens="$3"
-    fi
+    ${OPT_JSON} && opt_json=true
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -p|--prompt)
+                custom_prompt="${2:-}"
+                shift 2
+                ;;
+            --prompt=*)
+                custom_prompt="${1#*=}"
+                shift
+                ;;
+            -n|--predict|--tokens)
+                predict_tokens="${2:-60}"
+                shift 2
+                ;;
+            --predict=*|--tokens=*)
+                predict_tokens="${1#*=}"
+                shift
+                ;;
+            --temp|--temperature)
+                temperature="${2:-0.2}"
+                shift 2
+                ;;
+            --temp=*|--temperature=*)
+                temperature="${1#*=}"
+                shift
+                ;;
+            --json)
+                opt_json=true
+                shift
+                ;;
+            --remote)
+                TARGET_HOST="${REMOTE_HOST_URL}"
+                shift
+                ;;
+            --local)
+                TARGET_HOST="${LOCAL_HOST_URL}"
+                shift
+                ;;
+            --host)
+                TARGET_HOST="$(normalize_host_url "$2")"
+                shift 2
+                ;;
+            --host=*)
+                TARGET_HOST="$(normalize_host_url "${1#*=}")"
+                shift
+                ;;
+            -h|--help)
+                echo "${C_BOLD}kimo bench${C_RESET} – Benchmark model performance, TTFT, throughput & VRAM residency"
+                echo ""
+                echo "${C_YELLOW}Usage:${C_RESET}"
+                echo "  ${0##*/} bench [model] [options]"
+                echo ""
+                echo "${C_YELLOW}Options:${C_RESET}"
+                echo "  -p, --prompt <text>     Custom evaluation prompt string"
+                echo "  -n, --predict <tokens>  Number of tokens to generate (default: 60)"
+                echo "  --temp <val>            Sampling temperature (default: 0.2)"
+                echo "  --json                  Output benchmark results in structured JSON"
+                echo "  --remote                Run benchmark on remote GPU server"
+                echo "  --local                 Run benchmark on local Ollama daemon"
+                echo "  --host <addr>           Target specific Ollama host"
+                echo "  -h, --help              Show this help message"
+                return 0
+                ;;
+            -*)
+                echo "${C_RED}Error: Unknown option '$1' for bench.${C_RESET}" >&2
+                return 1
+                ;;
+            *)
+                if [[ -z "${target_model}" ]]; then
+                    target_model="$1"
+                fi
+                shift
+                ;;
+        esac
+    done
 
     local active_host=""
     local resolved_model="${target_model}"
@@ -2082,7 +2158,7 @@ cmd_bench() {
 
     if [[ -z "${resolved_model}" ]]; then
         local vram_model
-        vram_model=$(curl -s --connect-timeout 2 -m 3 "${active_host}/api/ps" | jq -r '.models[0].name // empty' 2>/dev/null || true)
+        vram_model=$(curl -s --connect-timeout 2 -m 3 "${active_host}/api/ps" 2>/dev/null | jq -r '.models[0].name // empty' 2>/dev/null || true)
         if [[ -n "${vram_model}" ]]; then
             resolved_model="${vram_model}"
         else
@@ -2094,82 +2170,159 @@ cmd_bench() {
     res=$(resolve_model_name "${resolved_model}" "${active_host}" || true)
     [[ -n "${res}" ]] && resolved_model="${res}"
 
-    echo "${C_CYAN}[*] Benchmarking '${resolved_model}' on ${active_host} (generating ${predict_tokens} tokens)...${C_RESET}"
+    if ! ${opt_json}; then
+        echo "${C_CYAN}[*] Benchmarking '${resolved_model}' on ${active_host} (generating ${predict_tokens} tokens)...${C_RESET}"
+    fi
 
-    OM_active_host="${active_host}" OM_resolved_model="${resolved_model}" OM_predict_tokens="${predict_tokens}" \
+    OM_ACTIVE_HOST="${active_host}" OM_RESOLVED_MODEL="${resolved_model}" OM_PREDICT_TOKENS="${predict_tokens}" \
+    OM_TEMPERATURE="${temperature}" OM_CUSTOM_PROMPT="${custom_prompt}" OM_OPT_JSON="${opt_json}" \
+    OM_C_RESET="${C_RESET}" OM_C_BOLD="${C_BOLD}" OM_C_GREEN="${C_GREEN}" OM_C_YELLOW="${C_YELLOW}" OM_C_CYAN="${C_CYAN}" OM_C_MAGENTA="${C_MAGENTA}" OM_C_RED="${C_RED}" OM_C_DIM="${C_DIM}" \
         python3 - <<'PYEOF'
-import os as _om_os
-OM_active_host = _om_os.environ["OM_active_host"]
-OM_resolved_model = _om_os.environ["OM_resolved_model"]
-OM_predict_tokens = _om_os.environ["OM_predict_tokens"]
-import json
-import urllib.request
-import sys
-import time
+import os, sys, json, time, urllib.request, urllib.error
 
-host = OM_active_host
-model = OM_resolved_model
-tokens_to_predict = int(OM_predict_tokens)
+host = os.environ.get("OM_ACTIVE_HOST", "http://127.0.0.1:11434")
+model = os.environ.get("OM_RESOLVED_MODEL", "")
+tokens_to_predict = int(os.environ.get("OM_PREDICT_TOKENS", "60"))
+temp = float(os.environ.get("OM_TEMPERATURE", "0.2"))
+custom_prompt = os.environ.get("OM_CUSTOM_PROMPT", "")
+as_json = os.environ.get("OM_OPT_JSON", "false").lower() == "true"
 
-prompt = "Explain the fundamental architecture differences between CPU and GPU memory bandwidth in 3 concise paragraphs."
+C_RESET = os.environ.get("OM_C_RESET", "")
+C_BOLD = os.environ.get("OM_C_BOLD", "")
+C_GREEN = os.environ.get("OM_C_GREEN", "")
+C_YELLOW = os.environ.get("OM_C_YELLOW", "")
+C_CYAN = os.environ.get("OM_C_CYAN", "")
+C_MAGENTA = os.environ.get("OM_C_MAGENTA", "")
+C_RED = os.environ.get("OM_C_RED", "")
+C_DIM = os.environ.get("OM_C_DIM", "")
+
+prompt = custom_prompt if custom_prompt else "Explain the fundamental architecture differences between CPU and GPU memory bandwidth in 3 concise paragraphs."
 
 payload = {
     "model": model,
     "prompt": prompt,
-    "stream": False,
+    "stream": True,
     "options": {
         "num_predict": tokens_to_predict,
-        "temperature": 0.2
+        "temperature": temp
     }
 }
 
 req = urllib.request.Request(
-    f"{host}/api/generate",
+    f"{host.rstrip('/')}/api/generate",
     data=json.dumps(payload).encode("utf-8"),
     headers={"Content-Type": "application/json"}
 )
 
 start_wall = time.time()
-try:
-    with urllib.request.urlopen(req, timeout=120) as resp:
-        data = json.loads(resp.read().decode("utf-8"))
-except Exception as e:
-    print(f"\033[0;31m[!] Benchmark failed: {e}\033[0m", file=sys.stderr)
-    sys.exit(1)
-end_wall = time.time()
+ttft_wall = None
+gen_tokens = 0
+final_data = {}
 
-gpu_pct_str = "N/A"
-vram_used_str = "N/A"
 try:
-    ps_req = urllib.request.Request(f"{host}/api/ps")
+    with urllib.request.urlopen(req, timeout=300) as resp:
+        for raw_line in resp:
+            line = raw_line.decode("utf-8", errors="replace").strip()
+            if not line:
+                continue
+            try:
+                chunk = json.loads(line)
+            except Exception:
+                continue
+
+            if "error" in chunk:
+                if not as_json and sys.stdout.isatty():
+                    sys.stdout.write("\n")
+                sys.stderr.write(f"{C_RED}[!] Benchmark error: {chunk['error']}{C_RESET}\n")
+                sys.exit(1)
+
+            if chunk.get("response"):
+                if ttft_wall is None:
+                    ttft_wall = time.time() - start_wall
+                gen_tokens += 1
+                if not as_json and sys.stdout.isatty():
+                    sys.stdout.write(f"\r\033[2K  {C_DIM}[*] Generating tokens: {gen_tokens}/{tokens_to_predict}...{C_RESET}")
+                    sys.stdout.flush()
+
+            if chunk.get("done"):
+                final_data = chunk
+
+except urllib.error.HTTPError as e:
+    err_body = e.read().decode("utf-8", errors="replace")
+    if as_json:
+        print(json.dumps({"error": f"HTTP {e.code}: {err_body or e.reason}"}, indent=2))
+    else:
+        sys.stderr.write(f"\n{C_RED}[!] Benchmark failed (HTTP {e.code}): {err_body or e.reason}{C_RESET}\n")
+    sys.exit(1)
+except Exception as e:
+    if as_json:
+        print(json.dumps({"error": str(e)}, indent=2))
+    else:
+        sys.stderr.write(f"\n{C_RED}[!] Benchmark failed: {e}{C_RESET}\n")
+    sys.exit(1)
+
+end_wall = time.time()
+if not as_json and sys.stdout.isatty():
+    sys.stdout.write("\r\033[2K")
+    sys.stdout.flush()
+
+vram_used_bytes = 0
+total_model_bytes = 0
+gpu_pct = 0.0
+vram_used_str = "N/A"
+gpu_pct_str = "N/A"
+
+try:
+    ps_req = urllib.request.Request(f"{host.rstrip('/')}/api/ps")
     with urllib.request.urlopen(ps_req, timeout=5) as ps_resp:
         ps_data = json.loads(ps_resp.read().decode("utf-8"))
         for m in ps_data.get("models", []):
-            if m.get("name") == model or m.get("model") == model or f"{m.get('name')}:latest" == model:
-                vram_b = m.get("size_vram", 0)
-                tot_b = m.get("size", 1)
-                vram_used_str = f"{vram_b / (1024**3):.2f} GB"
-                pct = (vram_b / tot_b) * 100 if tot_b else 0
-                gpu_pct_str = f"{pct:.1f}% GPU"
+            m_name = m.get("name", "")
+            if m_name == model or m.get("model") == model or f"{m_name}:latest" == model or m_name.startswith(model):
+                vram_used_bytes = m.get("size_vram", 0)
+                total_model_bytes = m.get("size", 1)
+                vram_used_str = f"{vram_used_bytes / (1024**3):.2f} GB"
+                gpu_pct = (vram_used_bytes / total_model_bytes) * 100.0 if total_model_bytes else 0.0
+                gpu_pct_str = f"{gpu_pct:.1f}% GPU"
                 break
 except Exception:
     pass
 
-p_count = data.get("prompt_eval_count", 0)
-p_dur_ns = data.get("prompt_eval_duration", 1)
-e_count = data.get("eval_count", 0)
-e_dur_ns = data.get("eval_duration", 1)
+p_count = final_data.get("prompt_eval_count", 0)
+p_dur_ns = final_data.get("prompt_eval_duration", 0)
+e_count = final_data.get("eval_count", gen_tokens)
+e_dur_ns = final_data.get("eval_duration", 0)
 
-prompt_tps = (p_count / (p_dur_ns / 1e9)) if p_dur_ns > 0 else 0
-eval_tps = (e_count / (e_dur_ns / 1e9)) if e_dur_ns > 0 else 0
-ttft_ms = (p_dur_ns / 1e6)
+prompt_tps = (p_count / (p_dur_ns / 1e9)) if p_dur_ns > 0 else 0.0
+eval_tps = (e_count / (e_dur_ns / 1e9)) if e_dur_ns > 0 else 0.0
+ttft_ms = (p_dur_ns / 1e6) if p_dur_ns > 0 else ((ttft_wall * 1000.0) if ttft_wall else 0.0)
 
-C_RESET = "\033[0m"
-C_BOLD = "\033[1m"
-C_GREEN = "\033[0;32m"
-C_YELLOW = "\033[0;33m"
-C_CYAN = "\033[0;36m"
-C_MAGENTA = "\033[0;35m"
+if as_json:
+    out = {
+        "model": model,
+        "host": host,
+        "prompt": prompt,
+        "vram": {
+            "used_bytes": vram_used_bytes,
+            "used_gb": round(vram_used_bytes / (1024**3), 2),
+            "total_bytes": total_model_bytes,
+            "percent_gpu": round(gpu_pct, 1)
+        },
+        "prompt_eval": {
+            "tokens": p_count,
+            "duration_ms": round(p_dur_ns / 1e6, 2),
+            "tokens_per_second": round(prompt_tps, 2)
+        },
+        "generation": {
+            "tokens": e_count,
+            "duration_ms": round(e_dur_ns / 1e6, 2),
+            "tokens_per_second": round(eval_tps, 2)
+        },
+        "time_to_first_token_ms": round(ttft_ms, 2),
+        "total_elapsed_sec": round(end_wall - start_wall, 2)
+    }
+    print(json.dumps(out, indent=2))
+    sys.exit(0)
 
 print()
 print(f"{C_BOLD}BENCHMARK RESULTS: {model}{C_RESET}")
@@ -2482,6 +2635,270 @@ except KeyboardInterrupt:
     sys.stdout.write(f"\n{C_YELLOW}[!] Pull canceled by user.{C_RESET}\n")
     sys.exit(130)
 PYEOF
+}
+
+# -----------------------------------------------------------------------------
+# Command: sync
+# -----------------------------------------------------------------------------
+cmd_sync() {
+    local target_model=""
+    local opt_from=""
+    local opt_to=""
+    local opt_all=false
+    local opt_force=false
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --from)
+                opt_from="${2:-}"
+                shift 2
+                ;;
+            --from=*)
+                opt_from="${1#*=}"
+                shift
+                ;;
+            --to)
+                opt_to="${2:-}"
+                shift 2
+                ;;
+            --to=*)
+                opt_to="${1#*=}"
+                shift
+                ;;
+            --all)
+                opt_all=true
+                shift
+                ;;
+            --force)
+                opt_force=true
+                shift
+                ;;
+            -h|--help)
+                echo "${C_BOLD}kimo sync${C_RESET} – Replicate and synchronize models across cluster hosts"
+                echo ""
+                echo "${C_YELLOW}Usage:${C_RESET}"
+                echo "  ${0##*/} sync <model> [options]"
+                echo "  ${0##*/} sync --all [options]"
+                echo ""
+                echo "${C_YELLOW}Options:${C_RESET}"
+                echo "  --from <host>   Source host (local, remote, or address; auto-detected if omitted)"
+                echo "  --to <host>     Destination host (local, remote, or address; auto-detected if omitted)"
+                echo "  --all           Synchronize all models missing on destination host"
+                echo "  --force         Force synchronization even if model already exists on destination"
+                echo "  -h, --help      Show this help message"
+                echo ""
+                echo "${C_YELLOW}Examples:${C_RESET}"
+                echo "  ${0##*/} sync granite4.2:latest              # Auto-detects local->remote and syncs"
+                echo "  ${0##*/} sync llama-3.1-8b:uncensored        # Auto-detects remote->local and syncs"
+                echo "  ${0##*/} sync kalidroid-27b:latest --to local # Pull remote model to local daemon"
+                echo "  ${0##*/} sync --all --from remote --to local  # Sync all missing remote models to local"
+                return 0
+                ;;
+            -*)
+                echo "${C_RED}Error: Unknown sync option '$1'.${C_RESET}" >&2
+                return 1
+                ;;
+            *)
+                if [[ -z "${target_model}" ]]; then
+                    target_model="$1"
+                fi
+                shift
+                ;;
+        esac
+    done
+
+    _resolve_sync_host() {
+        local arg="$1"
+        case "${arg}" in
+            local)  echo "${LOCAL_HOST_URL}" ;;
+            remote) echo "${REMOTE_HOST_URL}" ;;
+            "")     echo "" ;;
+            *)      normalize_host_url "${arg}" ;;
+        esac
+    }
+
+    local src_url="$(_resolve_sync_host "${opt_from}")"
+    local dst_url="$(_resolve_sync_host "${opt_to}")"
+
+    _sync_host_label() {
+        local u="$1"
+        if [[ "${u}" == "${LOCAL_HOST_URL}" ]]; then
+            echo "local (${u})"
+        elif [[ "${u}" == "${REMOTE_HOST_URL}" ]]; then
+            echo "remote (${u})"
+        else
+            echo "${u}"
+        fi
+    }
+
+    _fetch_host_tags() {
+        local u="$1"
+        curl -s --connect-timeout 5 -m 15 "${u}/api/tags" 2>/dev/null || echo "{}"
+    }
+
+    _sync_single_model() {
+        local m="$1"
+        local s_url="$2"
+        local d_url="$3"
+
+        local s_label="$(_sync_host_label "${s_url}")"
+        local d_label="$(_sync_host_label "${d_url}")"
+
+        echo "${C_BOLD}[*] Synchronizing '${m}' from ${s_label} -> ${d_label}...${C_RESET}"
+
+        local s_tags d_tags s_digest d_digest
+        s_tags="$(_fetch_host_tags "${s_url}")"
+        d_tags="$(_fetch_host_tags "${d_url}")"
+
+        s_digest=$(echo "${s_tags}" | jq -r --arg n "${m}" '.models[]? | select(.name == $n or .name == ($n + ":latest")) | .digest // empty' 2>/dev/null | head -n1)
+        d_digest=$(echo "${d_tags}" | jq -r --arg n "${m}" '.models[]? | select(.name == $n or .name == ($n + ":latest")) | .digest // empty' 2>/dev/null | head -n1)
+
+        if [[ -n "${d_digest}" ]]; then
+            if [[ -n "${s_digest}" && "${s_digest}" == "${d_digest}" ]]; then
+                if ! ${opt_force}; then
+                    echo "${C_GREEN}[✓] Model '${m}' is already synchronized on ${d_label} (digest: ${d_digest:0:12}).${C_RESET}"
+                    return 0
+                else
+                    echo "${C_DIM}[*] Re-synchronizing '${m}' due to --force...${C_RESET}"
+                fi
+            elif [[ -n "${s_digest}" && "${s_digest}" != "${d_digest}" ]]; then
+                if ! ${opt_force}; then
+                    echo "${C_YELLOW}[!] Model '${m}' exists on ${d_label} with differing digest (${d_digest:0:12} vs ${s_digest:0:12}).${C_RESET}"
+                    echo "    Use --force to overwrite: ${0##*/} sync ${m} --from ${s_url} --to ${d_url} --force"
+                    return 1
+                fi
+            fi
+        fi
+
+        TARGET_HOST="${d_url}" cmd_pull "${m}" || {
+            echo "${C_RED}[!] Failed to synchronize '${m}' to ${d_label}.${C_RESET}" >&2
+            return 1
+        }
+
+        echo "${C_GREEN}[✓] Successfully synchronized '${m}' to ${d_label}.${C_RESET}"
+        return 0
+    }
+
+    if ${opt_all}; then
+        local s_url="${src_url:-${LOCAL_HOST_URL}}"
+        local d_url="${dst_url:-${REMOTE_HOST_URL}}"
+
+        if [[ "${s_url}" == "${d_url}" ]]; then
+            echo "${C_RED}Error: Source and destination hosts cannot be the same (${s_url}).${C_RESET}" >&2
+            return 1
+        fi
+
+        local s_label="$(_sync_host_label "${s_url}")"
+        local d_label="$(_sync_host_label "${d_url}")"
+
+        echo "${C_BOLD}Scanning for models to synchronize from ${s_label} -> ${d_label}...${C_RESET}"
+        local s_tags d_tags
+        s_tags="$(_fetch_host_tags "${s_url}")"
+        d_tags="$(_fetch_host_tags "${d_url}")"
+
+        local -a missing_models=()
+        while IFS= read -r line; do
+            [[ -z "${line}" ]] && continue
+            local m_name m_dig
+            m_name=$(echo "${line}" | awk '{print $1}')
+            m_dig=$(echo "${line}" | awk '{print $2}')
+            local on_dst
+            on_dst=$(echo "${d_tags}" | jq -r --arg n "${m_name}" '.models[]? | select(.name == $n) | .digest // empty' 2>/dev/null)
+            if [[ -z "${on_dst}" ]] || { ${opt_force} && [[ "${on_dst}" != "${m_dig}" ]]; }; then
+                missing_models+=("${m_name}")
+            fi
+        done < <(echo "${s_tags}" | jq -r '.models[]? | "\(.name) \(.digest)"' 2>/dev/null)
+
+        if [[ ${#missing_models[@]} -eq 0 ]]; then
+            echo "${C_GREEN}[✓] All models on ${s_label} are already synchronized to ${d_label}.${C_RESET}"
+            return 0
+        fi
+
+        echo "${C_CYAN}Found ${#missing_models[@]} model(s) to synchronize:${C_RESET}"
+        for m in "${missing_models[@]}"; do
+            echo "  • ${m}"
+        done
+        echo ""
+
+        local failed=0
+        for m in "${missing_models[@]}"; do
+            if ! _sync_single_model "${m}" "${s_url}" "${d_url}"; then
+                failed=$((failed + 1))
+            fi
+            echo ""
+        done
+
+        if [[ "${failed}" -gt 0 ]]; then
+            echo "${C_RED}[!] Synchronization finished with ${failed} failure(s).${C_RESET}" >&2
+            return 1
+        fi
+        echo "${C_GREEN}[✓] All ${#missing_models[@]} models synchronized successfully!${C_RESET}"
+        return 0
+    fi
+
+    if [[ -z "${target_model}" ]]; then
+        echo "${C_RED}Error: 'sync' requires a model name or --all.${C_RESET}" >&2
+        echo "Usage: ${0##*/} sync <model> [--from <host>] [--to <host>]" >&2
+        echo "       ${0##*/} sync --all [--from <host>] [--to <host>]" >&2
+        return 1
+    fi
+
+    local s_url="${src_url}"
+    local d_url="${dst_url}"
+
+    if [[ -z "${s_url}" && -z "${d_url}" ]]; then
+        local s_tags d_tags l_dig r_dig
+        s_tags="$(_fetch_host_tags "${LOCAL_HOST_URL}")"
+        d_tags="$(_fetch_host_tags "${REMOTE_HOST_URL}")"
+        l_dig=$(echo "${s_tags}" | jq -r --arg n "${target_model}" '.models[]? | select(.name == $n or .name == ($n + ":latest")) | .digest // empty' 2>/dev/null | head -n1)
+        r_dig=$(echo "${d_tags}" | jq -r --arg n "${target_model}" '.models[]? | select(.name == $n or .name == ($n + ":latest")) | .digest // empty' 2>/dev/null | head -n1)
+
+        local on_local=false on_remote=false
+        [[ -n "${l_dig}" ]] && on_local=true
+        [[ -n "${r_dig}" ]] && on_remote=true
+
+        if ${on_local} && ! ${on_remote}; then
+            s_url="${LOCAL_HOST_URL}"
+            d_url="${REMOTE_HOST_URL}"
+        elif ${on_remote} && ! ${on_local}; then
+            s_url="${REMOTE_HOST_URL}"
+            d_url="${LOCAL_HOST_URL}"
+        elif ${on_local} && ${on_remote}; then
+            s_url="${LOCAL_HOST_URL}"
+            d_url="${REMOTE_HOST_URL}"
+            if [[ -n "${l_dig}" && "${l_dig}" == "${r_dig}" && "${opt_force}" != "true" ]]; then
+                echo "${C_GREEN}[✓] Model '${target_model}' is already synchronized across local and remote (digest: ${l_dig:0:12}).${C_RESET}"
+                return 0
+            fi
+            if ! ${opt_force}; then
+                echo "${C_YELLOW}[!] Model '${target_model}' exists on both local and remote with differing digests.${C_RESET}"
+                echo "    Specify direction and force: ${0##*/} sync ${target_model} --from <src> --to <dst> --force"
+                return 1
+            fi
+        else
+            echo "${C_RED}[!] Error: Model '${target_model}' not found on local (${LOCAL_HOST_URL}) or remote (${REMOTE_HOST_URL}).${C_RESET}" >&2
+            return 1
+        fi
+    elif [[ -n "${s_url}" && -z "${d_url}" ]]; then
+        if [[ "${s_url}" == "${LOCAL_HOST_URL}" ]]; then
+            d_url="${REMOTE_HOST_URL}"
+        else
+            d_url="${LOCAL_HOST_URL}"
+        fi
+    elif [[ -z "${s_url}" && -n "${d_url}" ]]; then
+        if [[ "${d_url}" == "${LOCAL_HOST_URL}" ]]; then
+            s_url="${REMOTE_HOST_URL}"
+        else
+            s_url="${LOCAL_HOST_URL}"
+        fi
+    fi
+
+    if [[ "${s_url}" == "${d_url}" ]]; then
+        echo "${C_RED}Error: Source and destination hosts cannot be the same (${s_url}).${C_RESET}" >&2
+        return 1
+    fi
+
+    _sync_single_model "${target_model}" "${s_url}" "${d_url}"
 }
 
 # -----------------------------------------------------------------------------
@@ -4432,7 +4849,7 @@ _kimo() {
         cword=$COMP_CWORD
     fi
 
-    local commands="list ls search find ps top warm preload stop unload tune set-ctx param bench eval benchmark info show tag alias rm delete pull download run launch install setup update upgrade doctor diagnose diag config cfg completion version status health hosts check ping stream logs rotate-token help"
+    local commands="list ls search find ps top warm preload stop unload tune set-ctx param bench eval benchmark info show tag alias rm delete pull download sync run launch install setup update upgrade doctor diagnose diag config cfg completion version status health hosts check ping stream logs rotate-token help"
     local global_opts="--remote --local --host --json --no-color -v --version -h --help"
     local supported_clis="claude grok kimi agy codex qwen opencode"
     local config_subcmds="get set unset list file help"
@@ -4498,9 +4915,23 @@ _kimo() {
                 COMPREPLY=( $(compgen -W "${supported_clis} all" -- "${cur}") )
             fi
             ;;
-        run|info|show|warm|preload|bench|eval|benchmark|rm|delete|tag|alias|stream)
+        run|info|show|warm|preload|rm|delete|tag|alias|stream)
             if [[ "${cur}" == -* ]]; then
                 COMPREPLY=( $(compgen -W "${global_opts}" -- "${cur}") )
+            else
+                _kimo_complete_models
+            fi
+            ;;
+        bench|eval|benchmark)
+            if [[ "${cur}" == -* ]]; then
+                COMPREPLY=( $(compgen -W "-p --prompt -n --predict --tokens --temp --temperature --json ${global_opts}" -- "${cur}") )
+            else
+                _kimo_complete_models
+            fi
+            ;;
+        sync)
+            if [[ "${cur}" == -* ]]; then
+                COMPREPLY=( $(compgen -W "--from --to --all --force -h --help" -- "${cur}") )
             else
                 _kimo_complete_models
             fi
@@ -4602,6 +5033,7 @@ _kimo() {
         'tag:Create a model tag or alias'
         'rm:Delete a model'
         'pull:Pull a model with live progress'
+        'sync:Replicate models across cluster hosts'
         'run:Run an Ollama model directly'
         'launch:Launch external agent CLI'
         'install:Install external LLM CLIs'
@@ -4651,6 +5083,14 @@ _kimo() {
                     shells=(bash zsh)
                     _describe -t shells 'shell' shells
                     ;;
+                sync)
+                    _arguments \
+                        '--from[Source host]:host:' \
+                        '--to[Destination host]:host:' \
+                        '--all[Sync all missing models]' \
+                        '--force[Force overwrite]' \
+                        '*: :->models' && return 0
+                    ;;
                 *)
                     local -a models
                     models=(${(f)"$(kimo list 2>/dev/null | awk 'NR>2 && $1 !~ /^(Total|---|Hosts)/ {print $1}')"})
@@ -4692,7 +5132,7 @@ EOFZSH
 # first --host).
 if [[ "${HOST_MODE}" == "multi" ]]; then
     case "${COMMAND}" in
-        check|ping|hosts|ps|top|list|ls|search|find|stop|unload|info|show|status|health|status-report|report|logs|log|rotate-token|rotate|install|setup|update|upgrade|doctor|diagnose|diag|config|cfg|completion|version|help|-h|--help) ;;
+        check|ping|hosts|ps|top|list|ls|search|find|stop|unload|info|show|status|health|status-report|report|logs|log|rotate-token|rotate|install|setup|update|upgrade|doctor|diagnose|diag|config|cfg|completion|sync|version|help|-h|--help) ;;
         *)
             _model="${ARGS[0]:-}"
             if [[ "${COMMAND}" == "launch" ]]; then
@@ -4773,6 +5213,9 @@ case "${COMMAND}" in
         ;;
     pull|download)
         cmd_pull "${ARGS[@]}"
+        ;;
+    sync)
+        cmd_sync "${ARGS[@]}"
         ;;
     stream)
         cmd_stream "${ARGS[@]}"

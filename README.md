@@ -10,6 +10,8 @@
 
 - **Multi-Host Routing**: Seamlessly query or execute against local daemons and remote GPU servers over SSH tunnels or direct LAN connections.
 - **Real-Time VRAM Monitor**: Live interactive GPU/CPU residency monitor (`top` / `ps --watch`) tracking memory usage across cluster hosts.
+- **Cluster Model Replication**: One-click bidirectional synchronization and digest verification across cluster hosts (`sync`).
+- **Streaming Model Benchmarking**: True time-to-first-token (TTFT) profiling, generation throughput (tok/s), memory residency, and structured JSON output (`bench`).
 - **Streaming Model Pulling**: Pull models directly from Ollama registries with live multi-layer download progress, layer digests, transfer speeds, and status updates (`pull`).
 - **Model Tuning & Persistence**: Bake per-model parameters (`num_ctx`, `num_batch`, `num_predict`, `temperature`, `num_gpu`) into runtime launches without modifying raw Modelfiles.
 - **Streaming & Keepalive Pinning**: Durable model availability via background keepalive and pre-warming (`stream`).
@@ -98,7 +100,8 @@ kimo [options] <command> [arguments...]
 | `warm <model> [dur]`| Pre-warm model into GPU VRAM (`keep_alive: 24h` by default) | `kimo warm kalidroid-27b` |
 | `info <model>` | Inspect detailed model metadata, quant, template, parameters | `kimo info kalidroid-27b` |
 | `tune <model> [opts]`| Register per-model defaults (`--ctx`, `--batch`, `--temp`, etc.) | `kimo tune model --ctx 32768` |
-| `bench [model]` | Benchmark TTFT, generation throughput (tok/s), and memory | `kimo bench kalidroid-27b` |
+| `bench [model]` | Benchmark TTFT, generation throughput (tok/s), and memory | `kimo bench kalidroid-27b -n 30` |
+| `sync <model>` | Replicate and synchronize models across cluster hosts | `kimo sync kalidroid-27b --to local` |
 | `tag <src> <dst>` | Create model tag/alias on target host | `kimo tag model:33b model:latest` |
 | `rm <model>` | Delete a model from target Ollama server | `kimo rm old-model` |
 | `stream <model>` | Pin model for durable availability via keepalive daemon | `kimo stream model --status` |
@@ -246,6 +249,65 @@ kimo --host 192.168.1.131:11434 pull qwen2.5:32b
 # Insecure registry pull
 kimo pull my-registry.internal/model:latest --insecure
 ```
+
+---
+
+## Cluster Model Replication (`sync`)
+
+Replicate and synchronize models between local daemons and remote GPU servers with digest verification and directional auto-detection:
+
+```bash
+# Auto-detect direction and synchronize a model between local and remote
+kimo sync llama3:latest
+
+# Synchronize model from remote host to local daemon
+kimo sync kalidroid-27b:latest --to local
+
+# Synchronize model between custom host addresses
+kimo sync qwen2.5:32b --from 192.168.1.131:11434 --to 127.0.0.1:11434
+
+# Scan and synchronize all missing models from remote to local
+kimo sync --all --from remote --to local
+
+# Force re-synchronization even if the model exists on destination
+kimo sync llama3:latest --force
+```
+
+Features:
+- Automatic presence and digest comparison (`/api/tags`) before initiating transfer.
+- Smart directional resolution: auto-detects which host has the model and replicates to the other.
+- Integrated streaming pull progress on the destination host.
+- Conflict detection with actionable `--force` guidance when digests differ.
+
+---
+
+## Model Benchmarking & Performance Profiling (`bench`)
+
+Benchmark inference throughput, time-to-first-token (TTFT), and VRAM residency:
+
+```bash
+# Benchmark model with default evaluation prompt (60 tokens)
+kimo bench kalidroid-27b:latest
+
+# Custom prompt and token generation limit
+kimo bench kalidroid-27b:latest -p "Explain quantum computing in 3 sentences." -n 100
+
+# Benchmark with sampling temperature override
+kimo bench llama3:latest --temp 0.7 -n 50
+
+# Output results in structured JSON for CI/automation pipelines
+kimo bench kalidroid-27b:latest --json
+
+# Run benchmark explicitly on remote GPU server
+kimo --remote bench kalidroid-27b:latest -n 30
+```
+
+Metrics reported:
+- **Time to First Token (TTFT)**: Accurate prompt processing and cold/warm start latency.
+- **Generation Speed**: Real-time streaming token throughput in tokens/sec (`tok/s`).
+- **Prompt Speed**: Prompt evaluation speed in tokens/sec (`tok/s`).
+- **Total Latency**: Wall-clock evaluation time.
+- **VRAM Footprint**: Active GPU VRAM allocation during and after inference.
 
 ---
 
