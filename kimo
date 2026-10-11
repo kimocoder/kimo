@@ -99,7 +99,7 @@ setup_colors() {
 
 usage() {
     cat <<EOF
-${C_BOLD}kimo - Ollama Manager (kimo)${C_RESET} – Unified Local & Remote Model Management & External CLI Hub
+${C_BOLD}kimo (Ollama Manager)${C_RESET} – Unified Local & Remote Model Management & External CLI Hub
 
 ${C_YELLOW}Usage:${C_RESET}
   ${0##*/} [options] <command> [arguments...]
@@ -158,11 +158,12 @@ ${C_YELLOW}Commands:${C_RESET}
                            declare support_efforts low..max + off_effort none, so the
                            in-session /effort picker works and reaches the wire as
                            reasoning_effort (Ollama's non-standard 'reasoning' field is mapped
-                           via reasoning_key). Overrides: OM_KIMI_EFFORT (default effort),
-                           OM_KIMI_EFFORTS, OM_KIMI_CAPABILITIES, OM_KIMI_REASONING_KEY.
+                           via reasoning_key). Overrides: KIMO_KIMI_EFFORT / OM_KIMI_EFFORT (default effort),
+                           KIMO_KIMI_EFFORTS / OM_KIMI_EFFORTS, KIMO_KIMI_CAPABILITIES / OM_KIMI_CAPABILITIES,
+                           KIMO_KIMI_REASONING_KEY / OM_KIMI_REASONING_KEY.
                            Without python3-tomlkit it falls back to the KIMI_MODEL_* env
                            channel: zero footprint, but /effort is limited to on/off and the
-                           graded effort must be set at launch via OM_KIMI_EFFORT=xhigh.
+                           graded effort must be set at launch via KIMO_KIMI_EFFORT=xhigh (or OM_KIMI_EFFORT).
 
 ${C_YELLOW}Examples:${C_RESET}
   ${0##*/} check
@@ -485,7 +486,7 @@ results = []
 for label, url in hosts_to_check:
     t0 = time.time()
     try:
-        req = urllib.request.Request(url + '/api/version', headers={'User-Agent': 'ollama_mgr'})
+        req = urllib.request.Request(url + '/api/version', headers={'User-Agent': 'kimo'})
         with urllib.request.urlopen(req, timeout=2.5) as r:
             ver = json.loads(r.read().decode('utf-8')).get('version', 'unknown')
             lat = int((time.time() - t0) * 1000)
@@ -496,7 +497,7 @@ for label, url in hosts_to_check:
 
     models_cnt = 0
     try:
-        req = urllib.request.Request(url + '/api/tags', headers={'User-Agent': 'ollama_mgr'})
+        req = urllib.request.Request(url + '/api/tags', headers={'User-Agent': 'kimo'})
         with urllib.request.urlopen(req, timeout=2.5) as r:
             models_cnt = len(json.loads(r.read().decode('utf-8')).get('models', []))
     except Exception:
@@ -505,7 +506,7 @@ for label, url in hosts_to_check:
     active_cnt = 0
     vram_bytes = 0
     try:
-        req = urllib.request.Request(url + '/api/ps', headers={'User-Agent': 'ollama_mgr'})
+        req = urllib.request.Request(url + '/api/ps', headers={'User-Agent': 'kimo'})
         with urllib.request.urlopen(req, timeout=2.5) as r:
             ps_models = json.loads(r.read().decode('utf-8')).get('models', [])
             active_cnt = len(ps_models)
@@ -688,7 +689,7 @@ def split_url(url):
 
 
 def get_json(url, path):
-    req = urllib.request.Request(url.rstrip("/") + path, headers={"User-Agent": "ollama_mgr"})
+    req = urllib.request.Request(url.rstrip("/") + path, headers={"User-Agent": "kimo"})
     with urllib.request.urlopen(req, timeout=2.5) as r:
         return json.loads(r.read().decode("utf-8"))
 
@@ -874,7 +875,7 @@ else:
 all_ps = []
 for label, url in hosts_to_query:
     try:
-        req = urllib.request.Request(url + '/api/ps', headers={'User-Agent': 'ollama_mgr'})
+        req = urllib.request.Request(url + '/api/ps', headers={'User-Agent': 'kimo'})
         with urllib.request.urlopen(req, timeout=2.5) as r:
             data = json.loads(r.read().decode('utf-8'))
             for m in data.get('models', []):
@@ -1034,7 +1035,7 @@ cmd_status() {
         pbadge="${C_RED}${pubresp:-no response}${C_RESET}"
     fi
 
-    echo "${C_BOLD}OLLAMA MANAGER — STATUS${C_RESET}"
+    echo "${C_BOLD}KIMO (OLLAMA MANAGER) — STATUS${C_RESET}"
     echo "---------------------------------------------------------------------"
     printf "  %-38s : %s\n" "Tunnel (ollama-remote-tunnel.service)" "${tbadge} (entered ${tunnel_enter:-?})"
     printf "  %-38s : %s  %s  ~%sms\n" "Remote API (${REMOTE_HOST_URL})" "${rbadge}" "${remote_ver:--}" "${vlat:--}"
@@ -1206,7 +1207,7 @@ def unload_model(host_label, url, model_name):
     req = urllib.request.Request(
         url + '/api/generate',
         data=payload,
-        headers={'Content-Type': 'application/json', 'User-Agent': 'ollama_mgr'}
+        headers={'Content-Type': 'application/json', 'User-Agent': 'kimo'}
     )
     try:
         with urllib.request.urlopen(req, timeout=5) as resp:
@@ -1222,7 +1223,7 @@ if not target_model or target_model in ['all', '--all']:
     print(f"{OM_C_BOLD}Scanning active VRAM models to unload...{OM_C_RESET}")
     for label, url in hosts:
         try:
-            req = urllib.request.Request(url + '/api/ps', headers={'User-Agent': 'ollama_mgr'})
+            req = urllib.request.Request(url + '/api/ps', headers={'User-Agent': 'kimo'})
             with urllib.request.urlopen(req, timeout=3) as r:
                 models = json.loads(r.read().decode('utf-8')).get('models', [])
                 for m in models:
@@ -1237,7 +1238,7 @@ if not target_model or target_model in ['all', '--all']:
 else:
     for label, url in hosts:
         try:
-            req = urllib.request.Request(url + '/api/tags', headers={'User-Agent': 'ollama_mgr'})
+            req = urllib.request.Request(url + '/api/tags', headers={'User-Agent': 'kimo'})
             with urllib.request.urlopen(req, timeout=3) as r:
                 tags = json.loads(r.read().decode('utf-8')).get('models', [])
                 matched = [m['name'] for m in tags if m['name'] == target_model or m['name'].startswith(target_model + ':')]
@@ -1364,7 +1365,7 @@ show_data = None
 
 for label, url in hosts:
     try:
-        req = urllib.request.Request(url + '/api/tags', headers={'User-Agent': 'ollama_mgr'})
+        req = urllib.request.Request(url + '/api/tags', headers={'User-Agent': 'kimo'})
         with urllib.request.urlopen(req, timeout=3) as r:
             tags = json.loads(r.read().decode('utf-8')).get('models', [])
             names = [m['name'] for m in tags]
@@ -1382,7 +1383,7 @@ for label, url in hosts:
                 show_req = urllib.request.Request(
                     url + '/api/show',
                     data=json.dumps({'name': cand}).encode('utf-8'),
-                    headers={'Content-Type': 'application/json', 'User-Agent': 'ollama_mgr'}
+                    headers={'Content-Type': 'application/json', 'User-Agent': 'kimo'}
                 )
                 with urllib.request.urlopen(show_req, timeout=5) as sr:
                     show_data = json.loads(sr.read().decode('utf-8'))
@@ -1497,7 +1498,7 @@ else:
 active_models = set()
 for label, url in hosts:
     try:
-        req = urllib.request.Request(url + '/api/ps', headers={'User-Agent': 'ollama_mgr'})
+        req = urllib.request.Request(url + '/api/ps', headers={'User-Agent': 'kimo'})
         with urllib.request.urlopen(req, timeout=2) as r:
             ps_data = json.loads(r.read().decode('utf-8')).get('models', [])
             for pm in ps_data:
@@ -1510,7 +1511,7 @@ seen_keys = set()
 
 for label, url in hosts:
     try:
-        req = urllib.request.Request(url + '/api/tags', headers={'User-Agent': 'ollama_mgr'})
+        req = urllib.request.Request(url + '/api/tags', headers={'User-Agent': 'kimo'})
         with urllib.request.urlopen(req, timeout=3) as r:
             tags_data = json.loads(r.read().decode('utf-8')).get('models', [])
             for m in tags_data:
@@ -1614,7 +1615,7 @@ as_json = OM_OPT_JSON.lower() == "true"
 
 def fetch(url, path, timeout=3):
     try:
-        req = urllib.request.Request(url + path, headers={'User-Agent': 'ollama_mgr'})
+        req = urllib.request.Request(url + path, headers={'User-Agent': 'kimo'})
         with urllib.request.urlopen(req, timeout=timeout) as r:
             return json.loads(r.read().decode('utf-8'))
     except Exception:
@@ -2231,7 +2232,7 @@ GEMINI_SHIM_PATHS=(
 )
 # One claim file per launcher, so a second concurrent `launch agy` does not
 # have its settings reverted by the first one exiting.
-AGY_CLAIM_DIR="${AGY_CLAIM_DIR:-${TMPDIR:-/tmp}/ollama-mgr-agy}"
+AGY_CLAIM_DIR="${KIMO_AGY_CLAIM_DIR:-${AGY_CLAIM_DIR:-${TMPDIR:-/tmp}/kimo-agy}}"
 AGY_SHIM_PID=""
 AGY_SHIM_PORT=""
 AGY_SHIM_OUT=""
@@ -2435,7 +2436,7 @@ agy_start_shim() {
 GROK_CONFIG="${GROK_CONFIG:-${HOME:-/root}/.grok/config.toml}"
 # One claim file per launcher, so a second concurrent 'launch grok' does not
 # have its override reverted by the first one exiting.
-GROK_CLAIM_DIR="${GROK_CLAIM_DIR:-${TMPDIR:-/tmp}/ollama-mgr-grok}"
+GROK_CLAIM_DIR="${KIMO_GROK_CLAIM_DIR:-${GROK_CLAIM_DIR:-${TMPDIR:-/tmp}/kimo-grok}}"
 GROK_CLAIM_FILE=""
 GROK_CTX_MODEL=""
 GROK_CTX_TABLE_PREV=false
@@ -2628,7 +2629,7 @@ grok_cleanup() {
 KIMI_CONFIG="${KIMI_CONFIG:-${KIMI_CODE_HOME:-${HOME:-/root}/.kimi-code}/config.toml}"
 # Serializes concurrent 'launch kimi' upserts so two read-modify-write cycles
 # cannot drop each other's entries.
-KIMI_CONFIG_LOCK="${KIMI_CONFIG_LOCK:-${TMPDIR:-/tmp}/ollama-mgr-kimi-config.lock}"
+KIMI_CONFIG_LOCK="${KIMO_KIMI_CONFIG_LOCK:-${KIMI_CONFIG_LOCK:-${TMPDIR:-/tmp}/kimo-kimi-config.lock}}"
 
 # Upserts providers[pid] and models[alias] through tomlkit so the user's
 # formatting, comments and key order survive (same contract as
@@ -2970,14 +2971,14 @@ cmd_launch() {
                 if [[ -n "${kimi_show}" ]]; then
                     kimi_caps=$(echo "${kimi_show}" | jq -r '[(.capabilities // [])[] | if . == "thinking" then "thinking" elif . == "tools" then "tool_use" elif . == "vision" then "image_in" else empty end] | join(",")' 2>/dev/null) || kimi_caps=""
                 fi
-                kimi_caps="${OM_KIMI_CAPABILITIES:-${kimi_caps:-tool_use}}"
+                kimi_caps="${KIMO_KIMI_CAPABILITIES:-${OM_KIMI_CAPABILITIES:-${kimi_caps:-tool_use}}}"
                 local kimi_efforts="" kimi_off="" kimi_rkey="" kimi_deff=""
                 if [[ ",${kimi_caps}," == *",thinking,"* ]]; then
                     # kalidroid's template maps high/max -> xhigh and raises on
                     # anything outside low/medium/xhigh, so all five kimi efforts
-                    # are safe there; override via OM_KIMI_EFFORTS for models
+                    # are safe there; override via KIMO_KIMI_EFFORTS / OM_KIMI_EFFORTS for models
                     # whose templates are pickier.
-                    kimi_efforts="${OM_KIMI_EFFORTS:-low,medium,high,xhigh,max}"
+                    kimi_efforts="${KIMO_KIMI_EFFORTS:-${OM_KIMI_EFFORTS:-low,medium,high,xhigh,max}}"
                     # Verified against Ollama 0.40 /v1: reasoning_effort=none is
                     # intercepted before the chat template and genuinely
                     # disables reasoning - so /effort 'off' is real, not silent.
@@ -2985,8 +2986,8 @@ cmd_launch() {
                     # Ollama's OpenAI layer returns reasoning under 'reasoning',
                     # not the 'reasoning_content' kimi auto-detects - without
                     # this override thinking output is silently dropped.
-                    kimi_rkey="${OM_KIMI_REASONING_KEY:-reasoning}"
-                    kimi_deff="${OM_KIMI_EFFORT:-high}"
+                    kimi_rkey="${KIMO_KIMI_REASONING_KEY:-${OM_KIMI_REASONING_KEY:-reasoning}}"
+                    kimi_deff="${KIMO_KIMI_EFFORT:-${OM_KIMI_EFFORT:-high}}"
                 fi
                 export KIMI_DISABLE_TELEMETRY="${KIMI_DISABLE_TELEMETRY:-1}"
                 export KIMI_CODE_NO_AUTO_UPDATE="${KIMI_CODE_NO_AUTO_UPDATE:-1}"
@@ -3025,8 +3026,8 @@ cmd_launch() {
                     # in-session /effort picker only offers on/off - and both
                     # encode as *silent* (no reasoning_effort field). A concrete
                     # effort must ride in env instead; it is sent verbatim:
-                    #   OM_KIMI_EFFORT=xhigh ollama-mgr --remote launch kimi ...
-                    export KIMI_MODEL_THINKING_EFFORT="${OM_KIMI_EFFORT:-high}"
+                    #   KIMO_KIMI_EFFORT=xhigh kimo --remote launch kimi ...
+                    export KIMI_MODEL_THINKING_EFFORT="${KIMO_KIMI_EFFORT:-${OM_KIMI_EFFORT:-high}}"
                 else
                     # A stale inherited effort on a non-thinking model makes kimi
                     # fail the request outright ("does not support thinking").
