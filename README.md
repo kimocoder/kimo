@@ -2,7 +2,7 @@
 
 **Unified Local & Remote Model Management & External CLI Hub**
 
-`kimo` is an advanced command-line tool designed for managing Ollama instances across local and remote environments, inspecting GPU VRAM residency, tuning execution parameters, and routing external LLM agent CLIs (`claude`, `codex`, `qwen`, `grok`, `kimi`, `agy`, `hermes`, `openclaw`) directly into your self-hosted models.
+`kimo` is an advanced command-line tool designed for managing Ollama instances across local and remote environments, inspecting GPU VRAM residency, tuning execution parameters, and routing external LLM agent CLIs (`claude`, `codex`, `qwen`, `grok`, `kimi`, `cursor`, `agy`, `hermes`, `openclaw`) directly into your self-hosted models.
 
 ---
 
@@ -22,6 +22,7 @@
   - **Qwen Code CLI** (`qwen`)
   - **Grok Build CLI** (`grok`)
   - **Kimi Code CLI** (`kimi`)
+  - **Cursor CLI** (`cursor` / Cursor Agent)
   - **Google Antigravity CLI** (`agy`)
   - **Cyberstrike AI Pentesting CLI** (`cyberstrike`)
   - **Hermes / OpenClaw**
@@ -128,7 +129,7 @@ Checks performed:
 2. **Configuration & Storage**: `~/.config/kimo/config`, `/var/lib/ollama/tunings.json`, and `/tmp` permissions.
 3. **Local Daemon**: Reachability, version, API latency, installed catalog count, and active VRAM residency.
 4. **Remote GPU & SSH Tunnel**: `ollama-remote-tunnel.service` state, tunnel endpoint latency, remote model catalog, and remote VRAM state.
-5. **CLI Ecosystem**: Installation status, versions, and paths for all 9 supported CLIs.
+5. **CLI Ecosystem**: Installation status, versions, and paths for all supported CLIs (claude, codex, qwen, grok, kimi, cursor, opencode, cyberstrike, agy, openclaw, hermes).
 
 ---
 
@@ -190,6 +191,7 @@ kimo install claude     # Installs Claude Code CLI (claude.ai)
 kimo install grok       # Installs Grok Build CLI (x.ai)
 kimo install codex      # Installs Codex CLI (npm)
 kimo install qwen       # Installs Qwen Code CLI (npm)
+kimo install cursor     # Installs Cursor CLI / Cursor Agent (cursor.com)
 kimo install opencode   # Installs OpenCode CLI
 kimo install cyberstrike # Installs Cyberstrike AI Pentesting CLI (cyberstrike.io)
 kimo install openclaw   # Installs OpenClaw CLI
@@ -356,6 +358,9 @@ kimo launch agy --model kalidroid-27b:latest
 
 # Launch Cyberstrike AI pentesting agent routed to Ollama models
 kimo launch cyberstrike --model kalidroid-27b:latest
+
+# Launch Cursor CLI routed to Ollama models
+kimo launch cursor --model kalidroid-27b:latest
 ```
 
 ### Environment Overrides

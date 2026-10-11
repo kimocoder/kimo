@@ -90,6 +90,7 @@ declare -A DEFAULT_MODELS=(
     ["grok"]="kalidroid-27b:latest"
     ["kimi"]="kalidroid-27b:latest"
     ["cyberstrike"]="kalidroid-27b:latest"
+    ["cursor"]="kalidroid-27b:latest"
 )
 
 # Map of external CLI binary names
@@ -104,15 +105,17 @@ declare -A EXTERNAL_CLI_MAP=(
     ["grok"]="grok"
     ["kimi"]="kimi"
     ["cyberstrike"]="cyberstrike"
+    ["cursor"]="cursor"
 )
 
-# grok, kimi, opencode, cyberstrike, etc. install into user directories that reach PATH only
+# grok, kimi, opencode, cyberstrike, cursor, etc. install into user directories that reach PATH only
 # through ~/.bashrc, which a non-interactive caller (cron, systemd, Apache, sh -c)
 # never sources. Ensure all CLI binary directories are present in PATH.
 GROK_BIN_DIR="${GROK_BIN_DIR:-${HOME:-/root}/.grok/bin}"
 KIMI_BIN_DIR="${KIMI_BIN_DIR:-${HOME:-/root}/.kimi-code/bin}"
 CYBERSTRIKE_BIN_DIR="${CYBERSTRIKE_BIN_DIR:-${HOME:-/root}/.cyberstrike/bin}"
-for _dir in "${GROK_BIN_DIR}" "${KIMI_BIN_DIR}" "${CYBERSTRIKE_BIN_DIR}" "${HOME:-/root}/.local/share/cyberstrike/bin" "${HOME:-/root}/.local/bin" "${HOME:-/root}/.opencode/bin" "${HOME:-/root}/.cargo/bin" "${HOME:-/root}/.npm-global/bin" "/usr/local/bin"; do
+CURSOR_BIN_DIR="${CURSOR_BIN_DIR:-${HOME:-/root}/.local/bin}"
+for _dir in "${GROK_BIN_DIR}" "${KIMI_BIN_DIR}" "${CYBERSTRIKE_BIN_DIR}" "${CURSOR_BIN_DIR}" "${HOME:-/root}/.local/share/cyberstrike/bin" "${HOME:-/root}/.local/bin" "${HOME:-/root}/.opencode/bin" "${HOME:-/root}/.cargo/bin" "${HOME:-/root}/.npm-global/bin" "/usr/local/bin"; do
     if [[ -d "${_dir}" && ":${PATH}:" != *":${_dir}:"* ]]; then
         PATH="${_dir}:${PATH}"
     fi
@@ -207,6 +210,7 @@ ${C_YELLOW}Supported CLIs (${0##*/} launch):${C_RESET}
   ${C_BOLD}qwen${C_RESET}        Qwen Code CLI routed to local/remote Ollama backend
   ${C_BOLD}opencode${C_RESET}    OpenCode AI assistant routed to Ollama models
   ${C_BOLD}cyberstrike${C_RESET} Cyberstrike AI pentesting agent (cyberstrike.io); configures ollama provider
+  ${C_BOLD}cursor${C_RESET}      Cursor CLI (Cursor Agent); routes to local/remote Ollama models
 
 ${C_YELLOW}Examples:${C_RESET}
   ${C_DIM}# Model & VRAM Control:${C_RESET}
@@ -223,8 +227,10 @@ ${C_YELLOW}Examples:${C_RESET}
   ${0##*/} launch grok --model kalidroid-27b:latest   # Launch Grok TUI with local model
   ${0##*/} --remote launch claude --model nemotron3   # Route Claude Code to remote GPU server
   ${0##*/} launch cyberstrike --model kalidroid-27b   # Launch Cyberstrike with Ollama routing
+  ${0##*/} launch cursor --model kalidroid-27b        # Launch Cursor Agent with Ollama routing
   ${0##*/} launch agy --model kalidroid-27b:latest    # Launch Google Antigravity via wire shim
   ${0##*/} install cyberstrike                        # Install Cyberstrike CLI (cyberstrike.io)
+  ${0##*/} install cursor                             # Install Cursor Agent CLI (cursor.com)
   ${0##*/} install kimi                               # Install Kimi Code CLI
   ${0##*/} update                                     # Check updates across all present CLIs
   ${0##*/} update --apply                             # Upgrade all present CLIs to latest
@@ -3471,6 +3477,7 @@ ${C_YELLOW}Supported CLIs:${C_RESET}
   ${C_CYAN}openclaw${C_RESET}      OpenClaw CLI
   ${C_CYAN}hermes${C_RESET}        Hermes Agent CLI
   ${C_CYAN}cyberstrike${C_RESET}   Cyberstrike AI Penetration Testing Agent (cyberstrike.io)
+  ${C_CYAN}cursor${C_RESET}        Cursor Agent CLI (cursor.com)
 
 ${C_YELLOW}CLI Integration Mechanics:${C_RESET}
   ${C_BOLD}agy${C_RESET}          Google Antigravity CLI speaks only the Gemini wire protocol. A per-session
@@ -3489,6 +3496,9 @@ ${C_YELLOW}CLI Integration Mechanics:${C_RESET}
   ${C_BOLD}cyberstrike${C_RESET}  Cyberstrike AI-Powered Penetration Testing Agent. Automatically registers
                  and routes the Ollama endpoint via 'cyberstrike provider' and CYBERSTRIKE_CONFIG_CONTENT,
                  addressing targets via the 'ollama/<model>' format.
+  ${C_BOLD}cursor${C_RESET}       Cursor Agent CLI (cursor.com); routes inference and completions to the target
+                 Ollama host via CURSOR_API_ENDPOINT, CURSOR_LOCAL_AGENT_BASE_URL,
+                 and OPENAI_BASE_URL with model override (--model <model>).
 
 ${C_YELLOW}Environment Overrides:${C_RESET}
   KIMO_KIMI_CONTEXT         Override Kimi model max context size in tokens (or 'kimo config set kimi_context <N>')
@@ -3506,6 +3516,7 @@ ${C_YELLOW}Examples:${C_RESET}
   ${0##*/} --remote launch kimi --model kalidroid-27b:latest --ctx 262144
   ${0##*/} --remote launch claude --model nemotron3:33b
   ${0##*/} launch cyberstrike --model kalidroid-27b:latest
+  ${0##*/} launch cursor --model kalidroid-27b:latest
   ${0##*/} launch agy --model kalidroid-27b:latest
 EOF
 }
@@ -3881,6 +3892,26 @@ cmd_launch() {
                 [[ "${cs_model}" != *"/"* ]] && cs_model="ollama/${cs_model}"
                 exec "${cli_cmd}" --model "${cs_model}" "${cli_passthrough_args[@]}"
                 ;;
+            cursor)
+                # Cursor CLI (Cursor Agent - cursor.com)
+                local cursor_bin="${cli_cmd}"
+                if ! command -v "${cursor_bin}" >/dev/null 2>&1; then
+                    if command -v "cursor-agent" >/dev/null 2>&1; then
+                        cursor_bin="cursor-agent"
+                    elif command -v "agent" >/dev/null 2>&1; then
+                        cursor_bin="agent"
+                    fi
+                fi
+                export CURSOR_API_ENDPOINT="${CURSOR_API_ENDPOINT:-${active_host}/v1}"
+                export CURSOR_API_BASE_URL="${CURSOR_API_BASE_URL:-${active_host}/v1}"
+                [[ -n "${CURSOR_API_KEY:-}" ]] && export CURSOR_API_KEY="${CURSOR_API_KEY}"
+                export CURSOR_LOCAL_AGENT_BASE_URL="${active_host}/v1"
+                export CURSOR_MODEL="${resolved_model}"
+                export OPENAI_BASE_URL="${active_host}/v1"
+                export OPENAI_API_BASE="${active_host}/v1"
+                export OPENAI_API_KEY="${OPENAI_API_KEY:-ollama}"
+                exec "${cursor_bin}" --model "${resolved_model}" "${cli_passthrough_args[@]}"
+                ;;
             *)
                 exec "${cli_cmd}" --model "${resolved_model}" "${cli_passthrough_args[@]}"
                 ;;
@@ -3903,11 +3934,23 @@ _get_cli_version() {
     local cmd="$1"
     local raw ver=""
     if ! command -v "${cmd}" >/dev/null 2>&1; then
-        echo "-"
-        return
+        if [[ "${cmd}" == "cursor" ]]; then
+            if command -v "cursor-agent" >/dev/null 2>&1; then
+                cmd="cursor-agent"
+            elif command -v "agent" >/dev/null 2>&1; then
+                cmd="agent"
+            else
+                echo "-"
+                return
+            fi
+        else
+            echo "-"
+            return
+        fi
     fi
     raw=$("${cmd}" --version 2>&1 | head -n 1) || raw=""
-    ver=$(echo "${raw}" | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' | head -n 1) || ver=""
+    [[ -z "${raw}" ]] && raw=$("${cmd}" -v 2>&1 | head -n 1) || true
+    ver=$(echo "${raw}" | grep -oE '[0-9]{4}\.[0-9]{2}\.[0-9]{2}(-[a-f0-9]+)?|[0-9]+\.[0-9]+(\.[0-9]+)?' | head -n 1) || ver=""
     if [[ -n "${ver}" ]]; then
         echo "${ver}"
     elif [[ -n "${raw}" ]]; then
@@ -3922,7 +3965,7 @@ _install_list_status() {
     local fmt="  %-12s %-20s %-14s %-32s %s"
     printf "${C_CYAN}${fmt}${C_RESET}\n" "CLI" "STATUS" "VERSION" "BINARY PATH" "DEFAULT MODEL"
     echo "  ------------------------------------------------------------------------------------------------------"
-    local clis=("claude" "codex" "qwen" "grok" "kimi" "opencode" "cyberstrike" "agy" "openclaw" "hermes")
+    local clis=("claude" "codex" "qwen" "grok" "kimi" "cursor" "opencode" "cyberstrike" "agy" "openclaw" "hermes")
     for c in "${clis[@]}"; do
         local bin="${EXTERNAL_CLI_MAP[$c]:-$c}"
         local dmodel="${DEFAULT_MODELS[$c]:-n/a}"
@@ -3954,6 +3997,7 @@ _install_single_cli() {
         grok-cli) cli="grok" ;;
         qwen-code) cli="qwen" ;;
         antigravity) cli="agy" ;;
+        cursor-agent|agent) cli="cursor" ;;
     esac
 
     case "${cli}" in
@@ -4250,9 +4294,62 @@ _install_single_cli() {
                 return 1
             fi
             ;;
+        cursor)
+            local cur_bin
+            cur_bin=$(command -v cursor 2>/dev/null || command -v cursor-agent 2>/dev/null || command -v agent 2>/dev/null || true)
+            if [[ -n "${cur_bin}" && "${force}" != "true" && "${update}" != "true" ]]; then
+                local ver
+                ver=$(_get_cli_version cursor)
+                echo "${C_GREEN}[✓] Cursor CLI is already installed (${ver}) at ${cur_bin}.${C_RESET}"
+                echo "${C_DIM}    Run '${0##*/} install cursor --update' to update to latest version.${C_RESET}"
+                return 0
+            fi
+            echo "${C_CYAN}[*] Installing Cursor CLI (Cursor Agent via cursor.com)...${C_RESET}"
+            if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
+                echo "${C_RED}Error: curl or wget is required to install Cursor CLI.${C_RESET}" >&2
+                return 1
+            fi
+            local installed=false
+            if command -v curl >/dev/null 2>&1; then
+                curl -fsSL https://cursor.com/install | bash && installed=true
+            elif command -v wget >/dev/null 2>&1; then
+                wget -qO- https://cursor.com/install | bash && installed=true
+            fi
+            local lbin="${HOME:-/root}/.local/bin"
+            local cursor_inst_dir="${HOME:-/root}/.local/share/cursor-agent"
+            mkdir -p "${lbin}"
+            local found_agent=""
+            if [[ -d "${cursor_inst_dir}/versions" ]]; then
+                found_agent=$(find "${cursor_inst_dir}/versions" -type f -name "cursor-agent" -perm -111 2>/dev/null | sort -V | tail -n 1 || true)
+            fi
+            if [[ -z "${found_agent}" ]]; then
+                found_agent=$(command -v cursor-agent 2>/dev/null || command -v agent 2>/dev/null || true)
+            fi
+            if [[ -n "${found_agent}" ]]; then
+                ln -sf "${found_agent}" "${lbin}/cursor" 2>/dev/null || true
+                ln -sf "${found_agent}" "${lbin}/cursor-agent" 2>/dev/null || true
+                ln -sf "${found_agent}" "${lbin}/agent" 2>/dev/null || true
+                if [[ -w "/usr/local/bin" ]]; then
+                    ln -sf "${found_agent}" "/usr/local/bin/cursor" 2>/dev/null || true
+                    ln -sf "${found_agent}" "/usr/local/bin/cursor-agent" 2>/dev/null || true
+                fi
+            fi
+            for _c_dir in "${lbin}" "/usr/local/bin"; do
+                [[ -d "${_c_dir}" && ":${PATH}:" != *":${_c_dir}:"* ]] && export PATH="${_c_dir}:${PATH}"
+            done
+            if command -v cursor >/dev/null 2>&1 || command -v cursor-agent >/dev/null 2>&1 || command -v agent >/dev/null 2>&1; then
+                local new_ver
+                new_ver=$(_get_cli_version cursor)
+                echo "${C_GREEN}[✓] Successfully installed Cursor CLI (${new_ver})!${C_RESET}"
+                echo "${C_CYAN}[*] Launch anytime with: ${0##*/} launch cursor${C_RESET}"
+            else
+                echo "${C_RED}[!] Cursor CLI installation failed or binary not found in PATH.${C_RESET}" >&2
+                return 1
+            fi
+            ;;
         *)
             echo "${C_RED}Error: Unknown CLI '${cli}'.${C_RESET}" >&2
-            echo "Supported CLIs: kimi, claude, grok, codex, qwen, opencode, cyberstrike, openclaw, hermes, agy, all" >&2
+            echo "Supported CLIs: kimi, claude, grok, codex, qwen, cursor, opencode, cyberstrike, openclaw, hermes, agy, all" >&2
             return 1
             ;;
     esac
@@ -4266,7 +4363,7 @@ ${C_YELLOW}Usage:${C_RESET}
   ${0##*/} install [cli|all|list] [options]
 
 ${C_YELLOW}Arguments:${C_RESET}
-  ${C_CYAN}<cli>${C_RESET}        Name of CLI to install (kimi, claude, grok, codex, qwen, opencode, cyberstrike, openclaw, hermes)
+  ${C_CYAN}<cli>${C_RESET}        Name of CLI to install (kimi, claude, grok, codex, qwen, cursor, opencode, cyberstrike, openclaw, hermes)
   ${C_CYAN}all${C_RESET}          Install or update all supported CLIs in batch
   ${C_CYAN}list${C_RESET}         Display status and version table of all supported CLIs (default without args)
 
@@ -4314,7 +4411,7 @@ cmd_install() {
     if [[ "${target}" == "all" ]]; then
         echo "${C_BOLD}Installing / Updating All External LLM CLIs...${C_RESET}"
         echo "====================================================================="
-        local clis=("kimi" "claude" "grok" "codex" "qwen" "opencode" "cyberstrike" "openclaw" "hermes")
+        local clis=("kimi" "claude" "grok" "codex" "qwen" "cursor" "opencode" "cyberstrike" "openclaw" "hermes")
         local failed=()
         for c in "${clis[@]}"; do
             echo ""
@@ -4372,6 +4469,9 @@ _get_cli_latest_version() {
         cyberstrike)
             latest=$(curl -fsSL --connect-timeout 2 -m 4 https://api.github.com/repos/CyberStrikeus/CyberStrike/releases/latest 2>/dev/null | grep -oE '"tag_name": *"v[0-9.]+"' | grep -oE '[0-9.]+' | head -n 1 || true)
             ;;
+        cursor)
+            latest=$(curl -fsSL --connect-timeout 2 -m 4 https://cursor.com/install 2>/dev/null | grep -oE '[0-9]{4}\.[0-9]{2}\.[0-9]{2}(-[a-f0-9]+)?' | head -n 1 || true)
+            ;;
     esac
     echo "${latest:-}"
 }
@@ -4382,7 +4482,7 @@ _check_updates_for_present_clis() {
     printf "${C_CYAN}${fmt}${C_RESET}\n" "CLI" "CURRENT" "LATEST" "STATUS"
     echo "  --------------------------------------------------------------------------------------"
 
-    local clis=("claude" "codex" "qwen" "grok" "kimi" "opencode" "cyberstrike" "agy" "openclaw" "hermes")
+    local clis=("claude" "codex" "qwen" "grok" "kimi" "cursor" "opencode" "cyberstrike" "agy" "openclaw" "hermes")
     local present_count=0
     local updates_available=()
 
@@ -4430,7 +4530,7 @@ _check_updates_for_present_clis() {
 _update_all_present() {
     echo "${C_BOLD}Updating All Present External CLIs...${C_RESET}"
     echo "====================================================================="
-    local clis=("claude" "codex" "qwen" "grok" "kimi" "opencode" "cyberstrike" "agy" "openclaw" "hermes")
+    local clis=("claude" "codex" "qwen" "grok" "kimi" "cursor" "opencode" "cyberstrike" "agy" "openclaw" "hermes")
     local updated_count=0
     local failed=()
 
@@ -4933,7 +5033,7 @@ cmd_doctor() {
     echo ""
     # 5. External LLM CLI Hub Inventory
     echo "${C_YELLOW}[5/5] External LLM CLI Hub Inventory:${C_RESET}"
-    local clis=("claude" "codex" "qwen" "grok" "kimi" "opencode" "cyberstrike" "agy" "openclaw" "hermes")
+    local clis=("claude" "codex" "qwen" "grok" "kimi" "cursor" "opencode" "cyberstrike" "agy" "openclaw" "hermes")
     for c in "${clis[@]}"; do
         local bin="${EXTERNAL_CLI_MAP[$c]:-$c}"
         if command -v "${bin}" >/dev/null 2>&1; then
@@ -5002,7 +5102,7 @@ _kimo() {
 
     local commands="list ls search find ps top warm preload stop unload tune set-ctx param bench eval benchmark info show tag alias rm delete pull download sync run launch install setup update upgrade doctor diagnose diag config cfg completion version status health hosts check ping stream logs rotate-token help"
     local global_opts="--remote --local --host --json --no-color -v --version -h --help"
-    local supported_clis="claude grok kimi agy codex qwen opencode cyberstrike openclaw hermes"
+    local supported_clis="claude grok kimi agy codex qwen cursor opencode cyberstrike openclaw hermes"
     local config_subcmds="get set unset list file help"
     local config_keys="default_host default_model remote_url local_url kimi_effort kimi_context no_color"
     local log_services="tunnel keepalive timer apache all"
@@ -5221,7 +5321,7 @@ _kimo() {
             case $words[1] in
                 launch|install|update)
                     local -a clis
-                    clis=(claude grok kimi agy codex qwen opencode cyberstrike openclaw hermes all)
+                    clis=(claude grok kimi agy codex qwen cursor opencode cyberstrike openclaw hermes all)
                     _describe -t clis 'supported CLIs' clis
                     ;;
                 config)
