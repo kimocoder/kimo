@@ -159,7 +159,9 @@ ${C_YELLOW}Global Options:${C_RESET}
 ${C_YELLOW}Model & VRAM Management:${C_RESET}
   ${C_CYAN}list, ls [filter]${C_RESET}            List installed models (local & remote) with VRAM indicators
   ${C_CYAN}search, find <keyword>${C_RESET}       Search model catalogs across hosts (name, params, capabilities)
-  ${C_CYAN}ps${C_RESET}                           Display models actively resident in GPU/CPU VRAM with memory stats
+  ${C_CYAN}ps [-w|--watch]${C_RESET}              Display models actively resident in GPU/CPU VRAM with memory stats
+  ${C_CYAN}top [-n <sec>]${C_RESET}               Real-time live VRAM residency & model monitor (ps --watch)
+  ${C_CYAN}pull, download <model>${C_RESET}       Pull model from registry with live streaming progress & speed
   ${C_CYAN}warm, preload <model> [dur]${C_RESET}  Pre-warm model into GPU VRAM (keep_alive: 24h) to avoid cold-starts
   ${C_CYAN}stop, unload [model|all]${C_RESET}     Evict models from GPU VRAM immediately (keep_alive: 0)
   ${C_CYAN}tune <model> [opts...]${C_RESET}       Bake runtime parameters (--ctx, --batch, --temp, --gpu) into registry
@@ -182,8 +184,9 @@ ${C_YELLOW}Cluster & Remote Operations:${C_RESET}
   ${C_CYAN}stream <model> [opts]${C_RESET}        Pin remote model for durable availability via keepalive daemon
                                 (modes: --status, --test, --resident-only, --repair-all)
 
-${C_YELLOW}Maintenance, Config & Logging:${C_RESET}
+${C_YELLOW}Maintenance, Config & Completion:${C_RESET}
   ${C_CYAN}config [subcmd] [args...]${C_RESET}    View or update persistent configuration (~/.config/kimo/config)
+  ${C_CYAN}completion [bash|zsh]${C_RESET}        Generate shell tab-completion script for bash or zsh
   ${C_CYAN}logs [service|all]${C_RESET}           Show recent journald output (tunnel, keepalive, timer, apache, all)
   ${C_CYAN}status-report${C_RESET}                Append operational status snapshot to /var/log/ollama-status-report.log
   ${C_CYAN}rotate-token${C_RESET}                 Generate new public API token, rewrite proxy conf & reload Apache
@@ -200,6 +203,8 @@ ${C_YELLOW}Supported CLIs (${0##*/} launch):${C_RESET}
 ${C_YELLOW}Examples:${C_RESET}
   ${C_DIM}# Model & VRAM Control:${C_RESET}
   ${0##*/} ps                                         # Show active GPU models and memory
+  ${0##*/} top                                        # Live real-time VRAM residency monitor
+  ${0##*/} pull qwen2.5:32b                           # Pull model with streaming progress & speed
   ${0##*/} warm kalidroid-27b:latest                  # Pre-warm model into VRAM (24h keepalive)
   ${0##*/} stop all                                   # Evict all models to reclaim GPU memory
   ${0##*/} tune kalidroid-27b:latest --ctx 32768      # Bake 32k context default into registry
@@ -212,10 +217,11 @@ ${C_YELLOW}Examples:${C_RESET}
   ${0##*/} update                                     # Check updates across all present CLIs
   ${0##*/} update --apply                             # Upgrade all present CLIs to latest
 
-  ${C_DIM}# Diagnostics & Configuration:${C_RESET}
+  ${C_DIM}# Diagnostics, Config & Completions:${C_RESET}
   ${0##*/} doctor                                     # Run system, cluster & CLI health check
   ${0##*/} config                                     # View current configuration and sources
   ${0##*/} config set default_host remote             # Default all commands to remote GPU server
+  ${0##*/} completion bash > /etc/bash_completion.d/kimo # Enable tab-completion for bash
 
   ${C_DIM}# Cluster & Multi-Host Management:${C_RESET}
   ${0##*/} check                                      # Health & latency probe for all endpoints
@@ -882,7 +888,7 @@ PYEOF
 # -----------------------------------------------------------------------------
 # Command: ps / status
 # -----------------------------------------------------------------------------
-cmd_ps() {
+_ps_snapshot() {
     OM_REMOTE_HOST_URL="${REMOTE_HOST_URL}" OM_LOCAL_HOST_URL="${LOCAL_HOST_URL}" OM_TARGET_HOST="${TARGET_HOST}" OM_HOST_MODE="${HOST_MODE}" OM_OPT_JSON="${OPT_JSON}" OM_MULTI_HOSTS="${MULTI_HOSTS}" OM_REMOTE_HOST_IP="${REMOTE_HOST_IP}" OM_C_RESET="${C_RESET}" OM_C_BOLD="${C_BOLD}" OM_C_GREEN="${C_GREEN}" OM_C_YELLOW="${C_YELLOW}" OM_C_CYAN="${C_CYAN}" OM_C_DIM="${C_DIM}" \
         python3 - <<'PYEOF'
 import os as _om_os
@@ -993,6 +999,52 @@ for m in all_ps:
     print(printf_fmt.format(m['host_label'], name, short_id, vram_desc, ctx, status_desc))
 print()
 PYEOF
+}
+
+cmd_ps() {
+    local opt_watch=false
+    local opt_interval=2
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -w|--watch) opt_watch=true; shift ;;
+            -n|--interval) opt_interval="${2:-2}"; shift 2 ;;
+            -h|--help)
+                echo "${C_BOLD}kimo ps${C_RESET} – Display active models resident in GPU/CPU VRAM"
+                echo ""
+                echo "${C_YELLOW}Usage:${C_RESET}"
+                echo "  ${0##*/} ps [options]"
+                echo ""
+                echo "${C_YELLOW}Options:${C_RESET}"
+                echo "  -w, --watch         Watch resident models in real time (refresh loop)"
+                echo "  -n, --interval <N>  Refresh interval in seconds (default: 2)"
+                echo "  --json              Output responses in structured JSON format"
+                echo "  -h, --help          Show this help message"
+                return 0
+                ;;
+            *) shift ;;
+        esac
+    done
+
+    if ${opt_watch}; then
+        trap 'tput cnorm 2>/dev/null; exit 0' INT TERM
+        tput civis 2>/dev/null || true
+        while true; do
+            printf '\033[H\033[2J'
+            echo "${C_BOLD}kimo top – Real-Time VRAM & Model Residency Monitor${C_RESET} ($(date '+%T'))"
+            echo "Press Ctrl+C to exit. Refresh interval: ${opt_interval}s."
+            echo "----------------------------------------------------------------------------------"
+            _ps_snapshot
+            sleep "${opt_interval}"
+        done
+        return 0
+    fi
+
+    _ps_snapshot
+}
+
+cmd_top() {
+    cmd_ps --watch "$@"
 }
 
 # -----------------------------------------------------------------------------
@@ -2260,6 +2312,176 @@ cmd_run() {
 
     echo "${C_CYAN}Running model: ${resolved_model} on ${active_host}...${C_RESET}"
     exec ollama run "${resolved_model}" "$@"
+}
+
+# -----------------------------------------------------------------------------
+# Command: pull / download
+# -----------------------------------------------------------------------------
+cmd_pull() {
+    local target_model=""
+    local opt_insecure=false
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --insecure)
+                opt_insecure=true
+                shift
+                ;;
+            -h|--help)
+                echo "${C_BOLD}kimo pull${C_RESET} – Pull a model from Ollama library / registry with live progress"
+                echo ""
+                echo "${C_YELLOW}Usage:${C_RESET}"
+                echo "  ${0##*/} pull <model> [options]"
+                echo ""
+                echo "${C_YELLOW}Options:${C_RESET}"
+                echo "  --insecure          Allow insecure connections to model registry"
+                echo "  --remote            Pull to remote Ollama server"
+                echo "  --local             Pull to local Ollama server"
+                echo "  --host <addr>       Pull to specific Ollama host"
+                echo "  -h, --help          Show this help message"
+                return 0
+                ;;
+            -*)
+                echo "${C_RED}Error: Unknown option '$1' for pull.${C_RESET}" >&2
+                return 1
+                ;;
+            *)
+                if [[ -z "${target_model}" ]]; then
+                    target_model="$1"
+                fi
+                shift
+                ;;
+        esac
+    done
+
+    if [[ -z "${target_model}" ]]; then
+        echo "${C_RED}Error: 'pull' requires a model name.${C_RESET}" >&2
+        echo "Usage: ${0##*/} pull <model>" >&2
+        return 1
+    fi
+
+    local target_host="${TARGET_HOST:-${LOCAL_HOST_URL}}"
+    echo "${C_BOLD}Pulling model '${target_model}' to ${target_host}...${C_RESET}"
+
+    OM_TARGET_HOST="${target_host}" OM_TARGET_MODEL="${target_model}" OM_INSECURE="${opt_insecure}" \
+    OM_C_RESET="${C_RESET}" OM_C_BOLD="${C_BOLD}" OM_C_GREEN="${C_GREEN}" OM_C_YELLOW="${C_YELLOW}" OM_C_CYAN="${C_CYAN}" OM_C_RED="${C_RED}" OM_C_DIM="${C_DIM}" \
+        python3 - <<'PYEOF'
+import os, sys, json, time, urllib.request, urllib.error
+
+target_host = os.environ.get("OM_TARGET_HOST", "http://127.0.0.1:11434")
+model = os.environ.get("OM_TARGET_MODEL", "")
+insecure = os.environ.get("OM_INSECURE", "false").lower() == "true"
+
+C_RESET = os.environ.get("OM_C_RESET", "")
+C_BOLD = os.environ.get("OM_C_BOLD", "")
+C_GREEN = os.environ.get("OM_C_GREEN", "")
+C_YELLOW = os.environ.get("OM_C_YELLOW", "")
+C_CYAN = os.environ.get("OM_C_CYAN", "")
+C_RED = os.environ.get("OM_C_RED", "")
+C_DIM = os.environ.get("OM_C_DIM", "")
+
+def format_bytes(n):
+    if n >= 1024 ** 3:
+        return f"{n / (1024 ** 3):.2f} GB"
+    if n >= 1024 ** 2:
+        return f"{n / (1024 ** 2):.1f} MB"
+    if n >= 1024:
+        return f"{n / 1024:.1f} KB"
+    return f"{n} B"
+
+url = f"{target_host.rstrip('/')}/api/pull"
+payload = json.dumps({"name": model, "insecure": insecure, "stream": True}).encode("utf-8")
+req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"})
+
+try:
+    with urllib.request.urlopen(req, timeout=3600) as resp:
+        prev_completed = 0
+        prev_time = time.time()
+        had_progress = False
+        last_digest = ""
+
+        for raw_line in resp:
+            line = raw_line.decode("utf-8", errors="replace").strip()
+            if not line:
+                continue
+            try:
+                data = json.loads(line)
+            except Exception:
+                continue
+
+            if "error" in data:
+                if had_progress:
+                    sys.stdout.write("\n")
+                sys.stderr.write(f"{C_RED}[!] Error: {data['error']}{C_RESET}\n")
+                sys.exit(1)
+
+            status = data.get("status", "")
+            total = data.get("total", 0)
+            completed = data.get("completed", 0)
+            digest = data.get("digest", "")
+
+            if total > 0:
+                if digest and digest != last_digest:
+                    if last_digest:
+                        sys.stdout.write("\n")
+                    last_digest = digest
+                    prev_completed = completed
+                    prev_time = time.time()
+
+                now = time.time()
+                dt = now - prev_time
+                if dt >= 0.5:
+                    speed = (completed - prev_completed) / dt if dt > 0 else 0
+                    prev_completed = completed
+                    prev_time = now
+                else:
+                    speed = (completed - prev_completed) / max(0.001, dt)
+
+                pct = min(100.0, (completed / total) * 100.0) if total > 0 else 0.0
+                bar_len = 20
+                filled = int(bar_len * (completed / total)) if total > 0 else 0
+                arrow = ">" if (0 < filled < bar_len) else ""
+                spaces = " " * max(0, bar_len - filled - (1 if arrow else 0))
+                bar = f"[{'=' * (filled - (1 if arrow else 0))}{arrow}{spaces}]"
+
+                c_str = format_bytes(completed)
+                t_str = format_bytes(total)
+                sp_str = f"{format_bytes(speed)}/s" if speed > 0 else "-- MB/s"
+                d_short = digest[:12] if digest else ""
+
+                if sys.stdout.isatty():
+                    sys.stdout.write(f"\r\033[2K  {C_CYAN}{d_short}{C_RESET} {bar} {C_BOLD}{pct:5.1f}%{C_RESET}  {c_str}/{t_str}  {C_DIM}{sp_str}{C_RESET}")
+                    sys.stdout.flush()
+                else:
+                    if completed == total:
+                        sys.stdout.write(f"  {d_short} {bar} {pct:5.1f}% ({c_str}/{t_str})\n")
+                        sys.stdout.flush()
+                had_progress = True
+            else:
+                if had_progress:
+                    sys.stdout.write("\n")
+                    had_progress = False
+                    last_digest = ""
+                    prev_completed = 0
+                    prev_time = time.time()
+                if status:
+                    if status == "success":
+                        sys.stdout.write(f"\n{C_GREEN}[✓] Successfully pulled model '{model}' to {target_host}.{C_RESET}\n")
+                    else:
+                        sys.stdout.write(f"  {C_DIM}→{C_RESET} {status}\n")
+                    sys.stdout.flush()
+
+except urllib.error.HTTPError as e:
+    err_body = e.read().decode("utf-8", errors="replace")
+    sys.stderr.write(f"\n{C_RED}[!] HTTP {e.code} Error pulling model: {err_body or e.reason}{C_RESET}\n")
+    sys.exit(1)
+except urllib.error.URLError as e:
+    sys.stderr.write(f"\n{C_RED}[!] Connection error reaching {target_host}: {e.reason}{C_RESET}\n")
+    sys.exit(1)
+except KeyboardInterrupt:
+    sys.stdout.write(f"\n{C_YELLOW}[!] Pull canceled by user.{C_RESET}\n")
+    sys.exit(130)
+PYEOF
 }
 
 # -----------------------------------------------------------------------------
@@ -4189,6 +4411,280 @@ cmd_doctor() {
 }
 
 # -----------------------------------------------------------------------------
+# Command: completion
+# -----------------------------------------------------------------------------
+cmd_completion() {
+    local shell="${1:-}"
+
+    case "${shell}" in
+        bash)
+            cat <<'EOFBASH'
+# bash completion for kimo
+
+_kimo() {
+    local cur prev words cword
+    if declare -F _init_completion >/dev/null 2>&1; then
+        _init_completion || return
+    else
+        cur="${COMP_WORDS[COMP_CWORD]}"
+        prev="${COMP_WORDS[COMP_CWORD-1]}"
+        words=("${COMP_WORDS[@]}")
+        cword=$COMP_CWORD
+    fi
+
+    local commands="list ls search find ps top warm preload stop unload tune set-ctx param bench eval benchmark info show tag alias rm delete pull download run launch install setup update upgrade doctor diagnose diag config cfg completion version status health hosts check ping stream logs rotate-token help"
+    local global_opts="--remote --local --host --json --no-color -v --version -h --help"
+    local supported_clis="claude grok kimi agy codex qwen opencode"
+    local config_subcmds="get set unset list file help"
+    local config_keys="default_host preferred_cli vram_reserve_mb timeout_sec"
+    local log_services="tunnel keepalive timer apache all"
+
+    local cmd=""
+    local cmd_idx=0
+    local i
+    for ((i=1; i < cword; i++)); do
+        local w="${words[i]}"
+        if [[ "${w}" != -* ]]; then
+            if [[ "${words[i-1]}" == "--host" ]]; then
+                continue
+            fi
+            cmd="${w}"
+            cmd_idx=$i
+            break
+        fi
+    done
+
+    _kimo_complete_models() {
+        local models
+        models=$(kimo list 2>/dev/null | awk 'NR>2 && $1 !~ /^(Total|---|Hosts)/ {print $1}')
+        if [[ -z "${models}" ]]; then
+            models=$(curl -s --connect-timeout 1 -m 1 http://127.0.0.1:11434/api/tags 2>/dev/null | jq -r '.models[].name' 2>/dev/null)
+        fi
+        COMPREPLY=( $(compgen -W "${models}" -- "${cur}") )
+    }
+
+    if [[ -z "${cmd}" || ${cword} -eq ${cmd_idx} ]]; then
+        if [[ "${cur}" == -* ]]; then
+            COMPREPLY=( $(compgen -W "${global_opts}" -- "${cur}") )
+        else
+            COMPREPLY=( $(compgen -W "${commands}" -- "${cur}") )
+        fi
+        return 0
+    fi
+
+    case "${cmd}" in
+        launch)
+            if [[ "${prev}" == "--model" ]]; then
+                _kimo_complete_models
+                return 0
+            fi
+            if [[ "${cur}" == -* ]]; then
+                COMPREPLY=( $(compgen -W "--model -h --help" -- "${cur}") )
+            else
+                COMPREPLY=( $(compgen -W "${supported_clis}" -- "${cur}") )
+            fi
+            ;;
+        install|setup)
+            if [[ "${cur}" == -* ]]; then
+                COMPREPLY=( $(compgen -W "--update --force --list -h --help" -- "${cur}") )
+            else
+                COMPREPLY=( $(compgen -W "${supported_clis} all list" -- "${cur}") )
+            fi
+            ;;
+        update|upgrade)
+            if [[ "${cur}" == -* ]]; then
+                COMPREPLY=( $(compgen -W "--apply -h --help" -- "${cur}") )
+            else
+                COMPREPLY=( $(compgen -W "${supported_clis} all" -- "${cur}") )
+            fi
+            ;;
+        run|info|show|warm|preload|bench|eval|benchmark|rm|delete|tag|alias|stream)
+            if [[ "${cur}" == -* ]]; then
+                COMPREPLY=( $(compgen -W "${global_opts}" -- "${cur}") )
+            else
+                _kimo_complete_models
+            fi
+            ;;
+        pull|download)
+            if [[ "${cur}" == -* ]]; then
+                COMPREPLY=( $(compgen -W "--insecure ${global_opts}" -- "${cur}") )
+            fi
+            ;;
+        ps)
+            if [[ "${cur}" == -* ]]; then
+                COMPREPLY=( $(compgen -W "-w --watch -n --interval --json -h --help" -- "${cur}") )
+            fi
+            ;;
+        top)
+            if [[ "${cur}" == -* ]]; then
+                COMPREPLY=( $(compgen -W "-n --interval -h --help" -- "${cur}") )
+            fi
+            ;;
+        stop|unload)
+            if [[ "${cur}" == -* ]]; then
+                COMPREPLY=( $(compgen -W "${global_opts}" -- "${cur}") )
+            else
+                local resident
+                resident=$(kimo ps --json 2>/dev/null | jq -r '.[].name' 2>/dev/null)
+                COMPREPLY=( $(compgen -W "all ${resident}" -- "${cur}") )
+            fi
+            ;;
+        logs|log)
+            COMPREPLY=( $(compgen -W "${log_services}" -- "${cur}") )
+            ;;
+        tune|set-ctx|param)
+            if [[ "${cur}" == -* ]]; then
+                COMPREPLY=( $(compgen -W "--ctx --batch --predict --temp --gpu --target --show --clear --json" -- "${cur}") )
+            else
+                _kimo_complete_models
+            fi
+            ;;
+        config|cfg)
+            local sub="${words[cmd_idx+1]:-}"
+            if [[ ${cword} -eq $((cmd_idx+1)) ]]; then
+                COMPREPLY=( $(compgen -W "${config_subcmds}" -- "${cur}") )
+            elif [[ ${cword} -eq $((cmd_idx+2)) ]]; then
+                case "${sub}" in
+                    get|set|unset)
+                        COMPREPLY=( $(compgen -W "${config_keys}" -- "${cur}") )
+                        ;;
+                esac
+            elif [[ ${cword} -eq $((cmd_idx+3)) ]]; then
+                local k="${words[cmd_idx+2]:-}"
+                if [[ "${sub}" == "set" ]]; then
+                    case "${k}" in
+                        default_host)
+                            COMPREPLY=( $(compgen -W "local remote" -- "${cur}") )
+                            ;;
+                        preferred_cli)
+                            COMPREPLY=( $(compgen -W "${supported_clis}" -- "${cur}") )
+                            ;;
+                    esac
+                fi
+            fi
+            ;;
+        completion)
+            COMPREPLY=( $(compgen -W "bash zsh" -- "${cur}") )
+            ;;
+        doctor|diagnose|diag)
+            if [[ "${cur}" == -* ]]; then
+                COMPREPLY=( $(compgen -W "--json -h --help" -- "${cur}") )
+            fi
+            ;;
+        *)
+            if [[ "${cur}" == -* ]]; then
+                COMPREPLY=( $(compgen -W "${global_opts}" -- "${cur}") )
+            fi
+            ;;
+    esac
+}
+
+complete -F _kimo kimo
+EOFBASH
+            ;;
+        zsh)
+            cat <<'EOFZSH'
+#compdef kimo
+# zsh completion for kimo
+
+_kimo() {
+    local -a commands
+    commands=(
+        'list:List installed models (local & remote)'
+        'search:Search model catalogs across hosts'
+        'ps:Display models resident in VRAM'
+        'top:Real-time VRAM residency monitor'
+        'warm:Pre-warm model into GPU VRAM'
+        'stop:Evict models from GPU VRAM'
+        'tune:Bake runtime parameters into registry'
+        'bench:Benchmark TTFT and throughput'
+        'info:Inspect model metadata'
+        'tag:Create a model tag or alias'
+        'rm:Delete a model'
+        'pull:Pull a model with live progress'
+        'run:Run an Ollama model directly'
+        'launch:Launch external agent CLI'
+        'install:Install external LLM CLIs'
+        'update:Check/apply updates for external CLIs'
+        'doctor:Run system and ecosystem diagnostics'
+        'config:Manage persistent configuration'
+        'hosts:Inventory reachable cluster nodes'
+        'check:Health and latency check'
+        'status:Operational snapshot'
+        'stream:Pin remote model availability'
+        'logs:Show recent journald output'
+        'rotate-token:Generate new public API token'
+        'completion:Generate shell autocompletions'
+        'version:Show version information'
+        'help:Show help message'
+    )
+
+    _arguments -C \
+        '--remote[Route to remote server]' \
+        '--local[Route to local daemon]' \
+        '--host[Specify custom Ollama host]:host:' \
+        '--json[Output in JSON format]' \
+        '--no-color[Disable colored output]' \
+        '(-v --version)'{-v,--version}'[Show version]' \
+        '(-h --help)'{-h,--help}'[Show help]' \
+        '1: :->command' \
+        '*:: :->args' && return 0
+
+    case $state in
+        command)
+            _describe -t commands 'kimo commands' commands
+            ;;
+        args)
+            case $words[1] in
+                launch|install|update)
+                    local -a clis
+                    clis=(claude grok kimi agy codex qwen opencode all)
+                    _describe -t clis 'supported CLIs' clis
+                    ;;
+                config)
+                    local -a cfg_cmds
+                    cfg_cmds=(get set unset list file help)
+                    _describe -t cfg_cmds 'config subcommands' cfg_cmds
+                    ;;
+                completion)
+                    local -a shells
+                    shells=(bash zsh)
+                    _describe -t shells 'shell' shells
+                    ;;
+                *)
+                    local -a models
+                    models=(${(f)"$(kimo list 2>/dev/null | awk 'NR>2 && $1 !~ /^(Total|---|Hosts)/ {print $1}')"})
+                    _describe -t models 'models' models
+                    ;;
+            esac
+            ;;
+    esac
+}
+
+_kimo "$@"
+EOFZSH
+            ;;
+        *)
+            echo "${C_BOLD}kimo completion${C_RESET} – Generate shell autocompletion script"
+            echo ""
+            echo "${C_YELLOW}Usage:${C_RESET}"
+            echo "  ${0##*/} completion <bash|zsh>"
+            echo ""
+            echo "${C_YELLOW}Setup:${C_RESET}"
+            echo "  ${C_BOLD}Bash:${C_RESET}"
+            echo "    source <(${0##*/} completion bash)            # Current session"
+            echo "    ${0##*/} completion bash > /etc/bash_completion.d/kimo  # System-wide (root)"
+            echo "    make install-completion                         # Via Makefile"
+            echo ""
+            echo "  ${C_BOLD}Zsh:${C_RESET}"
+            echo "    ${0##*/} completion zsh > ~/.zsh/completion/_kimo"
+            echo "    # Ensure ~/.zsh/completion is in your fpath"
+            return 0
+            ;;
+    esac
+}
+
+# -----------------------------------------------------------------------------
 # Main Dispatcher
 # -----------------------------------------------------------------------------
 # With several --host values, read-only/aggregate commands query every host;
@@ -4196,7 +4692,7 @@ cmd_doctor() {
 # first --host).
 if [[ "${HOST_MODE}" == "multi" ]]; then
     case "${COMMAND}" in
-        check|ping|hosts|ps|list|ls|search|find|stop|unload|info|show|status|health|status-report|report|logs|log|rotate-token|rotate|install|setup|update|upgrade|doctor|diagnose|diag|config|cfg|version|help|-h|--help) ;;
+        check|ping|hosts|ps|top|list|ls|search|find|stop|unload|info|show|status|health|status-report|report|logs|log|rotate-token|rotate|install|setup|update|upgrade|doctor|diagnose|diag|config|cfg|completion|version|help|-h|--help) ;;
         *)
             _model="${ARGS[0]:-}"
             if [[ "${COMMAND}" == "launch" ]]; then
@@ -4231,7 +4727,10 @@ case "${COMMAND}" in
         cmd_hosts
         ;;
     ps)
-        cmd_ps
+        cmd_ps "${ARGS[@]}"
+        ;;
+    top)
+        cmd_top "${ARGS[@]}"
         ;;
     status|health)
         cmd_status
@@ -4272,6 +4771,9 @@ case "${COMMAND}" in
     rm|delete)
         cmd_rm "${ARGS[0]:-}"
         ;;
+    pull|download)
+        cmd_pull "${ARGS[@]}"
+        ;;
     stream)
         cmd_stream "${ARGS[@]}"
         ;;
@@ -4292,6 +4794,9 @@ case "${COMMAND}" in
         ;;
     config|cfg)
         cmd_config "${ARGS[@]}"
+        ;;
+    completion)
+        cmd_completion "${ARGS[@]}"
         ;;
     version)
         echo "kimo v${KIMO_VERSION}"

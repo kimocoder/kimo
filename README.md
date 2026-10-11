@@ -9,9 +9,11 @@
 ## Features
 
 - **Multi-Host Routing**: Seamlessly query or execute against local daemons and remote GPU servers over SSH tunnels or direct LAN connections.
-- **VRAM Residency & Cleanup**: Real-time VRAM allocation tracking and instant eviction (`stop` / `unload`) to prevent CUDA OOM collisions.
+- **Real-Time VRAM Monitor**: Live interactive GPU/CPU residency monitor (`top` / `ps --watch`) tracking memory usage across cluster hosts.
+- **Streaming Model Pulling**: Pull models directly from Ollama registries with live multi-layer download progress, layer digests, transfer speeds, and status updates (`pull`).
 - **Model Tuning & Persistence**: Bake per-model parameters (`num_ctx`, `num_batch`, `num_predict`, `temperature`, `num_gpu`) into runtime launches without modifying raw Modelfiles.
 - **Streaming & Keepalive Pinning**: Durable model availability via background keepalive and pre-warming (`stream`).
+- **Shell Autocompletion**: Comprehensive tab completion scripts for Bash and Zsh covering commands, flags, CLIs, config options, and dynamic model names (`completion`).
 - **External CLI Hub**: Automatic model mapping, endpoint rewriting, context-window patching, and wire-format translation for:
   - **Claude Code CLI** (`claude`)
   - **Codex CLI** (`codex`)
@@ -31,6 +33,9 @@ Clone the repository and install using `make`:
 # System-wide installation to /usr/local/bin/kimo (default)
 sudo make install
 
+# Install shell tab-completions for Bash and Zsh
+sudo make install-completion
+
 # Or create a live development symlink:
 sudo make link
 
@@ -46,6 +51,8 @@ make check
 | `make uninstall` | Removes installed `kimo` binary from `$(DESTDIR)$(BINDIR)` |
 | `make link` | Creates development symlink from repo directly to `$(BINDIR)/kimo` |
 | `make unlink` | Removes the development symlink |
+| `make install-completion` | Installs shell autocompletion for Bash (`/etc/bash_completion.d/kimo`) and Zsh |
+| `make uninstall-completion`| Removes installed completion scripts |
 | `make check` | Validates bash syntax (`bash -n`) and executes basic CLI sanity tests |
 | `make lint` | Runs `shellcheck` with error filtering on `kimo` |
 | `make clean` | Removes temporary and backup files (`*~`, `*.tmp`, `*.bak`) |
@@ -85,6 +92,8 @@ kimo [options] <command> [arguments...]
 | `list [filter]` | List all installed models across hosts, highlighting active VRAM | `kimo list nemotron` |
 | `search <query>` | Search models across catalogs by name, parameters, capabilities | `kimo search 27b` |
 | `ps` | Display models currently resident in GPU/CPU VRAM with memory stats | `kimo ps` |
+| `top` | Interactive real-time VRAM residency monitor (`ps --watch`) | `kimo top` |
+| `pull <model>` | Pull model from registry with live streaming progress & speed | `kimo pull llama3:latest` |
 | `stop [model\|all]` | Unload models from VRAM immediately (`keep_alive: 0`) | `kimo stop all` |
 | `warm <model> [dur]`| Pre-warm model into GPU VRAM (`keep_alive: 24h` by default) | `kimo warm kalidroid-27b` |
 | `info <model>` | Inspect detailed model metadata, quant, template, parameters | `kimo info kalidroid-27b` |
@@ -97,6 +106,7 @@ kimo [options] <command> [arguments...]
 | `launch <cli> [opts]`| Launch external CLI with automatic Ollama routing | `kimo launch grok --model 27b` |
 | `install [cli\|all]` | Install/update external CLIs (`kimi`, `claude`, `grok`, `codex`, `qwen`, etc.) | `kimo install kimi` |
 | `update [cli\|all]`  | Check for updates for all installed CLIs, or apply updates | `kimo update` |
+| `completion [sh]`    | Generate shell tab-completion script for Bash or Zsh | `kimo completion bash` |
 
 ---
 
@@ -193,6 +203,68 @@ kimo update qwen
 
 # Apply all available updates for currently installed CLIs
 kimo update --apply     # or: kimo update all
+```
+
+---
+
+## Real-Time VRAM & Model Monitor (`top` / `ps --watch`)
+
+Monitor memory residency, active layers, and keepalive expiration in real time with an interactive top-like terminal dashboard:
+
+```bash
+# Launch real-time VRAM residency monitor (default 2s interval)
+kimo top
+
+# Specify custom refresh interval
+kimo top -n 1
+
+# Equivalent via ps watch flag
+kimo ps --watch --interval 3
+```
+
+Features:
+- Clean interactive redraws with terminal cursor preservation and graceful `Ctrl+C` handling.
+- Live VRAM footprint (GB) and percentage of model resident in GPU VRAM vs CPU memory.
+- Multi-host aggregation when queried across cluster nodes.
+
+---
+
+## Native Model Pulling with Live Streaming Progress (`pull`)
+
+Pull models directly from Ollama registries with layer-by-layer progress bars, download speed (`MB/s`), and digest verification:
+
+```bash
+# Pull model to local Ollama daemon
+kimo pull llama3:latest
+
+# Pull model directly to remote GPU server
+kimo --remote pull kalidroid-27b:latest
+
+# Pull to an explicit cluster host
+kimo --host 192.168.1.131:11434 pull qwen2.5:32b
+
+# Insecure registry pull
+kimo pull my-registry.internal/model:latest --insecure
+```
+
+---
+
+## Shell Autocompletions (`completion`)
+
+`kimo` includes complete tab-completion for Bash and Zsh. It autocompletes commands, global flags, external CLIs, persistent configuration keys, and dynamically suggests installed Ollama models:
+
+```bash
+# Load completion into active Bash session
+source <(kimo completion bash)
+
+# Install system-wide via Makefile (Bash + Zsh)
+sudo make install-completion
+
+# Manual system-wide installation for Bash
+sudo kimo completion bash > /etc/bash_completion.d/kimo
+
+# Zsh setup: save to your fpath directory
+kimo completion zsh > ~/.zsh/completion/_kimo
 ```
 
 ---

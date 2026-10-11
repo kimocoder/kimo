@@ -3,11 +3,13 @@
 PREFIX  ?= /usr/local
 BINDIR  ?= $(PREFIX)/bin
 DESTDIR ?=
+BASH_COMPLETION_DIR ?= /etc/bash_completion.d
+ZSH_COMPLETION_DIR  ?= $(PREFIX)/share/zsh/site-functions
 SHELL   := /bin/bash
 
 SCRIPT  := kimo
 
-.PHONY: all help install uninstall link unlink check lint clean
+.PHONY: all help install uninstall link unlink check lint clean install-completion uninstall-completion
 
 all: help
 
@@ -15,14 +17,16 @@ help:
 	@echo "kimo - Unified Model Management & External CLI Hub"
 	@echo ""
 	@echo "Available targets:"
-	@echo "  make install     Install kimo to $(DESTDIR)$(BINDIR)/kimo"
-	@echo "  make uninstall   Remove kimo from $(DESTDIR)$(BINDIR)"
-	@echo "  make link        Create development symlink from this directory to $(DESTDIR)$(BINDIR)/kimo"
-	@echo "  make unlink      Remove development symlink from $(DESTDIR)$(BINDIR)"
-	@echo "  make check       Verify bash syntax and execute basic CLI sanity checks"
-	@echo "  make lint        Run shellcheck (error severity) against $(SCRIPT)"
-	@echo "  make clean       Remove temporary and backup files"
-	@echo "  make help        Display this help message"
+	@echo "  make install               Install kimo to $(DESTDIR)$(BINDIR)/kimo"
+	@echo "  make uninstall             Remove kimo from $(DESTDIR)$(BINDIR)"
+	@echo "  make link                  Create development symlink from this directory to $(DESTDIR)$(BINDIR)/kimo"
+	@echo "  make unlink                Remove development symlink from $(DESTDIR)$(BINDIR)"
+	@echo "  make install-completion    Install shell tab-completions (bash & zsh)"
+	@echo "  make uninstall-completion  Remove installed shell tab-completions"
+	@echo "  make check                 Verify bash syntax and execute basic CLI sanity checks"
+	@echo "  make lint                  Run shellcheck (error severity) against $(SCRIPT)"
+	@echo "  make clean                 Remove temporary and backup files"
+	@echo "  make help                  Display this help message"
 	@echo ""
 	@echo "Variables:"
 	@echo "  PREFIX   Installation directory prefix (default: /usr/local)"
@@ -54,6 +58,28 @@ unlink:
 	else \
 		echo "[!] $(DESTDIR)$(BINDIR)/$(SCRIPT) is not a symlink, skipping."; \
 	fi
+
+install-completion:
+	@echo "[*] Installing shell completions..."
+	@install -d -m 755 $(DESTDIR)$(BASH_COMPLETION_DIR)
+	@./$(SCRIPT) completion bash > $(DESTDIR)$(BASH_COMPLETION_DIR)/$(SCRIPT)
+	@chmod 644 $(DESTDIR)$(BASH_COMPLETION_DIR)/$(SCRIPT)
+	@echo "[✓] Bash completion installed to $(DESTDIR)$(BASH_COMPLETION_DIR)/$(SCRIPT)"
+	@if [ -d "$(DESTDIR)$(ZSH_COMPLETION_DIR)" ] || [ -d "/usr/share/zsh/site-functions" ]; then \
+		ZDIR="$(DESTDIR)$(ZSH_COMPLETION_DIR)"; \
+		[ ! -d "$$ZDIR" ] && ZDIR="/usr/share/zsh/site-functions"; \
+		install -d -m 755 "$$ZDIR"; \
+		./$(SCRIPT) completion zsh > "$$ZDIR/_$(SCRIPT)"; \
+		chmod 644 "$$ZDIR/_$(SCRIPT)"; \
+		echo "[✓] Zsh completion installed to $$ZDIR/_$(SCRIPT)"; \
+	fi
+
+uninstall-completion:
+	@echo "[*] Removing shell completions..."
+	@rm -f $(DESTDIR)$(BASH_COMPLETION_DIR)/$(SCRIPT)
+	@rm -f $(DESTDIR)$(ZSH_COMPLETION_DIR)/_$(SCRIPT)
+	@rm -f /usr/share/zsh/site-functions/_$(SCRIPT)
+	@echo "[✓] Shell completions removed."
 
 check:
 	@echo "[*] Validating syntax for $(SCRIPT)..."
