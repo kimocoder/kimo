@@ -17,8 +17,57 @@ REMOTE_HOST_PORT="11434"
 REMOTE_DIRECT_URL="http://${REMOTE_HOST_IP}:${REMOTE_HOST_PORT}"
 REMOTE_TUNNEL_URL="http://127.0.0.1:11438"
 REMOTE_DAEMON_URL="http://${REMOTE_HOST_IP}:11436"
+KIMO_VERSION="1.1.0"
 REMOTE_HOST_URL="${OLLAMA_REMOTE_URL:-${REMOTE_TUNNEL_URL}}"
 LOCAL_HOST_URL="${OLLAMA_LOCAL_URL:-http://127.0.0.1:11434}"
+
+# Persistent Configuration
+KIMO_CONFIG_DIR="${XDG_CONFIG_HOME:-${HOME:-/root}/.config}/kimo"
+KIMO_CONFIG_FILE="${KIMO_CONFIG_FILE:-${KIMO_CONFIG_DIR}/config}"
+declare -A KIMO_CONFIG_VALUES=()
+declare -A KIMO_CONFIG_SOURCES=()
+
+load_kimo_config() {
+    local cfg="${KIMO_CONFIG_FILE}"
+    if [[ ! -f "${cfg}" && -f "/etc/kimo/config" ]]; then
+        cfg="/etc/kimo/config"
+    fi
+
+    if [[ -f "${cfg}" ]]; then
+        while IFS= read -r line || [[ -n "${line}" ]]; do
+            line="${line#"${line%%[![:space:]]*}"}"
+            line="${line%"${line##*[![:space:]]}"}"
+            [[ -z "${line}" || "${line}" == \#* || "${line}" == \;* ]] && continue
+            if [[ "${line}" =~ ^([a-zA-Z0-9_.-]+)[[:space:]]*=[[:space:]]*(.*)$ ]]; then
+                local k="${BASH_REMATCH[1]}"
+                local v="${BASH_REMATCH[2]}"
+                v="${v#[\"\']}"
+                v="${v%[\"\']}"
+                KIMO_CONFIG_VALUES["${k}"]="${v}"
+                KIMO_CONFIG_SOURCES["${k}"]="file:${cfg}"
+            fi
+        done < "${cfg}"
+    fi
+
+    if [[ -n "${KIMO_CONFIG_VALUES[remote_url]:-}" && -z "${OLLAMA_REMOTE_URL:-}" ]]; then
+        REMOTE_HOST_URL="${KIMO_CONFIG_VALUES[remote_url]}"
+        OLLAMA_REMOTE_URL="${REMOTE_HOST_URL}"
+    fi
+    if [[ -n "${KIMO_CONFIG_VALUES[local_url]:-}" && -z "${OLLAMA_LOCAL_URL:-}" ]]; then
+        LOCAL_HOST_URL="${KIMO_CONFIG_VALUES[local_url]}"
+        OLLAMA_LOCAL_URL="${LOCAL_HOST_URL}"
+    fi
+    if [[ -n "${KIMO_CONFIG_VALUES[default_model]:-}" && -z "${KIMO_DEFAULT_MODEL:-}" ]]; then
+        KIMO_DEFAULT_MODEL="${KIMO_CONFIG_VALUES[default_model]}"
+    fi
+    if [[ -n "${KIMO_CONFIG_VALUES[kimi_effort]:-}" && -z "${KIMO_KIMI_EFFORT:-}" && -z "${OM_KIMI_EFFORT:-}" ]]; then
+        KIMO_KIMI_EFFORT="${KIMO_CONFIG_VALUES[kimi_effort]}"
+    fi
+    if [[ "${KIMO_CONFIG_VALUES[no_color]:-}" == "true" && -z "${FORCE_NO_COLOR:-}" && "${NO_COLOR:-0}" != "1" ]]; then
+        FORCE_NO_COLOR=true
+    fi
+}
+load_kimo_config
 
 # Per-model tuned defaults baked into run/launch. Keyed by exact resolved model
 # name; values mirror Ollama request option names (num_ctx/num_batch/...).
@@ -104,6 +153,7 @@ ${C_YELLOW}Global Options:${C_RESET}
   ${C_CYAN}--host <address>${C_RESET}             Specify custom Ollama host (repeatable for multi-host routing)
   ${C_CYAN}--json${C_RESET}                       Output responses in structured JSON format
   ${C_CYAN}--no-color${C_RESET}                   Disable colored terminal output
+  ${C_CYAN}-v, --version${C_RESET}                Show kimo version
   ${C_CYAN}-h, --help${C_RESET}                   Show this help message
 
 ${C_YELLOW}Model & VRAM Management:${C_RESET}
@@ -128,10 +178,12 @@ ${C_YELLOW}Cluster & Remote Operations:${C_RESET}
   ${C_CYAN}check, ping${C_RESET}                  Probe connectivity, latency, and health across daemons & tunnels
   ${C_CYAN}hosts${C_RESET}                        Inventory table of reachable servers, models, versions, and disks
   ${C_CYAN}status, health${C_RESET}               Operational snapshot: tunnel, remote API, VRAM residency, timer
+  ${C_CYAN}doctor${C_RESET}                       Run system, cluster, and CLI ecosystem health diagnostics
   ${C_CYAN}stream <model> [opts]${C_RESET}        Pin remote model for durable availability via keepalive daemon
                                 (modes: --status, --test, --resident-only, --repair-all)
 
-${C_YELLOW}Maintenance & Logging:${C_RESET}
+${C_YELLOW}Maintenance, Config & Logging:${C_RESET}
+  ${C_CYAN}config [subcmd] [args...]${C_RESET}    View or update persistent configuration (~/.config/kimo/config)
   ${C_CYAN}logs [service|all]${C_RESET}           Show recent journald output (tunnel, keepalive, timer, apache, all)
   ${C_CYAN}status-report${C_RESET}                Append operational status snapshot to /var/log/ollama-status-report.log
   ${C_CYAN}rotate-token${C_RESET}                 Generate new public API token, rewrite proxy conf & reload Apache
@@ -159,6 +211,11 @@ ${C_YELLOW}Examples:${C_RESET}
   ${0##*/} install kimi                               # Install Kimi Code CLI
   ${0##*/} update                                     # Check updates across all present CLIs
   ${0##*/} update --apply                             # Upgrade all present CLIs to latest
+
+  ${C_DIM}# Diagnostics & Configuration:${C_RESET}
+  ${0##*/} doctor                                     # Run system, cluster & CLI health check
+  ${0##*/} config                                     # View current configuration and sources
+  ${0##*/} config set default_host remote             # Default all commands to remote GPU server
 
   ${C_DIM}# Cluster & Multi-Host Management:${C_RESET}
   ${0##*/} check                                      # Health & latency probe for all endpoints
@@ -210,6 +267,10 @@ while [[ $# -gt 0 ]]; do
             FORCE_NO_COLOR=true
             shift
             ;;
+        -v|--version)
+            echo "kimo v${KIMO_VERSION}"
+            exit 0
+            ;;
         -h|--help)
             if [[ ${#POSITIONAL_ARGS[@]} -eq 0 ]]; then
                 setup_colors
@@ -227,11 +288,20 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+# Apply default_host from persistent config if not overridden on command line
+if [[ -n "${KIMO_CONFIG_VALUES[default_host]:-}" && ${#OPT_HOSTS[@]} -eq 0 && ! ${OPT_LOCAL} && ! ${OPT_REMOTE} ]]; then
+    case "${KIMO_CONFIG_VALUES[default_host]}" in
+        remote) OPT_REMOTE=true ;;
+        local)  OPT_LOCAL=true ;;
+        *)      OPT_HOSTS+=("${KIMO_CONFIG_VALUES[default_host]}") ;;
+    esac
+fi
+
 setup_colors
 
 if [[ ${#POSITIONAL_ARGS[@]} -eq 0 ]]; then
     usage
-    exit 1
+    exit 0
 fi
 
 COMMAND="${POSITIONAL_ARGS[0]}"
@@ -3671,6 +3741,454 @@ cmd_update() {
 }
 
 # -----------------------------------------------------------------------------
+# Command: config
+# -----------------------------------------------------------------------------
+config_usage() {
+    cat <<EOF
+${C_BOLD}kimo config${C_RESET} – View and manage persistent user configuration
+
+${C_YELLOW}Usage:${C_RESET}
+  ${0##*/} config [list|get|set|unset|path] [arguments...]
+
+${C_YELLOW}Commands:${C_RESET}
+  ${C_CYAN}list, show${C_RESET}           Display all configuration keys, effective values, and sources
+  ${C_CYAN}get <key>${C_RESET}            Get the value of a specific configuration key
+  ${C_CYAN}set <key> <val>${C_RESET}      Set a configuration key in ${KIMO_CONFIG_FILE}
+  ${C_CYAN}unset <key>${C_RESET}          Remove a key from the configuration file
+  ${C_CYAN}path${C_RESET}                Print the configuration file path
+
+${C_YELLOW}Available Keys:${C_RESET}
+  ${C_BOLD}default_host${C_RESET}       Default routing host ('local', 'remote', or custom host/URL)
+  ${C_BOLD}default_model${C_RESET}      Default model name used for launches and runs
+  ${C_BOLD}remote_url${C_RESET}         Default remote server endpoint URL
+  ${C_BOLD}local_url${C_RESET}          Default local daemon endpoint URL
+  ${C_BOLD}kimi_effort${C_RESET}        Default thinking effort for Kimi Code CLI (low, medium, high, xhigh, max)
+  ${C_BOLD}no_color${C_RESET}           Disable ANSI color escapes (true/false)
+
+${C_YELLOW}Examples:${C_RESET}
+  ${0##*/} config                         # View all effective configurations
+  ${0##*/} config set default_host remote # Always default to remote server
+  ${0##*/} config set kimi_effort xhigh   # Set default thinking effort
+  ${0##*/} config get default_host        # Query specific setting
+  ${0##*/} config unset default_host      # Revert to built-in default
+EOF
+}
+
+cmd_config() {
+    local subcmd="${1:-list}"
+    shift || true
+
+    case "${subcmd}" in
+        list|show|"")
+            echo "${C_BOLD}kimo Configuration:${C_RESET}"
+            local cfg_status="${C_DIM}(not created)${C_RESET}"
+            [[ -f "${KIMO_CONFIG_FILE}" ]] && cfg_status="(${C_GREEN}exists${C_RESET})"
+            echo "  Config File : ${KIMO_CONFIG_FILE} ${cfg_status}"
+            echo "  ----------------------------------------------------------------------------------"
+            printf "  ${C_CYAN}%-18s %-32s %-20s${C_RESET}\n" "KEY" "CURRENT VALUE" "SOURCE"
+            echo "  ----------------------------------------------------------------------------------"
+
+            local known_keys=("default_host" "default_model" "remote_url" "local_url" "kimi_effort" "no_color")
+            for k in "${known_keys[@]}"; do
+                local val=""
+                local src="built-in default"
+                case "${k}" in
+                    default_host)
+                        val="${KIMO_CONFIG_VALUES[default_host]:-auto (local+remote)}"
+                        ;;
+                    default_model)
+                        val="${KIMO_DEFAULT_MODEL:-kalidroid-27b:latest}"
+                        [[ -n "${KIMO_DEFAULT_MODEL:-}" ]] && src="config/env"
+                        ;;
+                    remote_url)
+                        val="${REMOTE_HOST_URL}"
+                        [[ -n "${OLLAMA_REMOTE_URL:-}" ]] && src="env:OLLAMA_REMOTE_URL"
+                        ;;
+                    local_url)
+                        val="${LOCAL_HOST_URL}"
+                        [[ -n "${OLLAMA_LOCAL_URL:-}" ]] && src="env:OLLAMA_LOCAL_URL"
+                        ;;
+                    kimi_effort)
+                        val="${KIMO_KIMI_EFFORT:-${OM_KIMI_EFFORT:-default}}"
+                        [[ -n "${KIMO_KIMI_EFFORT:-}" || -n "${OM_KIMI_EFFORT:-}" ]] && src="config/env"
+                        ;;
+                    no_color)
+                        val="${FORCE_NO_COLOR:-false}"
+                        ;;
+                esac
+
+                if [[ -n "${KIMO_CONFIG_VALUES[$k]:-}" ]]; then
+                    src="config file"
+                fi
+
+                printf "  %-18s %-32s ${C_DIM}%-20s${C_RESET}\n" "${k}" "${val}" "${src}"
+            done
+            echo ""
+            echo "To change a setting:  ${0##*/} config set <key> <value>"
+            echo "To remove a setting: ${0##*/} config unset <key>"
+            ;;
+        get)
+            local key="${1:-}"
+            if [[ -z "${key}" ]]; then
+                echo "${C_RED}Error: 'config get' requires a key name.${C_RESET}" >&2
+                return 1
+            fi
+            echo "${KIMO_CONFIG_VALUES[$key]:-}"
+            ;;
+        set)
+            local key="${1:-}"
+            local val="${2:-}"
+            if [[ -z "${key}" || -z "${val}" ]]; then
+                echo "${C_RED}Error: 'config set' requires both a key and a value.${C_RESET}" >&2
+                echo "Usage: ${0##*/} config set <key> <value>" >&2
+                return 1
+            fi
+            case "${key}" in
+                default_host|default_model|remote_url|local_url|kimi_effort|no_color) ;;
+                *)
+                    echo "${C_YELLOW}[!] Warning: '${key}' is not a standard kimo configuration key.${C_RESET}" >&2
+                    ;;
+            esac
+            mkdir -p "${KIMO_CONFIG_DIR}"
+            touch "${KIMO_CONFIG_FILE}"
+
+            python3 -c '
+import sys, os, re
+f = sys.argv[1]
+k = sys.argv[2]
+v = sys.argv[3]
+lines = []
+found = False
+if os.path.exists(f):
+    with open(f, "r", encoding="utf-8") as fh:
+        for line in fh:
+            m = re.match(r"^\s*" + re.escape(k) + r"\s*=.*$", line)
+            if m:
+                lines.append(f"{k}={v}\n")
+                found = True
+            else:
+                lines.append(line)
+if not found:
+    lines.append(f"{k}={v}\n")
+with open(f, "w", encoding="utf-8") as fh:
+    fh.writelines(lines)
+' "${KIMO_CONFIG_FILE}" "${key}" "${val}"
+
+            echo "${C_GREEN}[✓] Saved: ${key}=${val} in ${KIMO_CONFIG_FILE}${C_RESET}"
+            ;;
+        unset|delete|rm)
+            local key="${1:-}"
+            if [[ -z "${key}" ]]; then
+                echo "${C_RED}Error: 'config unset' requires a key name.${C_RESET}" >&2
+                return 1
+            fi
+            if [[ -f "${KIMO_CONFIG_FILE}" ]]; then
+                python3 -c '
+import sys, os, re
+f = sys.argv[1]
+k = sys.argv[2]
+lines = []
+if os.path.exists(f):
+    with open(f, "r", encoding="utf-8") as fh:
+        for line in fh:
+            if not re.match(r"^\s*" + re.escape(k) + r"\s*=.*$", line):
+                lines.append(line)
+    with open(f, "w", encoding="utf-8") as fh:
+        fh.writelines(lines)
+' "${KIMO_CONFIG_FILE}" "${key}"
+                echo "${C_GREEN}[✓] Removed '${key}' from ${KIMO_CONFIG_FILE}${C_RESET}"
+            else
+                echo "${C_DIM}Config file does not exist.${C_RESET}"
+            fi
+            ;;
+        path)
+            echo "${KIMO_CONFIG_FILE}"
+            ;;
+        -h|--help|help)
+            config_usage
+            ;;
+        *)
+            echo "${C_RED}Error: Unknown config subcommand '${subcmd}'.${C_RESET}" >&2
+            config_usage
+            return 1
+            ;;
+    esac
+}
+
+# -----------------------------------------------------------------------------
+# Command: doctor / diagnose
+# -----------------------------------------------------------------------------
+doctor_usage() {
+    cat <<EOF
+${C_BOLD}kimo doctor${C_RESET} – System, cluster, and CLI ecosystem health diagnostics
+
+${C_YELLOW}Usage:${C_RESET}
+  ${0##*/} doctor [options]
+
+${C_YELLOW}Options:${C_RESET}
+  ${C_CYAN}-h, --help${C_RESET}    Show this help message
+
+${C_YELLOW}Examples:${C_RESET}
+  ${0##*/} doctor             # Run full diagnostic scorecard
+EOF
+}
+
+cmd_doctor() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -h|--help|help) doctor_usage; return 0 ;;
+            *) shift ;;
+        esac
+    done
+
+    echo "${C_BOLD}kimo Doctor – System, Cluster & CLI Health Diagnostics${C_RESET}"
+    echo "====================================================================="
+    local passed=0
+    local warnings=0
+    local errors=0
+    local recs=()
+
+    # 1. System Tools & Prerequisites
+    echo "${C_YELLOW}[1/5] Core System Prerequisites:${C_RESET}"
+
+    # curl
+    if command -v curl >/dev/null 2>&1; then
+        local curl_ver
+        curl_ver=$(curl --version 2>/dev/null | head -n 1 | awk '{print $2}')
+        echo "  ${C_GREEN}[✓] curl${C_RESET}          : v${curl_ver} ($(command -v curl))"
+        passed=$((passed + 1))
+    else
+        echo "  ${C_RED}[✗] curl${C_RESET}          : Not found in PATH!"
+        errors=$((errors + 1))
+        recs+=("Install curl: apt update && apt install -y curl")
+    fi
+
+    # jq
+    if command -v jq >/dev/null 2>&1; then
+        local jq_ver
+        jq_ver=$(jq --version 2>/dev/null | head -n 1)
+        echo "  ${C_GREEN}[✓] jq${C_RESET}            : ${jq_ver} ($(command -v jq))"
+        passed=$((passed + 1))
+    else
+        echo "  ${C_RED}[✗] jq${C_RESET}            : Not found in PATH!"
+        errors=$((errors + 1))
+        recs+=("Install jq: apt update && apt install -y jq")
+    fi
+
+    # python3
+    if command -v python3 >/dev/null 2>&1; then
+        local py_ver
+        py_ver=$(python3 --version 2>&1 | awk '{print $2}')
+        echo "  ${C_GREEN}[✓] python3${C_RESET}       : v${py_ver} ($(command -v python3))"
+        passed=$((passed + 1))
+    else
+        echo "  ${C_RED}[✗] python3${C_RESET}       : Not found in PATH!"
+        errors=$((errors + 1))
+        recs+=("Install python3: apt update && apt install -y python3")
+    fi
+
+    # tomlkit
+    if python3 -c "import tomlkit" >/dev/null 2>&1; then
+        echo "  ${C_GREEN}[✓] tomlkit${C_RESET}       : Available (graded Kimi /effort config supported)"
+        passed=$((passed + 1))
+    else
+        echo "  ${C_YELLOW}[!] tomlkit${C_RESET}       : Missing (Kimi /effort falls back to binary on/off)"
+        warnings=$((warnings + 1))
+        recs+=("Install tomlkit for full Kimi thinking effort control: pip install tomlkit")
+    fi
+
+    # node & npm
+    if command -v npm >/dev/null 2>&1; then
+        local node_ver npm_ver
+        node_ver=$(node -v 2>/dev/null || echo "unknown")
+        npm_ver=$(npm -v 2>/dev/null || echo "unknown")
+        echo "  ${C_GREEN}[✓] node / npm${C_RESET}    : node ${node_ver}, npm v${npm_ver}"
+        passed=$((passed + 1))
+    else
+        echo "  ${C_YELLOW}[!] node / npm${C_RESET}    : npm not found (required to install/update claude, codex, qwen)"
+        warnings=$((warnings + 1))
+        recs+=("Install Node.js & npm: apt install -y nodejs npm")
+    fi
+
+    # systemd
+    if command -v systemctl >/dev/null 2>&1; then
+        echo "  ${C_GREEN}[✓] systemd${C_RESET}       : systemctl & journalctl operational"
+        passed=$((passed + 1))
+    else
+        echo "  ${C_DIM}[·] systemd${C_RESET}       : systemctl not available in current environment"
+    fi
+
+    echo ""
+    # 2. Configuration & State Stores
+    echo "${C_YELLOW}[2/5] Configuration & Storage:${C_RESET}"
+    if [[ -f "${KIMO_CONFIG_FILE}" ]]; then
+        local cfg_keys=0
+        cfg_keys=$(grep -cE '^[a-zA-Z0-9_.-]+=' "${KIMO_CONFIG_FILE}" 2>/dev/null || true)
+        cfg_keys="${cfg_keys:-0}"
+        echo "  ${C_GREEN}[✓] Config File${C_RESET}   : ${KIMO_CONFIG_FILE} (${cfg_keys} active keys)"
+        passed=$((passed + 1))
+    else
+        echo "  ${C_DIM}[·] Config File${C_RESET}   : ${KIMO_CONFIG_FILE} (using built-in defaults; create with 'kimo config set ...')"
+        passed=$((passed + 1))
+    fi
+
+    if [[ -f "${TUNINGS_FILE}" ]]; then
+        local tuned_count=0
+        tuned_count=$(python3 -c 'import json, sys; d=json.load(open(sys.argv[1])) if open(sys.argv[1]).read().strip() else {}; print(len(d))' "${TUNINGS_FILE}" 2>/dev/null || echo "0")
+        echo "  ${C_GREEN}[✓] Tunings Store${C_RESET} : ${TUNINGS_FILE} (${tuned_count} tuned models registered)"
+        passed=$((passed + 1))
+    else
+        echo "  ${C_DIM}[·] Tunings Store${C_RESET} : ${TUNINGS_FILE} (not yet created; populated by 'kimo tune')"
+        passed=$((passed + 1))
+    fi
+
+    local tmp_test="/tmp/kimo-doc-test-$$"
+    if touch "${tmp_test}" 2>/dev/null; then
+        rm -f "${tmp_test}"
+        echo "  ${C_GREEN}[✓] Temp & Locks${C_RESET}   : /tmp is writable (session shims & lockfiles)"
+        passed=$((passed + 1))
+    else
+        echo "  ${C_RED}[✗] Temp & Locks${C_RESET}   : /tmp is NOT writable! Session shims and locks will fail."
+        errors=$((errors + 1))
+        recs+=("Ensure /tmp has 1777 permissions: chmod 1777 /tmp")
+    fi
+
+    echo ""
+    # 3. Local Ollama Daemon
+    echo "${C_YELLOW}[3/5] Local Ollama Daemon (${LOCAL_HOST_URL}):${C_RESET}"
+    local local_resp local_code local_lat local_ver
+    local_resp=$(curl -s --connect-timeout 2 -m 3 -w '|%{http_code}|%{time_total}' "${LOCAL_HOST_URL}/api/version" 2>/dev/null || true)
+    local_code=$(echo "${local_resp}" | awk -F'|' '{print $2}')
+    local_lat=$(echo "${local_resp}" | awk -F'|' '{print $3}')
+    if [[ "${local_code}" == "200" ]]; then
+        local_ver=$(echo "${local_resp}" | awk -F'|' '{print $1}' | jq -r '.version // "unknown"' 2>/dev/null || echo "unknown")
+        local local_lat_ms
+        local_lat_ms=$(awk "BEGIN {printf \"%.1f\", ${local_lat:-0} * 1000}")
+        echo "  ${C_GREEN}[✓] Connectivity${C_RESET}  : Reachable (v${local_ver}, ${local_lat_ms}ms latency)"
+        passed=$((passed + 1))
+
+        local local_tags local_models=0
+        local_tags=$(curl -s --connect-timeout 2 -m 3 "${LOCAL_HOST_URL}/api/tags" 2>/dev/null || true)
+        local_models=$(echo "${local_tags}" | jq -r '.models | length // 0' 2>/dev/null || echo "0")
+        echo "  ${C_GREEN}[✓] Model Catalog${C_RESET} : ${local_models} model(s) installed"
+        passed=$((passed + 1))
+
+        local local_ps local_res_count=0
+        local_ps=$(curl -s --connect-timeout 2 -m 3 "${LOCAL_HOST_URL}/api/ps" 2>/dev/null || true)
+        local_res_count=$(echo "${local_ps}" | jq -r '.models | length // 0' 2>/dev/null || echo "0")
+        if [[ "${local_res_count}" -gt 0 ]]; then
+            local active_name
+            active_name=$(echo "${local_ps}" | jq -r '.models[0].name // ""' 2>/dev/null)
+            echo "  ${C_CYAN}[●] VRAM Status${C_RESET}   : ${local_res_count} active model resident (${active_name})"
+        else
+            echo "  ${C_DIM}[○] VRAM Status${C_RESET}   : Idle (0 active models resident)"
+        fi
+        passed=$((passed + 1))
+    else
+        echo "  ${C_YELLOW}[!] Connectivity${C_RESET}  : Unreachable (HTTP ${local_code:-timeout})"
+        warnings=$((warnings + 1))
+        recs+=("Start local Ollama daemon: systemctl start ollama (or run 'ollama serve')")
+    fi
+
+    echo ""
+    # 4. Remote GPU Server & Tunnel
+    echo "${C_YELLOW}[4/5] Remote GPU Server & SSH Tunnel (${REMOTE_HOST_URL}):${C_RESET}"
+    if command -v systemctl >/dev/null 2>&1; then
+        local tunnel_state
+        tunnel_state=$(systemctl is-active ollama-remote-tunnel.service 2>/dev/null || echo "unknown")
+        if [[ "${tunnel_state}" == "active" ]]; then
+            echo "  ${C_GREEN}[✓] SSH Tunnel${C_RESET}    : ollama-remote-tunnel.service is ACTIVE"
+            passed=$((passed + 1))
+        else
+            echo "  ${C_YELLOW}[!] SSH Tunnel${C_RESET}    : ollama-remote-tunnel.service is ${tunnel_state}"
+            warnings=$((warnings + 1))
+            recs+=("Start SSH tunnel: systemctl start ollama-remote-tunnel.service")
+        fi
+    fi
+
+    local remote_resp remote_code remote_lat remote_ver
+    remote_resp=$(curl -s --connect-timeout 2 -m 3 -w '|%{http_code}|%{time_total}' "${REMOTE_HOST_URL}/api/version" 2>/dev/null || true)
+    remote_code=$(echo "${remote_resp}" | awk -F'|' '{print $2}')
+    remote_lat=$(echo "${remote_resp}" | awk -F'|' '{print $3}')
+    if [[ "${remote_code}" == "200" ]]; then
+        remote_ver=$(echo "${remote_resp}" | awk -F'|' '{print $1}' | jq -r '.version // "unknown"' 2>/dev/null || echo "unknown")
+        local remote_lat_ms
+        remote_lat_ms=$(awk "BEGIN {printf \"%.1f\", ${remote_lat:-0} * 1000}")
+        echo "  ${C_GREEN}[✓] Endpoint${C_RESET}      : Reachable via tunnel (v${remote_ver}, ${remote_lat_ms}ms latency)"
+        passed=$((passed + 1))
+
+        local remote_tags remote_models=0
+        remote_tags=$(curl -s --connect-timeout 2 -m 3 "${REMOTE_HOST_URL}/api/tags" 2>/dev/null || true)
+        remote_models=$(echo "${remote_tags}" | jq -r '.models | length // 0' 2>/dev/null || echo "0")
+        echo "  ${C_GREEN}[✓] Remote Catalog${C_RESET}: ${remote_models} model(s) installed"
+        passed=$((passed + 1))
+
+        local remote_ps remote_res_count=0
+        remote_ps=$(curl -s --connect-timeout 2 -m 3 "${REMOTE_HOST_URL}/api/ps" 2>/dev/null || true)
+        remote_res_count=$(echo "${remote_ps}" | jq -r '.models | length // 0' 2>/dev/null || echo "0")
+        if [[ "${remote_res_count}" -gt 0 ]]; then
+            local r_active_name
+            r_active_name=$(echo "${remote_ps}" | jq -r '.models[0].name // ""' 2>/dev/null)
+            echo "  ${C_CYAN}[●] Remote VRAM${C_RESET}   : ${remote_res_count} active model resident (${r_active_name})"
+        else
+            echo "  ${C_DIM}[○] Remote VRAM${C_RESET}   : Idle (0 active models resident)"
+        fi
+        passed=$((passed + 1))
+    else
+        echo "  ${C_YELLOW}[!] Endpoint${C_RESET}      : Unreachable at ${REMOTE_HOST_URL} (HTTP ${remote_code:-timeout})"
+        warnings=$((warnings + 1))
+        recs+=("Ensure remote server 192.168.1.131 is online and SSH tunnel is active")
+    fi
+
+    echo ""
+    # 5. External LLM CLI Hub Inventory
+    echo "${C_YELLOW}[5/5] External LLM CLI Hub Inventory:${C_RESET}"
+    local clis=("claude" "codex" "qwen" "grok" "kimi" "opencode" "agy" "openclaw" "hermes")
+    for c in "${clis[@]}"; do
+        local bin="${EXTERNAL_CLI_MAP[$c]:-$c}"
+        if command -v "${bin}" >/dev/null 2>&1; then
+            local c_ver
+            c_ver=$(_get_cli_version "${bin}")
+            local bin_path
+            bin_path=$(command -v "${bin}")
+            printf "  ${C_GREEN}[✓] %-14s${C_RESET}: Installed (v%s) at %s\n" "${c}" "${c_ver}" "${bin_path}"
+            passed=$((passed + 1))
+        else
+            printf "  ${C_DIM}[·] %-14s${C_RESET}: Not installed (install with: %s install %s)\n" "${c}" "${0##*/}" "${c}"
+        fi
+    done
+
+    echo ""
+    echo "====================================================================="
+    echo "${C_BOLD}Diagnostics Scorecard:${C_RESET}"
+    echo "  ${C_GREEN}[✓] Checks Passed : ${passed}${C_RESET}"
+    if [[ "${warnings}" -gt 0 ]]; then
+        echo "  ${C_YELLOW}[!] Warnings      : ${warnings}${C_RESET}"
+    fi
+    if [[ "${errors}" -gt 0 ]]; then
+        echo "  ${C_RED}[✗] Errors        : ${errors}${C_RESET}"
+    fi
+
+    if [[ ${#recs[@]} -gt 0 ]]; then
+        echo ""
+        echo "${C_YELLOW}Recommended Actions:${C_RESET}"
+        local idx=1
+        for r in "${recs[@]}"; do
+            echo "  ${idx}. ${r}"
+            idx=$((idx + 1))
+        done
+    else
+        echo ""
+        echo "${C_GREEN}[✓] All critical subsystems, daemons, and storage checks are in optimal health.${C_RESET}"
+    fi
+
+    if [[ "${errors}" -gt 0 ]]; then
+        return 1
+    fi
+    return 0
+}
+
+# -----------------------------------------------------------------------------
 # Main Dispatcher
 # -----------------------------------------------------------------------------
 # With several --host values, read-only/aggregate commands query every host;
@@ -3678,7 +4196,7 @@ cmd_update() {
 # first --host).
 if [[ "${HOST_MODE}" == "multi" ]]; then
     case "${COMMAND}" in
-        check|ping|hosts|ps|list|ls|search|find|stop|unload|info|show|status|health|status-report|report|logs|log|rotate-token|rotate|install|setup|update|upgrade|help|-h|--help) ;;
+        check|ping|hosts|ps|list|ls|search|find|stop|unload|info|show|status|health|status-report|report|logs|log|rotate-token|rotate|install|setup|update|upgrade|doctor|diagnose|diag|config|cfg|version|help|-h|--help) ;;
         *)
             _model="${ARGS[0]:-}"
             if [[ "${COMMAND}" == "launch" ]]; then
@@ -3768,6 +4286,15 @@ case "${COMMAND}" in
         ;;
     update|upgrade)
         cmd_update "${ARGS[@]}"
+        ;;
+    doctor|diagnose|diag)
+        cmd_doctor "${ARGS[@]}"
+        ;;
+    config|cfg)
+        cmd_config "${ARGS[@]}"
+        ;;
+    version)
+        echo "kimo v${KIMO_VERSION}"
         ;;
     help|-h|--help)
         usage

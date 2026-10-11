@@ -68,6 +68,7 @@ kimo [options] <command> [arguments...]
 | `--host <address>` | Target specific Ollama host address (can be repeated for multi-host) |
 | `--json` | Output responses in structured JSON format |
 | `--no-color` | Disable colored terminal output |
+| `-v, --version` | Show kimo version |
 | `-h, --help` | Show help and usage information |
 
 ---
@@ -77,6 +78,8 @@ kimo [options] <command> [arguments...]
 | Command | Description | Example |
 |---|---|---|
 | `check`, `ping` | Connectivity, latency, and health check for local and remote hosts | `kimo check` |
+| `doctor` | All-in-one health diagnostics (system, tunnel, daemons, CLIs) | `kimo doctor` |
+| `config [subcmd]` | View and manage persistent defaults in `~/.config/kimo/config` | `kimo config set default_host remote` |
 | `status`, `health` | Operational snapshot: tunnel, remote API, VRAM residency, timer | `kimo status` |
 | `hosts` | Detailed table of reachable servers, versions, models, disk GB | `kimo hosts` |
 | `list [filter]` | List all installed models across hosts, highlighting active VRAM | `kimo list nemotron` |
@@ -94,6 +97,64 @@ kimo [options] <command> [arguments...]
 | `launch <cli> [opts]`| Launch external CLI with automatic Ollama routing | `kimo launch grok --model 27b` |
 | `install [cli\|all]` | Install/update external CLIs (`kimi`, `claude`, `grok`, `codex`, `qwen`, etc.) | `kimo install kimi` |
 | `update [cli\|all]`  | Check for updates for all installed CLIs, or apply updates | `kimo update` |
+
+---
+
+## Health & Environment Diagnostics (`doctor`)
+
+`kimo doctor` inspects your host dependencies, Ollama daemons, network tunnels, storage stores, and external CLI agents, producing a consolidated health scorecard with remediation steps:
+
+```bash
+# Run comprehensive diagnostic suite
+kimo doctor
+```
+
+Checks performed:
+1. **System Tools**: `curl`, `jq`, `python3`, `python3-tomlkit`, `node/npm`, and `systemd`.
+2. **Configuration & Storage**: `~/.config/kimo/config`, `/var/lib/ollama/tunings.json`, and `/tmp` permissions.
+3. **Local Daemon**: Reachability, version, API latency, installed catalog count, and active VRAM residency.
+4. **Remote GPU & SSH Tunnel**: `ollama-remote-tunnel.service` state, tunnel endpoint latency, remote model catalog, and remote VRAM state.
+5. **CLI Ecosystem**: Installation status, versions, and paths for all 9 supported CLIs.
+
+---
+
+## Persistent Configuration (`config`)
+
+`kimo` supports persistent user configuration stored at `~/.config/kimo/config` (or `/etc/kimo/config`), eliminating the need to re-supply flags or export environment variables for common workflows:
+
+```bash
+# View active configuration values and their sources (file, env, default)
+kimo config
+
+# Route all commands to the remote server by default
+kimo config set default_host remote
+
+# Set default model used when launching CLIs or native runs
+kimo config set default_model kalidroid-27b:latest
+
+# Set default thinking effort for Kimi Code CLI
+kimo config set kimi_effort xhigh
+
+# Query a specific setting value
+kimo config get default_host
+
+# Remove a setting (revert to built-in default)
+kimo config unset default_host
+
+# Print the configuration file path
+kimo config path
+```
+
+### Supported Configuration Keys
+
+| Key | Description | Built-in Default |
+|---|---|---|
+| `default_host` | Default routing target (`local`, `remote`, or custom URL/address) | `auto (local+remote)` |
+| `default_model` | Fallback model name for agent CLI launches | `kalidroid-27b:latest` |
+| `remote_url` | Endpoint URL for the remote Ollama GPU host | `http://127.0.0.1:11438` |
+| `local_url` | Endpoint URL for the local Ollama daemon | `http://127.0.0.1:11434` |
+| `kimi_effort` | Default thinking effort for Kimi (`low`, `medium`, `high`, `xhigh`, `max`) | `default` |
+| `no_color` | Disable ANSI terminal color codes (`true`/`false`) | `false` |
 
 ---
 
