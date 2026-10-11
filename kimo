@@ -183,7 +183,7 @@ ${C_YELLOW}Model & VRAM Management:${C_RESET}
 ${C_YELLOW}External LLM CLI Hub:${C_RESET}
   ${C_CYAN}launch <cli> [opts...]${C_RESET}       Launch external agent CLI with automatic Ollama routing & shims
   ${C_CYAN}install [cli|all|list]${C_RESET}       Install or inspect external LLM CLIs (--update, --force, --list)
-  ${C_CYAN}update [cli|all]${C_RESET}             Check upstream updates across present CLIs (or --apply to upgrade)
+  ${C_CYAN}update [cli|all]${C_RESET}             Check installed CLIs (--check); apply only confirmed newer releases (--apply)
 
 ${C_YELLOW}Cluster & Remote Operations:${C_RESET}
   ${C_CYAN}check, ping${C_RESET}                  Probe connectivity, latency, and health across daemons & tunnels
@@ -4695,7 +4695,7 @@ _get_cli_version() {
     fi
     raw=$("${cmd}" --version 2>&1 | head -n 1) || raw=""
     [[ -z "${raw}" ]] && raw=$("${cmd}" -v 2>&1 | head -n 1) || true
-    ver=$(echo "${raw}" | grep -oE '[0-9]{4}\.[0-9]{2}\.[0-9]{2}(-[a-f0-9]+)?|[0-9]+\.[0-9]+(\.[0-9]+)?' | head -n 1) || ver=""
+    ver=$(echo "${raw}" | grep -oE '[0-9]+(\.[0-9]+)+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?' | head -n 1) || ver=""
     if [[ -n "${ver}" ]]; then
         echo "${ver}"
     elif [[ -n "${raw}" ]]; then
@@ -4736,20 +4736,98 @@ _gh_latest_version() {
         | jq -er '.tag_name | select(test("^v[0-9]+\\.[0-9]+\\.[0-9]+$")) | ltrimstr("v")'
 }
 
+_gh_check_destination() {
+    local dest="$1" require_existing="${2:-false}" dir="${1%/*}" parent="$1" output status cellar entry
+    case "${dest}" in
+        /*) ;;
+        *) echo "Error: GitHub CLI destination must be an absolute path: ${dest}." >&2; return 1 ;;
+    esac
+    case "${dest}" in
+        *'/../'*|*'/./'*|*'//'*) echo "Error: ambiguous GitHub CLI path: ${dest}." >&2; return 1 ;;
+        /bin/*|/sbin/*|/usr/bin/*|/usr/sbin/*|/nix/store/*|/gnu/store/*|/snap/*|/var/lib/flatpak/*|*/Cellar/*|*/Caskroom/*)
+            echo "Error: GitHub CLI is in a package-managed system store: ${dest}. Use its package manager." >&2; return 1 ;;
+    esac
+    while [[ "${parent}" != / ]]; do
+        if [[ -L "${parent}" ]]; then
+            echo "Error: refusing symlink in GitHub CLI destination path: ${parent}." >&2
+            return 1
+        fi
+        parent="${parent%/*}"
+        [[ -n "${parent}" ]] || parent=/
+    done
+    if [[ -e "${dest}" ]]; then
+        [[ -f "${dest}" && -x "${dest}" && -O "${dest}" && -w "${dest}" ]] || {
+            echo "Error: GitHub CLI must be a writable regular executable owned by the current user: ${dest}." >&2; return 1
+        }
+    elif [[ "${require_existing}" == true ]]; then
+        echo "Error: in-place GitHub CLI update requires an existing executable: ${dest}." >&2
+        return 1
+    fi
+    parent="${dir}"
+    while [[ ! -e "${parent}" ]]; do
+        parent="${parent%/*}"
+        [[ -n "${parent}" ]] || parent=/
+    done
+    [[ -d "${parent}" && -O "${parent}" && -w "${parent}" && -x "${parent}" ]] || {
+        echo "Error: GitHub CLI destination directory must be owned and writable by the current user: ${parent}. No sudo is used." >&2; return 1
+    }
+    if command -v dpkg-query >/dev/null 2>&1; then
+        status=0
+        output=$(LC_ALL=C dpkg-query -S "${dest}" 2>&1) || status=$?
+        if [[ "${status}" == 0 ]]; then
+            echo "Error: package-owned GitHub CLI at ${dest}; use its package manager." >&2; return 1
+        fi
+        [[ "${status}" == 1 && "${output}" == "dpkg-query: no path found matching pattern ${dest}" ]] || {
+            echo "Error: could not establish dpkg ownership of ${dest}; refusing replacement." >&2; return 1
+        }
+    fi
+    if command -v rpm >/dev/null 2>&1; then
+        status=0
+        output=$(LC_ALL=C rpm -qf "${dest}" 2>&1) || status=$?
+        [[ "${status}" != 0 ]] || {
+            echo "Error: package-owned GitHub CLI at ${dest}; use its package manager." >&2; return 1
+        }
+        [[ "${status}" == 1 && "${output}" == "file ${dest} is not owned by any package" ]] || {
+            echo "Error: could not establish RPM ownership of ${dest}; refusing replacement." >&2; return 1
+        }
+    fi
+    if command -v brew >/dev/null 2>&1; then
+        cellar=$(brew --cellar 2>/dev/null) && [[ "${cellar}" == /* ]] || {
+            echo "Error: could not locate Homebrew's store; refusing replacement." >&2; return 1
+        }
+        [[ "${dest}" != "${cellar}"/* ]] || {
+            echo "Error: GitHub CLI is in Homebrew's store; use brew upgrade gh." >&2; return 1
+        }
+        output=$(brew list --formula --verbose 2>/dev/null) || {
+            echo "Error: could not establish Homebrew ownership of ${dest}; refusing replacement." >&2; return 1
+        }
+        while IFS= read -r entry; do
+            if [[ "${entry}" == "${dest}" || ( "${entry}" == */ && "${dest}" == "${entry}"* ) ]]; then
+                echo "Error: Homebrew-owned GitHub CLI at ${dest}; use brew upgrade gh." >&2; return 1
+            fi
+        done <<< "${output}"
+    fi
+}
+
 _install_gh() (
-    local force="$1" update="$2" cur_bin dest dir os arch ext version asset base tmp expected actual staged
+    local force="$1" update="$2" cur_bin dest dir os arch ext version asset base tmp expected actual staged backup="" require_existing=false
     dir="${HOME}/.local/bin"
     dest="${dir}/gh"
-    cur_bin=$(command -v gh 2>/dev/null || true)
+    cur_bin=$(type -P gh 2>/dev/null || true)
     if [[ -n "${cur_bin}" && "${force}" != true && "${update}" != true ]]; then
         echo "GitHub CLI is already installed ($(_get_cli_version gh)) at ${cur_bin}."
         return 0
     fi
-    if [[ -n "${cur_bin}" && "${cur_bin}" != "${dest}" ]] || [[ -L "${HOME}/.local" || -L "${dir}" || -L "${dest}" ]] \
-        || { [[ -e "${dest}" ]] && [[ ! -f "${dest}" || ! -O "${dest}" ]]; }; then
-        echo "Error: refusing to replace or shadow GitHub CLI at ${cur_bin:-${dest}}. Use its package manager (e.g. brew upgrade gh or your Linux package manager); see https://cli.github.com/manual/installation." >&2
-        return 1
+    if [[ -n "${cur_bin}" && "${cur_bin}" != "${dest}" ]]; then
+        if [[ "${gh_allow_system_path:-false}" != true || "${update}" != true || " ${FUNCNAME[*]} " != *" cmd_update "* ]]; then
+            echo "Error: refusing to replace or shadow GitHub CLI at ${cur_bin}. For an owned standalone executable, use 'kimo update gh --allow-system-path'; package-managed gh must use its package manager (see https://cli.github.com/manual/installation)." >&2
+            return 1
+        fi
+        dest="${cur_bin}"
+        dir="${dest%/*}"
+        require_existing=true
     fi
+    _gh_check_destination "${dest}" "${require_existing}" || return 1
     case "$(uname -s)" in
         Linux) os=linux; ext=tar.gz ;;
         Darwin) os=macOS; ext=zip ;;
@@ -4791,7 +4869,7 @@ _install_gh() (
     if [[ "${ext}" == zip ]]; then
         unzip -q "${tmp}/${asset}" "gh_${version}_${os}_${arch}/bin/gh" -d "${tmp}" || return 1
     else
-        tar -xzf "${tmp}/${asset}" -C "${tmp}" "gh_${version}_${os}_${arch}/bin/gh" || return 1
+        tar --no-same-owner -xzf "${tmp}/${asset}" -C "${tmp}" "gh_${version}_${os}_${arch}/bin/gh" || return 1
     fi
     staged="${tmp}/gh_${version}_${os}_${arch}/bin/gh"
     [[ -f "${staged}" && ! -L "${staged}" ]] && chmod 755 "${staged}" || return 1
@@ -4799,8 +4877,29 @@ _install_gh() (
     [[ "${actual}" == "gh version ${version} "* || "${actual}" == "gh version ${version}" ]] || {
         echo "Error: staged GitHub CLI version does not match release." >&2; return 1
     }
-    [[ ! -L "${dest}" && ! -d "${dest}" ]] && mv -f "${staged}" "${dest}" || return 1
+    _gh_check_destination "${dest}" "${require_existing}" || return 1
+    if [[ -e "${dest}" ]]; then
+        backup=$(mktemp "${dir}/.gh-backup.XXXXXXXX") || return 1
+        cp -p "${dest}" "${backup}" || {
+            echo "Error: GitHub CLI backup failed at ${backup}; existing binary preserved." >&2; return 1
+        }
+    fi
+    [[ ! -L "${dest}" && ! -d "${dest}" ]] && mv -f "${staged}" "${dest}" || {
+        echo "Error: GitHub CLI replacement failed; backup: ${backup:-none}." >&2; return 1
+    }
+    if ! actual=$("${dest}" --version) || [[ "${actual}" != "gh version ${version} "* && "${actual}" != "gh version ${version}" ]]; then
+        echo "Error: installed GitHub CLI failed version verification at ${dest}." >&2
+        if [[ -n "${backup}" ]]; then
+            if mv -f "${backup}" "${dest}"; then
+                echo "Restored original GitHub CLI atomically at ${dest}." >&2
+            else
+                echo "Error: rollback failed; original GitHub CLI backup remains at ${backup}." >&2
+            fi
+        fi
+        return 1
+    fi
     echo "Installed GitHub CLI ${version} at ${dest}."
+    [[ -z "${backup}" ]] || echo "Original GitHub CLI backup retained at ${backup}."
     if [[ ":${PATH}:" != *":${dir}:"* ]]; then
         echo "Add ${dir} to PATH to use gh."
     fi
@@ -5321,34 +5420,46 @@ _agy_latest_version() {
         | grep -oE '[0-9][0-9A-Za-z._-]*' | head -n 1 || true
 }
 
+_bounded_update_lookup() {
+    python3 - "$@" <<'PY'
+import subprocess, sys
+try:
+    result = subprocess.run(sys.argv[1:], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                            text=True, timeout=10, check=True)
+    print(result.stdout.strip())
+except (OSError, subprocess.SubprocessError, UnicodeError):
+    sys.exit(1)
+PY
+}
+
 _get_cli_latest_version() {
     local cmd="$1"
     local latest=""
     case "${cmd}" in
         gh) latest=$(_gh_latest_version 2>/dev/null || true) ;;
         claude)
-            latest=$(npm view @anthropic-ai/claude-code version 2>/dev/null || true)
+            latest=$(_bounded_update_lookup npm view @anthropic-ai/claude-code version 2>/dev/null || true)
             ;;
         codex)
-            latest=$(npm view @openai/codex version 2>/dev/null || npm view codex version 2>/dev/null || true)
+            latest=$(_bounded_update_lookup npm view @openai/codex version 2>/dev/null || _bounded_update_lookup npm view codex version 2>/dev/null || true)
             ;;
         qwen)
-            latest=$(npm view @qwen-code/qwen-code version 2>/dev/null || true)
+            latest=$(_bounded_update_lookup npm view @qwen-code/qwen-code version 2>/dev/null || true)
             ;;
         grok)
-            latest=$(grok update --check 2>&1 | grep -oE 'latest: [0-9.]+' | awk '{print $2}' || true)
+            latest=$(_bounded_update_lookup grok update --check 2>/dev/null | grep -oE 'latest: [0-9A-Za-z.+-]+' | awk '{print $2}' || true)
             ;;
         kimi)
             latest=$(curl -fsSL --connect-timeout 2 -m 4 https://code.kimi.com/kimi-code/latest 2>/dev/null | tr -d ' \r\n' || true)
             ;;
         opencode)
-            latest=$(npm view opencode-ai version 2>/dev/null || true)
+            latest=$(_bounded_update_lookup npm view opencode-ai version 2>/dev/null || true)
             ;;
         openclaw)
-            latest=$(npm view openclaw version 2>/dev/null || true)
+            latest=$(_bounded_update_lookup npm view openclaw version 2>/dev/null || true)
             ;;
         hermes)
-            latest=$(npm view hermes-agent version 2>/dev/null || true)
+            latest=$(_bounded_update_lookup npm view hermes-agent version 2>/dev/null || true)
             ;;
         agy)
             # Version feed: the release manifest served alongside the official
@@ -5365,89 +5476,109 @@ _get_cli_latest_version() {
     echo "${latest:-}"
 }
 
-_check_updates_for_present_clis() {
-    echo "${C_BOLD}CHECKING FOR UPDATES (PRESENT CLIs):${C_RESET}"
-    local fmt="  %-12s %-16s %-16s %s"
-    printf "${C_CYAN}${fmt}${C_RESET}\n" "CLI" "CURRENT" "LATEST" "STATUS"
-    echo "  --------------------------------------------------------------------------------------"
-
-    local clis=("claude" "codex" "qwen" "grok" "kimi" "cursor" "opencode" "cyberstrike" "agy" "openclaw" "hermes" "gh")
-    local present_count=0
-    local updates_available=()
-
-    for c in "${clis[@]}"; do
-        local bin="${EXTERNAL_CLI_MAP[$c]:-$c}"
-        if ! command -v "${bin}" >/dev/null 2>&1; then
-            continue
-        fi
-        present_count=$((present_count + 1))
-        local cur_ver latest_ver status_str
-        cur_ver=$(_get_cli_version "${bin}")
-        latest_ver=$(_get_cli_latest_version "${c}")
-
-        if [[ -n "${latest_ver}" && "${latest_ver}" != "unknown" && "${latest_ver}" != "-" ]]; then
-            if [[ "${cur_ver}" == "${latest_ver}" ]]; then
-                status_str="${C_GREEN}● Up to date${C_RESET}"
-            else
-                status_str="${C_YELLOW}▲ Update available${C_RESET} (${C_YELLOW}${cur_ver}${C_RESET} -> ${C_GREEN}${latest_ver}${C_RESET})"
-                updates_available+=("${c}")
-            fi
-        else
-            status_str="${C_DIM}● Installed (${cur_ver})${C_RESET}"
-            latest_ver="-"
-        fi
-        printf "  %-12s %-16s %-16s %b\n" "${c}" "${cur_ver}" "${latest_ver}" "${status_str}"
-    done
-
-    if ((present_count == 0)); then
-        echo "  ${C_DIM}No external CLIs currently installed in PATH.${C_RESET}"
-        echo ""
-        echo "  Install any CLI with: ${0##*/} install <name>"
-        return 0
-    fi
-
-    echo ""
-    if [[ ${#updates_available[@]} -gt 0 ]]; then
-        echo "${C_YELLOW}[!] Updates available for ${#updates_available[@]} CLI(s): ${updates_available[*]}${C_RESET}"
-        echo "    To apply updates:  ${0##*/} update <name>"
-        echo "    To update all:     ${0##*/} update --apply (or ${0##*/} update all)"
-    else
-        echo "${C_GREEN}[✓] All installed CLIs are up to date.${C_RESET}"
-    fi
+_compare_cli_versions() {
+    python3 - "$1" "$2" "$3" <<'PY'
+import datetime, re, sys
+cli, current, latest = sys.argv[1:]
+def parse(value):
+    m = re.fullmatch(r'(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:\.(0|[1-9][0-9]*))?(?:-([0-9A-Za-z.-]+))?(?:\+([0-9A-Za-z.-]+))?', value)
+    if not m:
+        raise ValueError()
+    major, minor, patch, pre, build = m.groups()
+    for suffix in (pre, build):
+        if suffix is not None and any(not part for part in suffix.split('.')):
+            raise ValueError()
+    parts = []
+    if pre is not None:
+        for part in pre.split('.'):
+            if part.isdigit():
+                if len(part) > 1 and part.startswith('0'):
+                    raise ValueError()
+                parts.append((0, int(part)))
+            else:
+                parts.append((1, part))
+    return (int(major), int(minor), int(patch or 0)), pre is None, parts
+try:
+    if cli == 'cursor':
+        pattern = r'(\d{4})\.(\d{2})\.(\d{2})(?:-([0-9A-Za-z.-]+))?'
+        a, b = re.fullmatch(pattern, current), re.fullmatch(pattern, latest)
+        if not a or not b:
+            raise ValueError()
+        x, y = [datetime.date(*map(int, m.groups()[:3])) for m in (a, b)]
+        if x == y and current != latest:
+            raise ValueError()
+    else:
+        x, y = parse(current), parse(latest)
+    print('update available' if x < y else 'ahead' if x > y else 'up to date')
+except ValueError:
+    print('lookup failed/unknown')
+PY
 }
 
-_update_all_present() {
-    echo "${C_BOLD}Updating All Present External CLIs...${C_RESET}"
-    echo "====================================================================="
-    local clis=("claude" "codex" "qwen" "grok" "kimi" "cursor" "opencode" "cyberstrike" "agy" "openclaw" "hermes" "gh")
-    local updated_count=0
-    local failed=()
-
-    for c in "${clis[@]}"; do
-        local bin="${EXTERNAL_CLI_MAP[$c]:-$c}"
-        if ! command -v "${bin}" >/dev/null 2>&1; then
-            continue
-        fi
-        updated_count=$((updated_count + 1))
-        echo ""
-        if ! _install_single_cli "${c}" false true; then
-            failed+=("${c}")
-        fi
-    done
-
-    echo ""
-    echo "====================================================================="
-    if ((updated_count == 0)); then
-        echo "${C_DIM}No external CLIs found to update.${C_RESET}"
-        return 0
-    fi
-    if [[ ${#failed[@]} -eq 0 ]]; then
-        echo "${C_GREEN}[✓] All present CLIs updated successfully.${C_RESET}"
-    else
-        echo "${C_YELLOW}[!] Finished with errors for: ${failed[*]}${C_RESET}"
+_update_cli_binary() {
+    local cli="$1" bin
+    if [[ "${cli}" == cursor ]]; then
+        for bin in cursor cursor-agent agent; do
+            if command -v "${bin}" >/dev/null 2>&1; then echo "${bin}"; return 0; fi
+        done
         return 1
     fi
+    bin="${EXTERNAL_CLI_MAP[$cli]:-$cli}"
+    command -v "${bin}" >/dev/null 2>&1 || return 1
+    echo "${bin}"
 }
+
+_process_present_cli_updates() {
+    local apply="$1" target="${2:-all}"
+    local clis=(claude codex qwen grok kimi cursor opencode cyberstrike agy openclaw hermes gh)
+    [[ "${target}" != all ]] && clis=("${target}")
+    local c bin current latest state after
+    local present=0 available=0 skipped=0 unknown=0 attempts=0 verified=0 failures=0
+    printf '  %-12s %-24s %-24s %s\n' CLI CURRENT LATEST STATUS
+    for c in "${clis[@]}"; do
+        if ! bin=$(_update_cli_binary "${c}"); then
+            if [[ "${target}" != all ]]; then
+                echo "${c} is not installed; use '${0##*/} install ${c}'." >&2
+                return 1
+            fi
+            continue
+        fi
+        present=$((present + 1))
+        current=$(_get_cli_version "${bin}")
+        latest=$(_get_cli_latest_version "${c}")
+        state=$(_compare_cli_versions "${c}" "${current}" "${latest}")
+        state="${state:-lookup failed/unknown}"
+        printf '  %-12s %-24s %-24s %s\n' "${c}" "${current}" "${latest:--}" "${state}"
+        if [[ "${state}" != 'update available' ]]; then
+            skipped=$((skipped + 1))
+            [[ "${state}" == 'lookup failed/unknown' ]] && unknown=$((unknown + 1))
+            continue
+        fi
+        available=$((available + 1))
+        [[ "${apply}" == true ]] || continue
+        attempts=$((attempts + 1))
+        if _install_single_cli "${c}" false true; then
+            after=$(_get_cli_version "${bin}")
+            if [[ "$(_compare_cli_versions "${c}" "${current}" "${after}")" == 'update available' ]]; then
+                verified=$((verified + 1))
+                echo "${c}: verified upgrade ${current} -> ${after}"
+                continue
+            fi
+            echo "${c}: updater exited successfully, but upgrade could not be verified." >&2
+        else
+            echo "${c}: update failed." >&2
+        fi
+        failures=$((failures + 1))
+    done
+    echo "Summary: ${present} present, ${available} available, ${skipped} skipped (${unknown} unknown), ${attempts} attempted, ${verified} verified, ${failures} failed."
+    if ((present == 0)); then
+        echo "No external CLIs currently installed in PATH; use '${0##*/} install <name>'."
+    fi
+    ((failures == 0))
+}
+
+_check_updates_for_present_clis() { _process_present_cli_updates false "${1:-all}"; }
+_update_all_present() { _process_present_cli_updates true "${1:-all}"; }
 
 update_usage() {
     cat <<EOF
@@ -5458,58 +5589,79 @@ ${C_YELLOW}Usage:${C_RESET}
 
 ${C_YELLOW}Arguments:${C_RESET}
   ${C_CYAN}[none]${C_RESET}       Check for updates across only the CLIs currently installed (read-only audit)
-  ${C_CYAN}<cli>${C_RESET}        Update a specific installed CLI to its latest upstream release
-  ${C_CYAN}all${C_RESET}          Update all installed CLIs to their latest versions
+  ${C_CYAN}<cli>${C_RESET}        Apply a confirmed newer release to an installed CLI
+  ${C_CYAN}all${C_RESET}          Apply only confirmed newer releases to installed CLIs
+  Equal, locally newer, and unknown versions are skipped; missing CLIs require install.
 
 ${C_YELLOW}Options:${C_RESET}
   ${C_CYAN}-y, --apply${C_RESET}   Apply available updates to all installed CLIs
   ${C_CYAN}-c, --check${C_RESET}   Check for updates without installing (default behavior when no CLI is specified)
+  ${C_CYAN}--allow-system-path${C_RESET}  Only with named gh: update an owned standalone PATH executable in place
   ${C_CYAN}-h, --help${C_RESET}    Show this help message
+  GitHub CLI rejects package-owned files, symlinks (including parents), and unowned/unwritable directories.
+  No sudo or shadowing; keeps a backup and rolls back if installed-version verification fails.
 
 ${C_YELLOW}Examples:${C_RESET}
   ${0##*/} update             # Check updates for all present CLIs
-  ${0##*/} update qwen        # Update only Qwen Code CLI
+  ${0##*/} update qwen --check # Read-only check of one CLI (flags may precede target)
+  ${0##*/} update all --check  # Read-only check; cannot combine --check and --apply
+  ${0##*/} update qwen        # Update only Qwen Code CLI when confirmed newer
   ${0##*/} update agy         # Update Antigravity CLI with its native updater
   ${0##*/} update gh          # Update user-local GitHub CLI; package-managed gh must use its package manager
+  ${0##*/} update gh --allow-system-path # Opt in to standalone /usr/local/bin/gh (when owned/writable)
+  ${0##*/} update gh --allow-system-path --check # Read-only eligibility and release check
   ${0##*/} update --apply     # Update all installed CLIs with available updates
 EOF
 }
 
 cmd_update() {
     local target=""
-    local opt_apply=false
-
+    local opt_apply=false opt_check=false gh_allow_system_path=false
     while [[ $# -gt 0 ]]; do
         case "$1" in
             -h|--help|help) update_usage; return 0 ;;
-            --apply|-y|--yes) opt_apply=true; shift ;;
-            --check|-c) opt_apply=false; shift ;;
+            --apply|-y|--yes) opt_apply=true ;;
+            --check|-c|check) opt_check=true ;;
+            --allow-system-path) gh_allow_system_path=true ;;
+            -*) echo "Error: unknown update option: $1" >&2; return 1 ;;
             *)
-                if [[ -z "${target}" ]]; then
-                    target="$1"
-                fi
-                shift
+                [[ -z "${target}" ]] || { echo "Error: only one update target is allowed." >&2; return 1; }
+                target="$1"
                 ;;
         esac
+        shift
     done
-
-    # If a specific CLI or 'all' is passed (without --check), perform the update
-    if [[ -n "${target}" && "${target}" != "check" && "${target}" != "--check" ]]; then
-        if [[ "${target}" == "all" ]]; then
-            _update_all_present
-            return 0
+    if ${opt_check} && ${opt_apply}; then
+        echo "Error: --check and --apply cannot be combined." >&2
+        return 1
+    fi
+    case "${target}" in
+        kimi-code) target=kimi ;; claude-code) target=claude ;;
+        grok-cli) target=grok ;; qwen-code) target=qwen ;;
+        antigravity) target=agy ;; cursor-agent|agent) target=cursor ;;
+    esac
+    case "${target}" in
+        ''|all|claude|codex|qwen|grok|kimi|cursor|opencode|cyberstrike|agy|openclaw|hermes|gh) ;;
+        *) echo "Error: unsupported update target: ${target}" >&2; return 1 ;;
+    esac
+    if ${gh_allow_system_path}; then
+        [[ "${target}" == gh ]] || {
+            echo "Error: --allow-system-path is only valid for the named 'update gh' target, not batch updates." >&2; return 1
+        }
+        local gh_path
+        gh_path=$(type -P gh 2>/dev/null) || {
+            echo "Error: --allow-system-path requires an existing GitHub CLI in PATH." >&2; return 1
+        }
+        _gh_check_destination "${gh_path}" true || return 1
+        if ${opt_check}; then
+            echo "GitHub CLI at ${gh_path} is eligible for an in-place update (--check: no files changed)."
         fi
-        _install_single_cli "${target}" false true
-        return $?
     fi
-
-    if ${opt_apply}; then
-        _update_all_present
-        return 0
+    if ${opt_check} || { [[ -z "${target}" ]] && ! ${opt_apply}; }; then
+        _check_updates_for_present_clis "${target:-all}"
+    else
+        _update_all_present "${target:-all}"
     fi
-
-    # "kimo update" only: Check for updates for all CLIs present
-    _check_updates_for_present_clis
 }
 
 # -----------------------------------------------------------------------------
@@ -6053,7 +6205,7 @@ _kimo() {
             ;;
         update|upgrade)
             if [[ "${cur}" == -* ]]; then
-                COMPREPLY=( $(compgen -W "--apply -h --help" -- "${cur}") )
+                COMPREPLY=( $(compgen -W "--apply --check --allow-system-path -h --help" -- "${cur}") )
             else
                 COMPREPLY=( $(compgen -W "${supported_clis} gh all" -- "${cur}") )
             fi
@@ -6218,12 +6370,19 @@ _kimo() {
             ;;
         args)
             case $words[1] in
-                launch|install|setup|update|upgrade)
+                update|upgrade)
+                    _arguments \
+                        '(-y --apply)'{-y,--apply}'[Apply available updates]' \
+                        '(-c --check)'{-c,--check}'[Check without installing]' \
+                        '--allow-system-path[Named gh only: update owned standalone executable in place]' \
+                        '(-h --help)'{-h,--help}'[Show help]' \
+                        '1:CLI:(claude grok kimi agy codex qwen cursor opencode cyberstrike openclaw hermes gh all)' && return 0
+                    ;;
+                launch|install|setup)
                     local -a clis
                     clis=(claude grok kimi agy codex qwen cursor opencode cyberstrike openclaw hermes)
                     case $words[1] in
                         install|setup) clis+=(gh all list) ;;
-                        update|upgrade) clis+=(gh all) ;;
                     esac
                     _describe -t clis 'supported CLIs' clis
                     ;;

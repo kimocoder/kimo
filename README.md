@@ -185,7 +185,9 @@ kimo config path
 
 Use `kimo install gh` for a fresh installation and `kimo update gh` (or `kimo install gh --update`) to update. GitHub CLI uses the latest official `cli/cli` release: Linux tar archives (amd64, arm64, 386, armv6) or macOS ZIP archives (amd64, arm64). Downloads are SHA-256 checked against the official release checksums, and the staged executable's version is verified before atomic replacement in `~/.local/bin/gh`. Add `~/.local/bin` to your shell's PATH if needed.
 
-Updates and `--force` only replace an owned regular file at that user-local path. System/package-manager installations and symlinks are refused without sudo or silent shadowing; update those with their package manager (for example `brew upgrade gh`) or follow the [official installation guide](https://cli.github.com/manual/installation). Failures preserve the existing binary. `gh` appears in inventory, doctor, batch installation/updating and update checks, but has no Ollama model or `launch` integration.
+By default, updates and `--force` only replace an owned regular executable at that user-local path. For an existing standalone executable elsewhere in PATH, such as `/usr/local/bin/gh`, explicitly opt in with `kimo update gh --allow-system-path`. This flag is valid only for the named `gh` update (not `install`, other CLIs, or batches); adding `--check` reports eligibility and release status without writing files. A root-owned `/usr/local/bin/gh` is eligible when the current user is already root; kimo never invokes sudo.
+
+Both paths require a writable regular executable and destination directory owned by the current user, with no symlinks anywhere in the destination path. Package-owned files, known package-manager stores, and failed ownership queries are refused; available `dpkg-query`, `rpm`, and `brew` are checked. Use the owning package manager (for example `brew upgrade gh`) or follow the [official installation guide](https://cli.github.com/manual/installation) for managed installations. No silent shadowing occurs. Replacement uses a unique attribute-preserving backup in the destination directory and a same-filesystem atomic rename. The installed absolute path's version is verified; a failed verification atomically restores the backup. Successful updates keep and report the backup path. `gh` appears in inventory, doctor, batch installation/updating and update checks, but has no Ollama model or `launch` integration.
 
 ```bash
 # Display installed CLI inventory, versions, and paths
@@ -210,19 +212,28 @@ kimo install all
 
 ### Checking for Updates Across Present CLIs
 
-Running `kimo update` without arguments inspects only the CLIs currently installed on your system, querying upstream registries and release channels to report whether updates are available:
+Running `kimo update` without arguments inspects only installed CLIs. Checks report **up to date**, **update available**, **ahead**, or **lookup failed/unknown**. Named and batch updates apply only confirmed newer releases; equal, locally newer, unreadable, and incompatible versions are skipped. Missing CLIs require `kimo install <name>`.
+
+Numeric versions use semantic prerelease ordering and ignore build metadata. Cursor releases use valid dates; different opaque suffixes on the same date are unknown. Metadata checks are bounded, and failed lookups do not stop the batch. Apply summaries distinguish available releases, skips, attempts, verified upgrades, and failures; updater errors or an unverifiable installed-version change return nonzero.
 
 ```bash
 # Check for updates across all installed CLIs (read-only audit)
 kimo update
+kimo update all --check
 
-# Update a specific installed CLI
+# Check one CLI without installing; flag order does not matter
+kimo update qwen --check
+kimo update --check qwen
+
+# Update a specific installed CLI only when a newer release is confirmed
 kimo update qwen
 kimo update agy         # Uses agy's native self-updater (also: kimo install agy --update)
 
 # Apply all available updates for currently installed CLIs
 kimo update --apply     # or: kimo update all
 ```
+
+`--check` and `--apply` cannot be combined. Unknown options and multiple targets are rejected.
 
 ---
 
