@@ -92,6 +92,47 @@ kimo [options] <command> [arguments...]
 | `stream <model>` | Pin model for durable availability via keepalive daemon | `kimo stream model --status` |
 | `run <model> [args]`| Run model directly with auto-routing to remote GPU | `kimo run kalidroid-27b` |
 | `launch <cli> [opts]`| Launch external CLI with automatic Ollama routing | `kimo launch grok --model 27b` |
+| `install [cli\|all]` | Install/update external CLIs (`kimi`, `claude`, `grok`, `codex`, `qwen`, etc.) | `kimo install kimi` |
+| `update [cli\|all]`  | Check for updates for all installed CLIs, or apply updates | `kimo update` |
+
+---
+
+## CLI Package Manager (`install` & `update`)
+
+`kimo` provides automated installation, updating, and health inspection for supported external LLM CLIs:
+
+```bash
+# Display installed CLI inventory, versions, and paths
+kimo install
+
+# Install specific CLIs
+kimo install kimi       # Installs Kimi Code CLI (code.kimi.com)
+kimo install claude     # Installs Claude Code CLI (claude.ai)
+kimo install grok       # Installs Grok Build CLI (x.ai)
+kimo install codex      # Installs Codex CLI (npm)
+kimo install qwen       # Installs Qwen Code CLI (npm)
+kimo install opencode   # Installs OpenCode CLI
+kimo install openclaw   # Installs OpenClaw CLI
+kimo install hermes     # Installs Hermes Agent CLI
+
+# Install or update all supported CLIs at once
+kimo install all
+```
+
+### Checking for Updates Across Present CLIs
+
+Running `kimo update` without arguments inspects only the CLIs currently installed on your system, querying upstream registries and release channels to report whether updates are available:
+
+```bash
+# Check for updates across all installed CLIs (read-only audit)
+kimo update
+
+# Update a specific installed CLI
+kimo update qwen
+
+# Apply all available updates for currently installed CLIs
+kimo update --apply     # or: kimo update all
+```
 
 ---
 

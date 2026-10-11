@@ -52,23 +52,17 @@ declare -A EXTERNAL_CLI_MAP=(
     ["kimi"]="kimi"
 )
 
-# grok installs into ~/.grok/bin and reaches PATH only through ~/.bashrc, which a
-# non-interactive caller (cron, systemd, Apache, sh -c) never sources. Without
-# this the 'command -v' gate in cmd_launch misses the binary and silently
-# degrades to 'ollama run' instead of launching grok.
+# grok, kimi, opencode, etc. install into user directories that reach PATH only
+# through ~/.bashrc, which a non-interactive caller (cron, systemd, Apache, sh -c)
+# never sources. Ensure all CLI binary directories are present in PATH.
 GROK_BIN_DIR="${GROK_BIN_DIR:-${HOME:-/root}/.grok/bin}"
-if [[ -x "${GROK_BIN_DIR}/grok" && ":${PATH}:" != *":${GROK_BIN_DIR}:"* ]]; then
-    PATH="${GROK_BIN_DIR}:${PATH}"
-    export PATH
-fi
-
-# kimi (Kimi Code CLI) installs into ~/.kimi-code/bin; same non-interactive PATH
-# hazard as grok, so the 'command -v' gate in cmd_launch can find it everywhere.
 KIMI_BIN_DIR="${KIMI_BIN_DIR:-${HOME:-/root}/.kimi-code/bin}"
-if [[ -x "${KIMI_BIN_DIR}/kimi" && ":${PATH}:" != *":${KIMI_BIN_DIR}:"* ]]; then
-    PATH="${KIMI_BIN_DIR}:${PATH}"
-    export PATH
-fi
+for _dir in "${GROK_BIN_DIR}" "${KIMI_BIN_DIR}" "${HOME:-/root}/.local/bin" "${HOME:-/root}/.opencode/bin" "${HOME:-/root}/.cargo/bin" "${HOME:-/root}/.npm-global/bin" "/usr/local/bin"; do
+    if [[ -d "${_dir}" && ":${PATH}:" != *":${_dir}:"* ]]; then
+        PATH="${_dir}:${PATH}"
+    fi
+done
+export PATH
 
 # Terminal color initialization
 setup_colors() {
@@ -165,7 +159,20 @@ ${C_YELLOW}Commands:${C_RESET}
                            channel: zero footprint, but /effort is limited to on/off and the
                            graded effort must be set at launch via KIMO_KIMI_EFFORT=xhigh (or OM_KIMI_EFFORT).
 
+  ${C_CYAN}install [cli|all|list]${C_RESET} Install external LLM CLIs (claude, kimi, grok, codex, qwen, opencode, openclaw, hermes).
+                           Without arguments, displays the external CLI inventory and installation status.
+                           Supports --update / -u to upgrade and --force / -f to reinstall.
+  ${C_CYAN}update [cli|all]${C_RESET}       Check for updates for all installed CLIs (when called without arguments).
+                           Specify a CLI name to update that CLI (e.g. ${0##*/} update kimi).
+                           Use --apply or 'all' to update all installed CLIs.
+
 ${C_YELLOW}Examples:${C_RESET}
+  ${0##*/} install
+  ${0##*/} install kimi
+  ${0##*/} install all
+  ${0##*/} update
+  ${0##*/} update kimi
+  ${0##*/} update all
   ${0##*/} check
   ${0##*/} status
   ${0##*/} list nemotron
@@ -3073,12 +3080,524 @@ cmd_launch() {
         esac
     elif [[ -n "${cli_cmd}" ]]; then
         echo "${C_YELLOW}[!] External CLI '${cli_cmd}' not found in PATH.${C_RESET}"
+        echo "${C_DIM}    Tip: Install it with: ${0##*/} install ${provider}${C_RESET}"
         echo "${C_CYAN}[*] Falling back to native 'ollama run ${resolved_model}'...${C_RESET}"
         exec ollama run "${resolved_model}" "${cli_passthrough_args[@]}"
     else
         echo "${C_CYAN}[*] Executing provider '${provider}' via 'ollama run ${resolved_model}'...${C_RESET}"
         exec ollama run "${resolved_model}" "${cli_passthrough_args[@]}"
     fi
+}
+
+# -----------------------------------------------------------------------------
+# Command: install / setup (External CLI Package Manager)
+# -----------------------------------------------------------------------------
+_get_cli_version() {
+    local cmd="$1"
+    local raw ver=""
+    if ! command -v "${cmd}" >/dev/null 2>&1; then
+        echo "-"
+        return
+    fi
+    raw=$("${cmd}" --version 2>&1 | head -n 1) || raw=""
+    ver=$(echo "${raw}" | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' | head -n 1) || ver=""
+    if [[ -n "${ver}" ]]; then
+        echo "${ver}"
+    elif [[ -n "${raw}" ]]; then
+        echo "${raw:0:15}"
+    else
+        echo "unknown"
+    fi
+}
+
+_install_list_status() {
+    echo "${C_BOLD}EXTERNAL LLM CLI INVENTORY & STATUS:${C_RESET}"
+    local fmt="  %-12s %-20s %-14s %-32s %s"
+    printf "${C_CYAN}${fmt}${C_RESET}\n" "CLI" "STATUS" "VERSION" "BINARY PATH" "DEFAULT MODEL"
+    echo "  ------------------------------------------------------------------------------------------------------"
+    local clis=("claude" "codex" "qwen" "grok" "kimi" "opencode" "agy" "openclaw" "hermes")
+    for c in "${clis[@]}"; do
+        local bin="${EXTERNAL_CLI_MAP[$c]:-$c}"
+        local dmodel="${DEFAULT_MODELS[$c]:-n/a}"
+        local bin_path=""
+        bin_path=$(command -v "${bin}" 2>/dev/null || true)
+        local status_badge ver
+        if [[ -n "${bin_path}" ]]; then
+            ver=$(_get_cli_version "${bin}")
+            status_badge="${C_GREEN}● INSTALLED${C_RESET}"
+            printf "  %-12s %-29s %-14s %-32s %s\n" "${c}" "${status_badge}" "${ver}" "${bin_path}" "${dmodel}"
+        else
+            status_badge="${C_RED}○ MISSING${C_RESET}"
+            printf "  %-12s %-29s %-14s %-32s %s\n" "${c}" "${status_badge}" "-" "-" "${dmodel}"
+        fi
+    done
+    echo ""
+    echo "${C_DIM}Install or update any CLI with: ${0##*/} install <name> [--update|--force]${C_RESET}"
+    echo "${C_DIM}Install all supported CLIs with: ${0##*/} install all${C_RESET}"
+}
+
+_install_single_cli() {
+    local cli="$1"
+    local force="${2:-false}"
+    local update="${3:-false}"
+
+    case "${cli}" in
+        kimi-code) cli="kimi" ;;
+        claude-code) cli="claude" ;;
+        grok-cli) cli="grok" ;;
+        qwen-code) cli="qwen" ;;
+        antigravity) cli="agy" ;;
+    esac
+
+    case "${cli}" in
+        kimi)
+            local cur_bin
+            cur_bin=$(command -v kimi 2>/dev/null || true)
+            if [[ -n "${cur_bin}" && "${force}" != "true" && "${update}" != "true" ]]; then
+                local ver
+                ver=$(_get_cli_version kimi)
+                echo "${C_GREEN}[✓] Kimi Code CLI is already installed (${ver}) at ${cur_bin}.${C_RESET}"
+                echo "${C_DIM}    Run '${0##*/} install kimi --update' to update to latest version.${C_RESET}"
+                return 0
+            fi
+            echo "${C_CYAN}[*] Installing Kimi Code CLI (via code.kimi.com)...${C_RESET}"
+            if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
+                echo "${C_RED}Error: curl or wget is required to install Kimi Code CLI.${C_RESET}" >&2
+                return 1
+            fi
+            curl -fsSL https://code.kimi.com/kimi-code/install.sh | bash
+            local kimi_path="${HOME:-/root}/.kimi-code/bin"
+            [[ -d "${kimi_path}" && ":${PATH}:" != *":${kimi_path}:"* ]] && export PATH="${kimi_path}:${PATH}"
+            if command -v kimi >/dev/null 2>&1; then
+                local new_ver
+                new_ver=$(_get_cli_version kimi)
+                echo "${C_GREEN}[✓] Successfully installed Kimi Code CLI (${new_ver})!${C_RESET}"
+                echo "${C_CYAN}[*] Launch anytime with: ${0##*/} launch kimi${C_RESET}"
+            else
+                echo "${C_RED}[!] Installation completed but 'kimi' binary was not found in PATH.${C_RESET}" >&2
+                return 1
+            fi
+            ;;
+        claude)
+            local cur_bin
+            cur_bin=$(command -v claude 2>/dev/null || true)
+            if [[ -n "${cur_bin}" && "${force}" != "true" && "${update}" != "true" ]]; then
+                local ver
+                ver=$(_get_cli_version claude)
+                echo "${C_GREEN}[✓] Claude Code CLI is already installed (${ver}) at ${cur_bin}.${C_RESET}"
+                echo "${C_DIM}    Run '${0##*/} install claude --update' to update to latest version.${C_RESET}"
+                return 0
+            fi
+            echo "${C_CYAN}[*] Installing Claude Code CLI (via claude.ai/install.sh)...${C_RESET}"
+            local installed=false
+            if command -v curl >/dev/null 2>&1; then
+                CLAUDE_INSTALL_ALLOW_SUDO=1 curl -fsSL https://claude.ai/install.sh | bash && installed=true
+            fi
+            if ! ${installed} && command -v npm >/dev/null 2>&1; then
+                echo "${C_YELLOW}[*] Falling back to npm for @anthropic-ai/claude-code...${C_RESET}"
+                npm install -g @anthropic-ai/claude-code && installed=true
+            fi
+            local lbin="${HOME:-/root}/.local/bin"
+            [[ -d "${lbin}" && ":${PATH}:" != *":${lbin}:"* ]] && export PATH="${lbin}:${PATH}"
+            if command -v claude >/dev/null 2>&1; then
+                local new_ver
+                new_ver=$(_get_cli_version claude)
+                echo "${C_GREEN}[✓] Successfully installed Claude Code CLI (${new_ver})!${C_RESET}"
+                echo "${C_CYAN}[*] Launch anytime with: ${0##*/} launch claude${C_RESET}"
+            else
+                echo "${C_RED}[!] Claude Code installation failed.${C_RESET}" >&2
+                return 1
+            fi
+            ;;
+        grok)
+            local cur_bin
+            cur_bin=$(command -v grok 2>/dev/null || true)
+            if [[ -n "${cur_bin}" && "${force}" != "true" && "${update}" != "true" ]]; then
+                local ver
+                ver=$(_get_cli_version grok)
+                echo "${C_GREEN}[✓] Grok Build CLI is already installed (${ver}) at ${cur_bin}.${C_RESET}"
+                echo "${C_DIM}    Run '${0##*/} install grok --update' to update to latest version.${C_RESET}"
+                return 0
+            fi
+            echo "${C_CYAN}[*] Installing Grok Build CLI (via x.ai/cli)...${C_RESET}"
+            if ! command -v curl >/dev/null 2>&1; then
+                echo "${C_RED}Error: curl is required to install Grok CLI.${C_RESET}" >&2
+                return 1
+            fi
+            curl -fsSL https://x.ai/cli/install.sh | bash
+            local grok_path="${HOME:-/root}/.grok/bin"
+            [[ -d "${grok_path}" && ":${PATH}:" != *":${grok_path}:"* ]] && export PATH="${grok_path}:${PATH}"
+            if command -v grok >/dev/null 2>&1; then
+                local new_ver
+                new_ver=$(_get_cli_version grok)
+                echo "${C_GREEN}[✓] Successfully installed Grok Build CLI (${new_ver})!${C_RESET}"
+                echo "${C_CYAN}[*] Launch anytime with: ${0##*/} launch grok${C_RESET}"
+            else
+                echo "${C_RED}[!] Grok installation failed or binary not found.${C_RESET}" >&2
+                return 1
+            fi
+            ;;
+        codex)
+            local cur_bin
+            cur_bin=$(command -v codex 2>/dev/null || true)
+            if [[ -n "${cur_bin}" && "${force}" != "true" && "${update}" != "true" ]]; then
+                local ver
+                ver=$(_get_cli_version codex)
+                echo "${C_GREEN}[✓] Codex CLI is already installed (${ver}) at ${cur_bin}.${C_RESET}"
+                echo "${C_DIM}    Run '${0##*/} install codex --update' to update to latest version.${C_RESET}"
+                return 0
+            fi
+            echo "${C_CYAN}[*] Installing Codex CLI (via npm)...${C_RESET}"
+            if ! command -v npm >/dev/null 2>&1; then
+                echo "${C_RED}Error: npm is required to install Codex CLI.${C_RESET}" >&2
+                return 1
+            fi
+            npm install -g @openai/codex 2>/dev/null || npm install -g codex
+            if command -v codex >/dev/null 2>&1; then
+                local new_ver
+                new_ver=$(_get_cli_version codex)
+                echo "${C_GREEN}[✓] Successfully installed Codex CLI (${new_ver})!${C_RESET}"
+                echo "${C_CYAN}[*] Launch anytime with: ${0##*/} launch codex${C_RESET}"
+            else
+                echo "${C_RED}[!] Codex installation failed.${C_RESET}" >&2
+                return 1
+            fi
+            ;;
+        qwen)
+            local cur_bin
+            cur_bin=$(command -v qwen 2>/dev/null || true)
+            if [[ -n "${cur_bin}" && "${force}" != "true" && "${update}" != "true" ]]; then
+                local ver
+                ver=$(_get_cli_version qwen)
+                echo "${C_GREEN}[✓] Qwen Code CLI is already installed (${ver}) at ${cur_bin}.${C_RESET}"
+                echo "${C_DIM}    Run '${0##*/} install qwen --update' to update to latest version.${C_RESET}"
+                return 0
+            fi
+            echo "${C_CYAN}[*] Installing Qwen Code CLI (via npm)...${C_RESET}"
+            if ! command -v npm >/dev/null 2>&1; then
+                echo "${C_RED}Error: npm is required to install Qwen Code CLI.${C_RESET}" >&2
+                return 1
+            fi
+            npm install -g @qwen-code/qwen-code
+            if command -v qwen >/dev/null 2>&1; then
+                local new_ver
+                new_ver=$(_get_cli_version qwen)
+                echo "${C_GREEN}[✓] Successfully installed Qwen Code CLI (${new_ver})!${C_RESET}"
+                echo "${C_CYAN}[*] Launch anytime with: ${0##*/} launch qwen${C_RESET}"
+            else
+                echo "${C_RED}[!] Qwen installation failed.${C_RESET}" >&2
+                return 1
+            fi
+            ;;
+        opencode)
+            local cur_bin
+            cur_bin=$(command -v opencode 2>/dev/null || true)
+            if [[ -n "${cur_bin}" && "${force}" != "true" && "${update}" != "true" ]]; then
+                local ver
+                ver=$(_get_cli_version opencode)
+                echo "${C_GREEN}[✓] OpenCode CLI is already installed (${ver}) at ${cur_bin}.${C_RESET}"
+                echo "${C_DIM}    Run '${0##*/} install opencode --update' to update to latest version.${C_RESET}"
+                return 0
+            fi
+            echo "${C_CYAN}[*] Installing OpenCode CLI...${C_RESET}"
+            local installed=false
+            if command -v curl >/dev/null 2>&1; then
+                curl -fsSL https://opencode.ai/install.sh 2>/dev/null | bash && installed=true
+            fi
+            if ! ${installed} && command -v npm >/dev/null 2>&1; then
+                npm install -g opencode-ai && installed=true
+            fi
+            local oc_path="${HOME:-/root}/.opencode/bin"
+            [[ -d "${oc_path}" && ":${PATH}:" != *":${oc_path}:"* ]] && export PATH="${oc_path}:${PATH}"
+            if command -v opencode >/dev/null 2>&1; then
+                local new_ver
+                new_ver=$(_get_cli_version opencode)
+                echo "${C_GREEN}[✓] Successfully installed OpenCode CLI (${new_ver})!${C_RESET}"
+                echo "${C_CYAN}[*] Launch anytime with: ${0##*/} launch opencode${C_RESET}"
+            else
+                echo "${C_RED}[!] OpenCode installation failed.${C_RESET}" >&2
+                return 1
+            fi
+            ;;
+        openclaw)
+            local cur_bin
+            cur_bin=$(command -v openclaw 2>/dev/null || true)
+            if [[ -n "${cur_bin}" && "${force}" != "true" && "${update}" != "true" ]]; then
+                local ver
+                ver=$(_get_cli_version openclaw)
+                echo "${C_GREEN}[✓] OpenClaw CLI is already installed (${ver}) at ${cur_bin}.${C_RESET}"
+                echo "${C_DIM}    Run '${0##*/} install openclaw --update' to update to latest version.${C_RESET}"
+                return 0
+            fi
+            echo "${C_CYAN}[*] Installing OpenClaw CLI (via npm)...${C_RESET}"
+            if ! command -v npm >/dev/null 2>&1; then
+                echo "${C_RED}Error: npm is required to install OpenClaw CLI.${C_RESET}" >&2
+                return 1
+            fi
+            npm install -g openclaw
+            if command -v openclaw >/dev/null 2>&1; then
+                local new_ver
+                new_ver=$(_get_cli_version openclaw)
+                echo "${C_GREEN}[✓] Successfully installed OpenClaw CLI (${new_ver})!${C_RESET}"
+                echo "${C_CYAN}[*] Launch anytime with: ${0##*/} launch openclaw${C_RESET}"
+            else
+                echo "${C_RED}[!] OpenClaw installation failed.${C_RESET}" >&2
+                return 1
+            fi
+            ;;
+        hermes)
+            local cur_bin
+            cur_bin=$(command -v hermes 2>/dev/null || true)
+            if [[ -n "${cur_bin}" && "${force}" != "true" && "${update}" != "true" ]]; then
+                local ver
+                ver=$(_get_cli_version hermes)
+                echo "${C_GREEN}[✓] Hermes CLI is already installed (${ver}) at ${cur_bin}.${C_RESET}"
+                echo "${C_DIM}    Run '${0##*/} install hermes --update' to update to latest version.${C_RESET}"
+                return 0
+            fi
+            echo "${C_CYAN}[*] Installing Hermes CLI...${C_RESET}"
+            local installed=false
+            if command -v npm >/dev/null 2>&1; then
+                npm install -g hermes-agent 2>/dev/null && installed=true
+            fi
+            if ! ${installed} && command -v pip >/dev/null 2>&1; then
+                pip install hermes-agent 2>/dev/null && installed=true
+            fi
+            if command -v hermes >/dev/null 2>&1; then
+                local new_ver
+                new_ver=$(_get_cli_version hermes)
+                echo "${C_GREEN}[✓] Successfully installed Hermes CLI (${new_ver})!${C_RESET}"
+                echo "${C_CYAN}[*] Launch anytime with: ${0##*/} launch hermes${C_RESET}"
+            else
+                echo "${C_RED}[!] Hermes installation failed.${C_RESET}" >&2
+                return 1
+            fi
+            ;;
+        agy)
+            local cur_bin
+            cur_bin=$(command -v agy 2>/dev/null || true)
+            if [[ -n "${cur_bin}" ]]; then
+                local ver
+                ver=$(_get_cli_version agy)
+                echo "${C_GREEN}[✓] Antigravity CLI (agy) is already installed (${ver}) at ${cur_bin}.${C_RESET}"
+                return 0
+            fi
+            echo "${C_YELLOW}[!] Antigravity CLI (agy) is managed through your Google Antigravity installation.${C_RESET}"
+            echo "${C_DIM}    Ensure ~/.local/bin or antigravity-cli/bin is in your PATH.${C_RESET}"
+            return 1
+            ;;
+        *)
+            echo "${C_RED}Error: Unknown CLI '${cli}'.${C_RESET}" >&2
+            echo "Supported CLIs: kimi, claude, grok, codex, qwen, opencode, openclaw, hermes, agy, all" >&2
+            return 1
+            ;;
+    esac
+}
+
+cmd_install() {
+    local target=""
+    local opt_force=false
+    local opt_update=false
+    local opt_list=false
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --force|-f) opt_force=true; shift ;;
+            --update|-u) opt_update=true; shift ;;
+            --list|-l) opt_list=true; shift ;;
+            *)
+                if [[ -z "${target}" ]]; then
+                    target="$1"
+                fi
+                shift
+                ;;
+        esac
+    done
+
+    if [[ -z "${target}" || "${target}" == "list" || "${target}" == "--list" || "${opt_list}" == "true" ]]; then
+        _install_list_status
+        return 0
+    fi
+
+    if [[ "${target}" == "all" ]]; then
+        echo "${C_BOLD}Installing / Updating All External LLM CLIs...${C_RESET}"
+        echo "====================================================================="
+        local clis=("kimi" "claude" "grok" "codex" "qwen" "opencode" "openclaw" "hermes")
+        local failed=()
+        for c in "${clis[@]}"; do
+            echo ""
+            if ! _install_single_cli "${c}" "${opt_force}" "${opt_update}"; then
+                failed+=("${c}")
+            fi
+        done
+        echo ""
+        echo "====================================================================="
+        if [[ ${#failed[@]} -eq 0 ]]; then
+            echo "${C_GREEN}[✓] All CLIs processed successfully.${C_RESET}"
+        else
+            echo "${C_YELLOW}[!] Finished with errors for: ${failed[*]}${C_RESET}"
+        fi
+        return 0
+    fi
+
+    _install_single_cli "${target}" "${opt_force}" "${opt_update}"
+}
+
+# -----------------------------------------------------------------------------
+# Command: update / upgrade
+# -----------------------------------------------------------------------------
+_get_cli_latest_version() {
+    local cmd="$1"
+    local latest=""
+    case "${cmd}" in
+        claude)
+            latest=$(npm view @anthropic-ai/claude-code version 2>/dev/null || true)
+            ;;
+        codex)
+            latest=$(npm view @openai/codex version 2>/dev/null || npm view codex version 2>/dev/null || true)
+            ;;
+        qwen)
+            latest=$(npm view @qwen-code/qwen-code version 2>/dev/null || true)
+            ;;
+        grok)
+            latest=$(grok update --check 2>&1 | grep -oE 'latest: [0-9.]+' | awk '{print $2}' || true)
+            ;;
+        kimi)
+            latest=$(curl -fsSL --connect-timeout 2 -m 4 https://code.kimi.com/kimi-code/latest 2>/dev/null | tr -d ' \r\n' || true)
+            ;;
+        opencode)
+            latest=$(npm view opencode-ai version 2>/dev/null || true)
+            ;;
+        openclaw)
+            latest=$(npm view openclaw version 2>/dev/null || true)
+            ;;
+        hermes)
+            latest=$(npm view hermes-agent version 2>/dev/null || true)
+            ;;
+        agy)
+            latest=""
+            ;;
+    esac
+    echo "${latest:-}"
+}
+
+_check_updates_for_present_clis() {
+    echo "${C_BOLD}CHECKING FOR UPDATES (PRESENT CLIs):${C_RESET}"
+    local fmt="  %-12s %-16s %-16s %s"
+    printf "${C_CYAN}${fmt}${C_RESET}\n" "CLI" "CURRENT" "LATEST" "STATUS"
+    echo "  --------------------------------------------------------------------------------------"
+
+    local clis=("claude" "codex" "qwen" "grok" "kimi" "opencode" "agy" "openclaw" "hermes")
+    local present_count=0
+    local updates_available=()
+
+    for c in "${clis[@]}"; do
+        local bin="${EXTERNAL_CLI_MAP[$c]:-$c}"
+        if ! command -v "${bin}" >/dev/null 2>&1; then
+            continue
+        fi
+        present_count=$((present_count + 1))
+        local cur_ver latest_ver status_str
+        cur_ver=$(_get_cli_version "${bin}")
+        latest_ver=$(_get_cli_latest_version "${c}")
+
+        if [[ -n "${latest_ver}" && "${latest_ver}" != "unknown" && "${latest_ver}" != "-" ]]; then
+            if [[ "${cur_ver}" == "${latest_ver}" ]]; then
+                status_str="${C_GREEN}● Up to date${C_RESET}"
+            else
+                status_str="${C_YELLOW}▲ Update available${C_RESET} (${C_YELLOW}${cur_ver}${C_RESET} -> ${C_GREEN}${latest_ver}${C_RESET})"
+                updates_available+=("${c}")
+            fi
+        else
+            status_str="${C_DIM}● Installed (${cur_ver})${C_RESET}"
+            latest_ver="-"
+        fi
+        printf "  %-12s %-16s %-16s %b\n" "${c}" "${cur_ver}" "${latest_ver}" "${status_str}"
+    done
+
+    if ((present_count == 0)); then
+        echo "  ${C_DIM}No external CLIs currently installed in PATH.${C_RESET}"
+        echo ""
+        echo "  Install any CLI with: ${0##*/} install <name>"
+        return 0
+    fi
+
+    echo ""
+    if [[ ${#updates_available[@]} -gt 0 ]]; then
+        echo "${C_YELLOW}[!] Updates available for ${#updates_available[@]} CLI(s): ${updates_available[*]}${C_RESET}"
+        echo "    To apply updates:  ${0##*/} update <name>"
+        echo "    To update all:     ${0##*/} update --apply (or ${0##*/} update all)"
+    else
+        echo "${C_GREEN}[✓] All installed CLIs are up to date.${C_RESET}"
+    fi
+}
+
+_update_all_present() {
+    echo "${C_BOLD}Updating All Present External CLIs...${C_RESET}"
+    echo "====================================================================="
+    local clis=("claude" "codex" "qwen" "grok" "kimi" "opencode" "agy" "openclaw" "hermes")
+    local updated_count=0
+    local failed=()
+
+    for c in "${clis[@]}"; do
+        local bin="${EXTERNAL_CLI_MAP[$c]:-$c}"
+        if ! command -v "${bin}" >/dev/null 2>&1; then
+            continue
+        fi
+        updated_count=$((updated_count + 1))
+        echo ""
+        if ! _install_single_cli "${c}" false true; then
+            failed+=("${c}")
+        fi
+    done
+
+    echo ""
+    echo "====================================================================="
+    if ((updated_count == 0)); then
+        echo "${C_DIM}No external CLIs found to update.${C_RESET}"
+        return 0
+    fi
+    if [[ ${#failed[@]} -eq 0 ]]; then
+        echo "${C_GREEN}[✓] All present CLIs updated successfully.${C_RESET}"
+    else
+        echo "${C_YELLOW}[!] Finished with errors for: ${failed[*]}${C_RESET}"
+    fi
+}
+
+cmd_update() {
+    local target=""
+    local opt_apply=false
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --apply|-y|--yes) opt_apply=true; shift ;;
+            --check|-c) opt_apply=false; shift ;;
+            *)
+                if [[ -z "${target}" ]]; then
+                    target="$1"
+                fi
+                shift
+                ;;
+        esac
+    done
+
+    # If a specific CLI or 'all' is passed (without --check), perform the update
+    if [[ -n "${target}" && "${target}" != "check" && "${target}" != "--check" ]]; then
+        if [[ "${target}" == "all" ]]; then
+            _update_all_present
+            return 0
+        fi
+        _install_single_cli "${target}" false true
+        return 0
+    fi
+
+    if ${opt_apply}; then
+        _update_all_present
+        return 0
+    fi
+
+    # "kimo update" only: Check for updates for all CLIs present
+    _check_updates_for_present_clis
 }
 
 # -----------------------------------------------------------------------------
@@ -3089,7 +3608,7 @@ cmd_launch() {
 # first --host).
 if [[ "${HOST_MODE}" == "multi" ]]; then
     case "${COMMAND}" in
-        check|ping|hosts|ps|list|ls|search|find|stop|unload|info|show|status|health|status-report|report|logs|log|rotate-token|rotate|help|-h|--help) ;;
+        check|ping|hosts|ps|list|ls|search|find|stop|unload|info|show|status|health|status-report|report|logs|log|rotate-token|rotate|install|setup|update|upgrade|help|-h|--help) ;;
         *)
             _model="${ARGS[0]:-}"
             if [[ "${COMMAND}" == "launch" ]]; then
@@ -3173,6 +3692,12 @@ case "${COMMAND}" in
         ;;
     launch)
         cmd_launch "${ARGS[@]}"
+        ;;
+    install|setup)
+        cmd_install "${ARGS[@]}"
+        ;;
+    update|upgrade)
+        cmd_update "${ARGS[@]}"
         ;;
     help|-h|--help)
         usage
