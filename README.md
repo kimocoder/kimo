@@ -181,7 +181,11 @@ kimo config path
 
 ## CLI Package Manager (`install` & `update`)
 
-`kimo` provides automated installation, updating, and health inspection for supported external LLM CLIs:
+`kimo` provides automated installation, updating, and health inspection for supported external CLIs, including GitHub CLI (`gh`, not Copilot).
+
+Use `kimo install gh` for a fresh installation and `kimo update gh` (or `kimo install gh --update`) to update. GitHub CLI uses the latest official `cli/cli` release: Linux tar archives (amd64, arm64, 386, armv6) or macOS ZIP archives (amd64, arm64). Downloads are SHA-256 checked against the official release checksums, and the staged executable's version is verified before atomic replacement in `~/.local/bin/gh`. Add `~/.local/bin` to your shell's PATH if needed.
+
+Updates and `--force` only replace an owned regular file at that user-local path. System/package-manager installations and symlinks are refused without sudo or silent shadowing; update those with their package manager (for example `brew upgrade gh`) or follow the [official installation guide](https://cli.github.com/manual/installation). Failures preserve the existing binary. `gh` appears in inventory, doctor, batch installation/updating and update checks, but has no Ollama model or `launch` integration.
 
 ```bash
 # Display installed CLI inventory, versions, and paths
@@ -198,6 +202,7 @@ kimo install opencode   # Installs OpenCode CLI
 kimo install cyberstrike # Installs Cyberstrike AI Pentesting CLI (cyberstrike.io)
 kimo install openclaw   # Installs OpenClaw CLI
 kimo install hermes     # Installs Hermes Agent CLI
+kimo install agy        # Installs Google Antigravity CLI (official bootstrapper)
 
 # Install or update all supported CLIs at once
 kimo install all
@@ -213,6 +218,7 @@ kimo update
 
 # Update a specific installed CLI
 kimo update qwen
+kimo update agy         # Uses agy's native self-updater (also: kimo install agy --update)
 
 # Apply all available updates for currently installed CLIs
 kimo update --apply     # or: kimo update all

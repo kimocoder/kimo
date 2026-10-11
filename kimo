@@ -4264,6 +4264,10 @@ EOF
 
 cmd_launch() {
     local provider="${1:-}"
+    if [[ "${provider}" == gh ]]; then
+        echo "Error: GitHub CLI is management-only; run gh directly, not through Ollama launch." >&2
+        return 1
+    fi
     if [[ -z "${provider}" || "${provider}" == "-h" || "${provider}" == "--help" || "${provider}" == "help" ]]; then
         launch_usage
         return 0
@@ -4706,7 +4710,7 @@ _install_list_status() {
     local fmt="  %-12s %-20s %-14s %-32s %s"
     printf "${C_CYAN}${fmt}${C_RESET}\n" "CLI" "STATUS" "VERSION" "BINARY PATH" "DEFAULT MODEL"
     echo "  ------------------------------------------------------------------------------------------------------"
-    local clis=("claude" "codex" "qwen" "grok" "kimi" "cursor" "opencode" "cyberstrike" "agy" "openclaw" "hermes")
+    local clis=("claude" "codex" "qwen" "grok" "kimi" "cursor" "opencode" "cyberstrike" "agy" "openclaw" "hermes" "gh")
     for c in "${clis[@]}"; do
         local bin="${EXTERNAL_CLI_MAP[$c]:-$c}"
         local dmodel="${DEFAULT_MODELS[$c]:-n/a}"
@@ -4727,6 +4731,81 @@ _install_list_status() {
     echo "${C_DIM}Install all supported CLIs with: ${0##*/} install all${C_RESET}"
 }
 
+_gh_latest_version() {
+    curl -fsSL --connect-timeout 2 -m 10 https://api.github.com/repos/cli/cli/releases/latest \
+        | jq -er '.tag_name | select(test("^v[0-9]+\\.[0-9]+\\.[0-9]+$")) | ltrimstr("v")'
+}
+
+_install_gh() (
+    local force="$1" update="$2" cur_bin dest dir os arch ext version asset base tmp expected actual staged
+    dir="${HOME}/.local/bin"
+    dest="${dir}/gh"
+    cur_bin=$(command -v gh 2>/dev/null || true)
+    if [[ -n "${cur_bin}" && "${force}" != true && "${update}" != true ]]; then
+        echo "GitHub CLI is already installed ($(_get_cli_version gh)) at ${cur_bin}."
+        return 0
+    fi
+    if [[ -n "${cur_bin}" && "${cur_bin}" != "${dest}" ]] || [[ -L "${HOME}/.local" || -L "${dir}" || -L "${dest}" ]] \
+        || { [[ -e "${dest}" ]] && [[ ! -f "${dest}" || ! -O "${dest}" ]]; }; then
+        echo "Error: refusing to replace or shadow GitHub CLI at ${cur_bin:-${dest}}. Use its package manager (e.g. brew upgrade gh or your Linux package manager); see https://cli.github.com/manual/installation." >&2
+        return 1
+    fi
+    case "$(uname -s)" in
+        Linux) os=linux; ext=tar.gz ;;
+        Darwin) os=macOS; ext=zip ;;
+        *) echo "Error: unsupported GitHub CLI platform." >&2; return 1 ;;
+    esac
+    case "$(uname -m)" in
+        x86_64|amd64) arch=amd64 ;;
+        aarch64|arm64) arch=arm64 ;;
+        i386|i686) arch=386 ;;
+        armv6l|armv7l) arch=armv6 ;;
+        *) echo "Error: unsupported GitHub CLI architecture." >&2; return 1 ;;
+    esac
+    if [[ "${os}" == macOS && "${arch}" != amd64 && "${arch}" != arm64 ]]; then
+        echo "Error: unsupported GitHub CLI architecture on macOS." >&2; return 1
+    fi
+    command -v curl >/dev/null && command -v jq >/dev/null \
+        && { command -v sha256sum >/dev/null || command -v shasum >/dev/null; } \
+        && { { [[ "${ext}" == zip ]] && command -v unzip >/dev/null; } || { [[ "${ext}" == tar.gz ]] && command -v tar >/dev/null; }; } || {
+        echo "Error: GitHub CLI installation requires curl, jq, SHA-256 tooling and tar (Linux) or unzip (macOS)." >&2; return 1
+    }
+    version=$(_gh_latest_version) || { echo "Error: could not read GitHub CLI release metadata." >&2; return 1; }
+    asset="gh_${version}_${os}_${arch}.${ext}"
+    base="https://github.com/cli/cli/releases/download/v${version}"
+    mkdir -p "${dir}" || return 1
+    tmp=$(mktemp -d "${dir}/.gh-install.XXXXXXXX") || return 1
+    trap 'rm -rf "${tmp}"' EXIT
+    curl -fsSL --connect-timeout 10 -m 120 "${base}/${asset}" -o "${tmp}/${asset}" \
+        && curl -fsSL --connect-timeout 10 -m 30 "${base}/gh_${version}_checksums.txt" -o "${tmp}/checksums" || {
+        echo "Error: GitHub CLI download failed." >&2; return 1
+    }
+    expected=$(awk -v name="${asset}" '$2 == name {print $1}' "${tmp}/checksums")
+    [[ "${expected}" =~ ^[0-9a-fA-F]{64}$ ]] || { echo "Error: missing or invalid GitHub CLI checksum." >&2; return 1; }
+    if command -v sha256sum >/dev/null; then
+        actual=$(sha256sum "${tmp}/${asset}") || return 1
+    else
+        actual=$(shasum -a 256 "${tmp}/${asset}") || return 1
+    fi
+    [[ "${actual%% *}" == "${expected}" ]] || { echo "Error: GitHub CLI checksum mismatch." >&2; return 1; }
+    if [[ "${ext}" == zip ]]; then
+        unzip -q "${tmp}/${asset}" "gh_${version}_${os}_${arch}/bin/gh" -d "${tmp}" || return 1
+    else
+        tar -xzf "${tmp}/${asset}" -C "${tmp}" "gh_${version}_${os}_${arch}/bin/gh" || return 1
+    fi
+    staged="${tmp}/gh_${version}_${os}_${arch}/bin/gh"
+    [[ -f "${staged}" && ! -L "${staged}" ]] && chmod 755 "${staged}" || return 1
+    actual=$("${staged}" --version) || return 1
+    [[ "${actual}" == "gh version ${version} "* || "${actual}" == "gh version ${version}" ]] || {
+        echo "Error: staged GitHub CLI version does not match release." >&2; return 1
+    }
+    [[ ! -L "${dest}" && ! -d "${dest}" ]] && mv -f "${staged}" "${dest}" || return 1
+    echo "Installed GitHub CLI ${version} at ${dest}."
+    if [[ ":${PATH}:" != *":${dir}:"* ]]; then
+        echo "Add ${dir} to PATH to use gh."
+    fi
+)
+
 _install_single_cli() {
     local cli="$1"
     local force="${2:-false}"
@@ -4742,6 +4821,7 @@ _install_single_cli() {
     esac
 
     case "${cli}" in
+        gh) _install_gh "${force}" "${update}"; return $? ;;
         kimi)
             local cur_bin
             cur_bin=$(command -v kimi 2>/dev/null || true)
@@ -4968,15 +5048,51 @@ _install_single_cli() {
         agy)
             local cur_bin
             cur_bin=$(command -v agy 2>/dev/null || true)
-            if [[ -n "${cur_bin}" ]]; then
+            if [[ -n "${cur_bin}" && "${force}" != "true" && "${update}" != "true" ]]; then
                 local ver
                 ver=$(_get_cli_version agy)
                 echo "${C_GREEN}[✓] Antigravity CLI (agy) is already installed (${ver}) at ${cur_bin}.${C_RESET}"
+                echo "${C_DIM}    Run '${0##*/} install agy --update' to update to latest version.${C_RESET}"
                 return 0
             fi
-            echo "${C_YELLOW}[!] Antigravity CLI (agy) is managed through your Google Antigravity installation.${C_RESET}"
-            echo "${C_DIM}    Ensure ~/.local/bin or antigravity-cli/bin is in your PATH.${C_RESET}"
-            return 1
+            if [[ -n "${cur_bin}" ]]; then
+                echo "${C_CYAN}[*] Updating Antigravity CLI (agy) via its built-in self-updater...${C_RESET}"
+                local update_status=0
+                agy update 2>&1 || update_status=$?
+                if [[ "${update_status}" -ne 0 ]]; then
+                    echo "${C_RED}[!] Agy self-update failed; the existing installation has been preserved.${C_RESET}" >&2
+                    echo "${C_DIM}    Check the updater output above, then retry '${0##*/} update agy'.${C_RESET}" >&2
+                    return "${update_status}"
+                fi
+                local new_ver
+                new_ver=$(_get_cli_version agy)
+                echo "${C_GREEN}[✓] Antigravity CLI (agy) is now ${new_ver} at ${cur_bin}.${C_RESET}"
+                echo "${C_CYAN}[*] Launch anytime with: ${0##*/} launch agy${C_RESET}"
+            else
+                echo "${C_CYAN}[*] Installing Antigravity CLI (via antigravity.google/cli/install.sh)...${C_RESET}"
+                local installed=false
+                if command -v curl >/dev/null 2>&1; then
+                    if curl -fsSL https://antigravity.google/cli/install.sh 2>/dev/null | bash; then
+                        installed=true
+                    fi
+                fi
+                local lbin="${HOME:-/root}/.local/bin"
+                [[ -d "${lbin}" && ":${PATH}:" != *":${lbin}:"* ]] && export PATH="${lbin}:${PATH}"
+                if ! ${installed} && ! command -v agy >/dev/null 2>&1; then
+                    echo "${C_RED}[!] Antigravity CLI installation failed.${C_RESET}" >&2
+                    echo "${C_DIM}    Ensure curl is installed and ~/.local/bin or antigravity-cli/bin is in your PATH.${C_RESET}" >&2
+                    return 1
+                fi
+                if command -v agy >/dev/null 2>&1; then
+                    local new_ver
+                    new_ver=$(_get_cli_version agy)
+                    echo "${C_GREEN}[✓] Successfully installed Antigravity CLI (agy) (${new_ver})!${C_RESET}"
+                    echo "${C_CYAN}[*] Launch anytime with: ${0##*/} launch agy${C_RESET}"
+                else
+                    echo "${C_RED}[!] Agy installation failed or binary not found in PATH.${C_RESET}" >&2
+                    return 1
+                fi
+            fi
             ;;
         cyberstrike)
             local cur_bin
@@ -5090,7 +5206,7 @@ _install_single_cli() {
             ;;
         *)
             echo "${C_RED}Error: Unknown CLI '${cli}'.${C_RESET}" >&2
-            echo "Supported CLIs: kimi, claude, grok, codex, qwen, cursor, opencode, cyberstrike, openclaw, hermes, agy, all" >&2
+            echo "Supported CLIs: kimi, claude, grok, codex, qwen, cursor, opencode, cyberstrike, openclaw, hermes, gh, agy, all" >&2
             return 1
             ;;
     esac
@@ -5098,13 +5214,17 @@ _install_single_cli() {
 
 install_usage() {
     cat <<EOF
-${C_BOLD}kimo install${C_RESET} – Install and manage external LLM CLIs
+${C_BOLD}kimo install${C_RESET} – Install and manage external CLIs (including GitHub CLI: gh)
+
+GitHub CLI uses official checksum-verified Linux/macOS releases in ~/.local/bin.
+Updates/--force refuse system, package-manager and symlink installations; use their package manager.
+GitHub CLI is not Copilot and is not routed to Ollama.
 
 ${C_YELLOW}Usage:${C_RESET}
   ${0##*/} install [cli|all|list] [options]
 
 ${C_YELLOW}Arguments:${C_RESET}
-  ${C_CYAN}<cli>${C_RESET}        Name of CLI to install (kimi, claude, grok, codex, qwen, cursor, opencode, cyberstrike, openclaw, hermes)
+  ${C_CYAN}<cli>${C_RESET}        Name of CLI to install (kimi, claude, grok, codex, qwen, cursor, opencode, cyberstrike, agy, openclaw, hermes, gh)
   ${C_CYAN}all${C_RESET}          Install or update all supported CLIs in batch
   ${C_CYAN}list${C_RESET}         Display status and version table of all supported CLIs (default without args)
 
@@ -5152,7 +5272,7 @@ cmd_install() {
     if [[ "${target}" == "all" ]]; then
         echo "${C_BOLD}Installing / Updating All External LLM CLIs...${C_RESET}"
         echo "====================================================================="
-        local clis=("kimi" "claude" "grok" "codex" "qwen" "cursor" "opencode" "cyberstrike" "openclaw" "hermes")
+        local clis=("kimi" "claude" "grok" "codex" "qwen" "cursor" "opencode" "cyberstrike" "agy" "openclaw" "hermes" "gh")
         local failed=()
         for c in "${clis[@]}"; do
             echo ""
@@ -5166,6 +5286,7 @@ cmd_install() {
             echo "${C_GREEN}[✓] All CLIs processed successfully.${C_RESET}"
         else
             echo "${C_YELLOW}[!] Finished with errors for: ${failed[*]}${C_RESET}"
+            return 1
         fi
         return 0
     fi
@@ -5176,10 +5297,35 @@ cmd_install() {
 # -----------------------------------------------------------------------------
 # Command: update / upgrade
 # -----------------------------------------------------------------------------
+_agy_latest_version() {
+    local base="https://antigravity-cli-auto-updater-974169037036.us-central1.run.app/manifests"
+    local os arch slug
+    case "$(uname -s)" in
+        Darwin) os="darwin" ;;
+        Linux)
+            if [[ "$(uname -o 2>/dev/null)" == "Android" ]]; then os="android"; else os="linux"; fi
+            ;;
+        *) return 0 ;;
+    esac
+    case "$(uname -m)" in
+        x86_64|amd64) arch="amd64" ;;
+        arm64|aarch64) arch="arm64" ;;
+        *) return 0 ;;
+    esac
+    slug="${os}_${arch}"
+    if [[ "${os}" == "linux" ]] && { [[ -f /lib/libc.musl-x86_64.so.1 ]] || [[ -f /lib/libc.musl-aarch64.so.1 ]] || ldd /bin/ls 2>&1 | grep -q musl; }; then
+        slug="${slug}_musl"
+    fi
+    curl -fsSL --connect-timeout 2 -m 4 "${base}/${slug}.json" 2>/dev/null \
+        | grep -oE '"version"[[:space:]]*:[[:space:]]*"[0-9][0-9A-Za-z._-]*"' \
+        | grep -oE '[0-9][0-9A-Za-z._-]*' | head -n 1 || true
+}
+
 _get_cli_latest_version() {
     local cmd="$1"
     local latest=""
     case "${cmd}" in
+        gh) latest=$(_gh_latest_version 2>/dev/null || true) ;;
         claude)
             latest=$(npm view @anthropic-ai/claude-code version 2>/dev/null || true)
             ;;
@@ -5205,7 +5351,9 @@ _get_cli_latest_version() {
             latest=$(npm view hermes-agent version 2>/dev/null || true)
             ;;
         agy)
-            latest=""
+            # Version feed: the release manifest served alongside the official
+            # install script (same host the bootstrapper downloads from).
+            latest=$(_agy_latest_version)
             ;;
         cyberstrike)
             latest=$(curl -fsSL --connect-timeout 2 -m 4 https://api.github.com/repos/CyberStrikeus/CyberStrike/releases/latest 2>/dev/null | grep -oE '"tag_name": *"v[0-9.]+"' | grep -oE '[0-9.]+' | head -n 1 || true)
@@ -5223,7 +5371,7 @@ _check_updates_for_present_clis() {
     printf "${C_CYAN}${fmt}${C_RESET}\n" "CLI" "CURRENT" "LATEST" "STATUS"
     echo "  --------------------------------------------------------------------------------------"
 
-    local clis=("claude" "codex" "qwen" "grok" "kimi" "cursor" "opencode" "cyberstrike" "agy" "openclaw" "hermes")
+    local clis=("claude" "codex" "qwen" "grok" "kimi" "cursor" "opencode" "cyberstrike" "agy" "openclaw" "hermes" "gh")
     local present_count=0
     local updates_available=()
 
@@ -5271,7 +5419,7 @@ _check_updates_for_present_clis() {
 _update_all_present() {
     echo "${C_BOLD}Updating All Present External CLIs...${C_RESET}"
     echo "====================================================================="
-    local clis=("claude" "codex" "qwen" "grok" "kimi" "cursor" "opencode" "cyberstrike" "agy" "openclaw" "hermes")
+    local clis=("claude" "codex" "qwen" "grok" "kimi" "cursor" "opencode" "cyberstrike" "agy" "openclaw" "hermes" "gh")
     local updated_count=0
     local failed=()
 
@@ -5297,6 +5445,7 @@ _update_all_present() {
         echo "${C_GREEN}[✓] All present CLIs updated successfully.${C_RESET}"
     else
         echo "${C_YELLOW}[!] Finished with errors for: ${failed[*]}${C_RESET}"
+        return 1
     fi
 }
 
@@ -5320,6 +5469,8 @@ ${C_YELLOW}Options:${C_RESET}
 ${C_YELLOW}Examples:${C_RESET}
   ${0##*/} update             # Check updates for all present CLIs
   ${0##*/} update qwen        # Update only Qwen Code CLI
+  ${0##*/} update agy         # Update Antigravity CLI with its native updater
+  ${0##*/} update gh          # Update user-local GitHub CLI; package-managed gh must use its package manager
   ${0##*/} update --apply     # Update all installed CLIs with available updates
 EOF
 }
@@ -5349,7 +5500,7 @@ cmd_update() {
             return 0
         fi
         _install_single_cli "${target}" false true
-        return 0
+        return $?
     fi
 
     if ${opt_apply}; then
@@ -5774,7 +5925,7 @@ cmd_doctor() {
     echo ""
     # 5. External LLM CLI Hub Inventory
     echo "${C_YELLOW}[5/5] External LLM CLI Hub Inventory:${C_RESET}"
-    local clis=("claude" "codex" "qwen" "grok" "kimi" "cursor" "opencode" "cyberstrike" "agy" "openclaw" "hermes")
+    local clis=("claude" "codex" "qwen" "grok" "kimi" "cursor" "opencode" "cyberstrike" "agy" "openclaw" "hermes" "gh")
     for c in "${clis[@]}"; do
         local bin="${EXTERNAL_CLI_MAP[$c]:-$c}"
         if command -v "${bin}" >/dev/null 2>&1; then
@@ -5897,14 +6048,14 @@ _kimo() {
             if [[ "${cur}" == -* ]]; then
                 COMPREPLY=( $(compgen -W "--update --force --list -h --help" -- "${cur}") )
             else
-                COMPREPLY=( $(compgen -W "${supported_clis} all list" -- "${cur}") )
+                COMPREPLY=( $(compgen -W "${supported_clis} gh all list" -- "${cur}") )
             fi
             ;;
         update|upgrade)
             if [[ "${cur}" == -* ]]; then
                 COMPREPLY=( $(compgen -W "--apply -h --help" -- "${cur}") )
             else
-                COMPREPLY=( $(compgen -W "${supported_clis} all" -- "${cur}") )
+                COMPREPLY=( $(compgen -W "${supported_clis} gh all" -- "${cur}") )
             fi
             ;;
         run|info|show|warm|preload|rm|delete|tag|alias|stream)
@@ -6067,9 +6218,13 @@ _kimo() {
             ;;
         args)
             case $words[1] in
-                launch|install|update)
+                launch|install|setup|update|upgrade)
                     local -a clis
-                    clis=(claude grok kimi agy codex qwen cursor opencode cyberstrike openclaw hermes all)
+                    clis=(claude grok kimi agy codex qwen cursor opencode cyberstrike openclaw hermes)
+                    case $words[1] in
+                        install|setup) clis+=(gh all list) ;;
+                        update|upgrade) clis+=(gh all) ;;
+                    esac
                     _describe -t clis 'supported CLIs' clis
                     ;;
                 config)
