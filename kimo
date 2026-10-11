@@ -188,6 +188,7 @@ ${C_YELLOW}External LLM CLI Hub:${C_RESET}
 ${C_YELLOW}Cluster & Remote Operations:${C_RESET}
   ${C_CYAN}check, ping${C_RESET}                  Probe connectivity, latency, and health across daemons & tunnels
   ${C_CYAN}hosts${C_RESET}                        Inventory table of reachable servers, models, versions, and disks
+  ${C_CYAN}scan, discover [target]${C_RESET}      Scan LAN/subnets for active Ollama instances (--models, --save)
   ${C_CYAN}status, health${C_RESET}               Operational snapshot: tunnel, remote API, VRAM residency, timer
   ${C_CYAN}doctor${C_RESET}                       Run system, cluster, and CLI ecosystem health diagnostics
   ${C_CYAN}sync <model|--all>${C_RESET}           Replicate and synchronize models across cluster hosts
@@ -244,6 +245,10 @@ ${C_YELLOW}Examples:${C_RESET}
   ${C_DIM}# Cluster & Multi-Host Management:${C_RESET}
   ${0##*/} check                                      # Health & latency probe for all endpoints
   ${0##*/} hosts                                      # Discover reachable cluster nodes
+  ${0##*/} scan                                       # Discover all Ollama nodes on local network
+  ${0##*/} scan -m                                    # Deep scan with model catalog & VRAM breakdown
+  ${0##*/} scan 192.168.1.0/24 -p 11434               # Scan specific subnet and port
+  ${0##*/} scan --save                                # Discover and persist remote node to config
   ${0##*/} sync granite4.2:latest                     # Replicate model across cluster hosts
   ${0##*/} --local --remote list                      # List models across local & remote nodes
   ${0##*/} stream kalidroid-27b:latest --status       # Inspect model keepalive pinning state
@@ -902,6 +907,742 @@ for r in rows:
 if notes:
     print(C_DIM + "\n".join(notes) + C_RESET)
 PYEOF
+}
+
+# -----------------------------------------------------------------------------
+# Command: scan / discover (Network Discovery for Ollama Instances)
+# -----------------------------------------------------------------------------
+scan_usage() {
+    cat <<EOF
+${C_BOLD}kimo scan${C_RESET} – Discover active Ollama instances across local network & subnets
+
+${C_YELLOW}Usage:${C_RESET}
+  ${0##*/} scan [options] [targets...]
+  ${0##*/} discover [options] [targets...]
+
+${C_YELLOW}Targets:${C_RESET}
+  <none>              Auto-detect active physical LAN subnets (e.g. 192.168.1.0/24) + localhost
+  <cidr>              Scan specific CIDR subnet (e.g. 192.168.1.0/24, 10.0.0.0/24)
+  <ip-range>          Scan IP range (e.g. 192.168.1.100-200, 192.168.1.50-192.168.1.150)
+  <host>              Probe specific host or IP (e.g. 192.168.1.131, localhost, gpu-node)
+  <endpoint>          Probe specific endpoint (e.g. 192.168.1.131:11434, http://192.168.1.104:11434)
+
+${C_YELLOW}Options:${C_RESET}
+  ${C_CYAN}-p, --ports <ports>${C_RESET}      Comma-separated list of ports to scan (default: 11434,11438)
+  ${C_CYAN}--all-ports${C_RESET}              Scan common Ollama & proxy ports (11434-11438, 8000, 8080)
+  ${C_CYAN}-t, --threads <num>${C_RESET}      Concurrency worker threads (default: 64)
+  ${C_CYAN}--timeout <ms>${C_RESET}           Socket connection timeout in milliseconds (default: 400)
+  ${C_CYAN}-m, --models, --deep${C_RESET}     Deep model inspection (list models, sizes, quant, VRAM residency)
+  ${C_CYAN}--all-interfaces${C_RESET}         Scan all network interfaces including docker bridges
+  ${C_CYAN}--save${C_RESET}                   Save discovered remote endpoint into persistent config
+  ${C_CYAN}--set-remote <endpoint>${C_RESET}   Set specified discovered endpoint as remote_url in config
+  ${C_CYAN}--json${C_RESET}                   Output scan results in structured JSON format
+  ${C_CYAN}-h, --help${C_RESET}               Show this help message
+
+${C_YELLOW}Examples:${C_RESET}
+  ${0##*/} scan                               # Auto-detect LAN and discover all Ollama nodes
+  ${0##*/} scan -m                            # Scan with deep model catalog and VRAM breakdown
+  ${0##*/} scan 192.168.1.0/24 -p 11434       # Scan specific subnet on standard Ollama port
+  ${0##*/} scan 192.168.1.100-150             # Scan IP range
+  ${0##*/} scan --save                        # Discover and persist remote node to ~/.config/kimo/config
+  ${0##*/} scan --set-remote 192.168.1.104:11434 # Point remote_url directly to discovered node
+  ${0##*/} scan --json                        # Machine-readable JSON output for scripting
+EOF
+}
+
+cmd_scan() {
+    local ports="11434,11438"
+    local threads=64
+    local timeout_ms=400
+    local deep=false
+    local all_ifaces=false
+    local save_remote=false
+    local set_remote=""
+    local json_output=false
+    local targets=()
+
+    if [[ "${OPT_JSON:-false}" == "true" ]]; then
+        json_output=true
+    fi
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -p|--ports)
+                ports="${2:-}"
+                shift 2
+                ;;
+            --ports=*)
+                ports="${1#*=}"
+                shift
+                ;;
+            --all-ports)
+                ports="11434,11435,11436,11437,11438,8000,8080"
+                shift
+                ;;
+            -t|--threads)
+                threads="${2:-64}"
+                shift 2
+                ;;
+            --threads=*)
+                threads="${1#*=}"
+                shift
+                ;;
+            --timeout)
+                timeout_ms="${2:-400}"
+                shift 2
+                ;;
+            --timeout=*)
+                timeout_ms="${1#*=}"
+                shift
+                ;;
+            -m|--models|--deep)
+                deep=true
+                shift
+                ;;
+            --all-interfaces)
+                all_ifaces=true
+                shift
+                ;;
+            --save)
+                save_remote=true
+                shift
+                ;;
+            --set-remote)
+                set_remote="${2:-}"
+                shift 2
+                ;;
+            --set-remote=*)
+                set_remote="${1#*=}"
+                shift
+                ;;
+            --json)
+                json_output=true
+                shift
+                ;;
+            -h|--help)
+                scan_usage
+                return 0
+                ;;
+            -*)
+                echo "${C_RED}Error: Unknown scan option '$1'.${C_RESET}" >&2
+                scan_usage >&2
+                return 1
+                ;;
+            *)
+                targets+=("$1")
+                shift
+                ;;
+        esac
+    done
+
+    local candidate_file="/tmp/.kimo_scan_candidate_$$"
+    rm -f "${candidate_file}"
+
+    OM_SCAN_TARGETS="${targets[*]:-}" \
+    OM_SCAN_PORTS="${ports}" \
+    OM_SCAN_THREADS="${threads}" \
+    OM_SCAN_TIMEOUT_MS="${timeout_ms}" \
+    OM_SCAN_DEEP="${deep}" \
+    OM_SCAN_ALL_IFACES="${all_ifaces}" \
+    OM_SCAN_JSON="${json_output}" \
+    OM_CANDIDATE_FILE="${candidate_file}" \
+    OM_REMOTE_HOST_IP="${REMOTE_HOST_IP}" \
+    OM_REMOTE_HOST_URL="${REMOTE_HOST_URL}" \
+    OM_REMOTE_TUNNEL_URL="${REMOTE_TUNNEL_URL}" \
+    OM_LOCAL_HOST_URL="${LOCAL_HOST_URL}" \
+    OM_C_RESET="${C_RESET}" \
+    OM_C_BOLD="${C_BOLD}" \
+    OM_C_DIM="${C_DIM}" \
+    OM_C_GREEN="${C_GREEN}" \
+    OM_C_YELLOW="${C_YELLOW}" \
+    OM_C_CYAN="${C_CYAN}" \
+    OM_C_RED="${C_RED}" \
+    OM_C_BLUE="${C_BLUE}" \
+    OM_C_MAGENTA="${C_MAGENTA}" \
+    python3 - <<'PYEOF'
+import sys, os, time, socket, json, ipaddress, subprocess, urllib.request, urllib.parse
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+env = os.environ
+targets_str = env.get("OM_SCAN_TARGETS", "").strip()
+ports_str = env.get("OM_SCAN_PORTS", "11434,11438").strip()
+threads = int(env.get("OM_SCAN_THREADS", "64"))
+timeout_ms = int(env.get("OM_SCAN_TIMEOUT_MS", "400"))
+deep = env.get("OM_SCAN_DEEP", "false").lower() == "true"
+all_ifaces = env.get("OM_SCAN_ALL_IFACES", "false").lower() == "true"
+as_json = env.get("OM_SCAN_JSON", "false").lower() == "true"
+candidate_file = env.get("OM_CANDIDATE_FILE", "")
+REMOTE_HOST_IP = env.get("OM_REMOTE_HOST_IP", "192.168.1.131")
+
+C_RESET = env.get("OM_C_RESET", "")
+C_BOLD = env.get("OM_C_BOLD", "")
+C_DIM = env.get("OM_C_DIM", "")
+C_GREEN = env.get("OM_C_GREEN", "")
+C_YELLOW = env.get("OM_C_YELLOW", "")
+C_CYAN = env.get("OM_C_CYAN", "")
+C_RED = env.get("OM_C_RED", "")
+C_BLUE = env.get("OM_C_BLUE", "")
+C_MAGENTA = env.get("OM_C_MAGENTA", "")
+
+LOOPBACK = {"127.0.0.1", "localhost", "::1"}
+SSH_VALUE_OPTS = {"b", "c", "D", "E", "e", "F", "I", "i", "J", "L", "l", "m", "O", "o", "p", "Q", "R", "S", "W", "w"}
+
+def pad_ansi(text, width, align="left", color=None):
+    plain_len = len(text)
+    pad = max(0, width - plain_len)
+    styled = f"{color}{text}{C_RESET}" if color else text
+    if align == "right":
+        return (" " * pad) + styled
+    return styled + (" " * pad)
+
+def local_addresses():
+    addrs = {"127.0.0.1", "::1"}
+    try:
+        out = subprocess.check_output(["ip", "-o", "addr", "show"], text=True, stderr=subprocess.DEVNULL)
+        for line in out.splitlines():
+            parts = line.split()
+            if len(parts) >= 4:
+                ip = parts[3].split("/")[0]
+                addrs.add(ip)
+    except Exception:
+        pass
+    return addrs
+
+def ssh_forwards():
+    forwards = {}
+    for pid in os.listdir("/proc"):
+        if not pid.isdigit():
+            continue
+        try:
+            with open(f"/proc/{pid}/cmdline", "rb") as f:
+                argv = [a.decode(errors="replace") for a in f.read().split(b"\0") if a]
+        except OSError:
+            continue
+        if not argv or os.path.basename(argv[0]) != "ssh":
+            continue
+        dest, specs, i = None, [], 1
+        while i < len(argv):
+            arg = argv[i]
+            if arg.startswith("-") and len(arg) > 1:
+                for j, opt in enumerate(arg[1:], start=1):
+                    if opt in SSH_VALUE_OPTS:
+                        val = arg[j + 1:]
+                        if not val and i + 1 < len(argv):
+                            i += 1
+                            val = argv[i]
+                        if opt == "L":
+                            specs.append(val)
+                        break
+                i += 1
+                continue
+            dest = arg
+            break
+        for spec in specs:
+            parts = spec.split(":")
+            if len(parts) >= 3:
+                lport = parts[-3] if len(parts) == 4 else parts[0]
+                host = parts[-2]
+                hport = parts[-1]
+                if lport.isdigit() and hport.isdigit():
+                    if host in LOOPBACK and dest:
+                        host = dest.split("@")[-1]
+                    forwards[int(lport)] = (host, int(hport))
+    return forwards
+
+def detect_subnets(all_interfaces=False):
+    subnets = []
+    try:
+        out = subprocess.check_output(["ip", "-o", "-4", "addr", "show"], text=True, stderr=subprocess.DEVNULL)
+        for line in out.splitlines():
+            parts = line.split()
+            if len(parts) >= 4:
+                iface = parts[1]
+                cidr = parts[3]
+                if not all_interfaces:
+                    if iface == "lo" or iface.startswith(("docker", "br-", "veth", "virbr", "cni", "flannel")):
+                        continue
+                try:
+                    net = ipaddress.ip_network(cidr, strict=False)
+                    if not net.is_loopback:
+                        subnets.append(str(net))
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    if not subnets:
+        try:
+            out = subprocess.check_output(["hostname", "-I"], text=True, stderr=subprocess.DEVNULL)
+            for ip in out.split():
+                if ip.startswith("127.") or ":" in ip:
+                    continue
+                prefix = ".".join(ip.split(".")[:3])
+                subnets.append(f"{prefix}.0/24")
+        except Exception:
+            pass
+    return list(dict.fromkeys(subnets))
+
+def is_ip_range(t):
+    if "-" in t:
+        parts = t.split("-")
+        if len(parts) == 2:
+            p1 = parts[0].strip()
+            if all(ch.isdigit() or ch == "." for ch in p1) and any(ch.isdigit() for ch in p1):
+                return True
+    return False
+
+def expand_endpoints(target_tokens, default_ports, all_interfaces):
+    if not target_tokens:
+        subnets = detect_subnets(all_interfaces)
+        ips = ["127.0.0.1"]
+        for sub in subnets:
+            try:
+                net = ipaddress.ip_network(sub, strict=False)
+                ips.extend(str(h) for h in net.hosts())
+            except Exception:
+                pass
+        unique_ips = list(dict.fromkeys(ips))
+        eps = [(ip, p) for ip in unique_ips for p in default_ports]
+        return eps, subnets
+
+    eps = []
+    for t in target_tokens:
+        t = t.strip()
+        if not t:
+            continue
+        if "://" in t:
+            parts = urllib.parse.urlsplit(t)
+            host = parts.hostname or ""
+            port = parts.port or (443 if parts.scheme == "https" else 11434)
+            if host:
+                eps.append((host, port))
+            continue
+        if ":" in t and not t.count(":") > 1:
+            host, _, port_str = t.partition(":")
+            if port_str.isdigit():
+                eps.append((host, int(port_str)))
+                continue
+        if "/" in t:
+            try:
+                net = ipaddress.ip_network(t, strict=False)
+                if net.num_addresses > 65536:
+                    print(f"{C_YELLOW}[!] Warning: Subnet {t} has >65536 hosts; limited to first 65536.{C_RESET}", file=sys.stderr)
+                    count = 0
+                    for h in net.hosts():
+                        for p in default_ports:
+                            eps.append((str(h), p))
+                        count += 1
+                        if count >= 65536:
+                            break
+                else:
+                    for h in net.hosts():
+                        for p in default_ports:
+                            eps.append((str(h), p))
+            except Exception as e:
+                print(f"{C_RED}[!] Error parsing CIDR '{t}': {e}{C_RESET}", file=sys.stderr)
+        elif is_ip_range(t):
+            parts = t.split("-")
+            p1, p2 = parts[0].strip(), parts[1].strip()
+            try:
+                ip1 = ipaddress.IPv4Address(p1)
+                if "." in p2:
+                    ip2 = ipaddress.IPv4Address(p2)
+                else:
+                    prefix = ".".join(p1.split(".")[:3])
+                    ip2 = ipaddress.IPv4Address(f"{prefix}.{p2}")
+                if int(ip1) <= int(ip2):
+                    diff = int(ip2) - int(ip1) + 1
+                    if diff > 65536:
+                        print(f"{C_YELLOW}[!] Warning: Range {t} has >65536 hosts; skipping.{C_RESET}", file=sys.stderr)
+                    else:
+                        for i in range(int(ip1), int(ip2) + 1):
+                            sip = str(ipaddress.IPv4Address(i))
+                            for p in default_ports:
+                                eps.append((sip, p))
+            except Exception as e:
+                print(f"{C_RED}[!] Error parsing range '{t}': {e}{C_RESET}", file=sys.stderr)
+        else:
+            for p in default_ports:
+                eps.append((t, p))
+    # Deduplicate while preserving order
+    seen = set()
+    dedup = []
+    for ep in eps:
+        if ep not in seen:
+            seen.add(ep)
+            dedup.append(ep)
+    return dedup, []
+
+# Parse ports
+default_ports = []
+for p in ports_str.replace(" ", ",").split(","):
+    p = p.strip()
+    if p.isdigit() and 1 <= int(p) <= 65535:
+        default_ports.append(int(p))
+if not default_ports:
+    default_ports = [11434, 11438]
+
+target_tokens = targets_str.split() if targets_str else []
+endpoints, auto_subnets = expand_endpoints(target_tokens, default_ports, all_ifaces)
+
+if not endpoints:
+    print(f"{C_RED}Error: No valid IP addresses or targets found to scan.{C_RESET}", file=sys.stderr)
+    sys.exit(1)
+
+forwards = ssh_forwards()
+local_addrs = local_addresses()
+
+if not as_json:
+    if target_tokens:
+        scope_str = ", ".join(target_tokens)
+    elif auto_subnets:
+        scope_str = f"{', '.join(auto_subnets)} + loopback"
+    else:
+        scope_str = "local network"
+    ports_display = ",".join(str(p) for p in default_ports)
+    print(f"{C_BOLD}[🔍] Scanning {len(endpoints)} endpoint(s) across {scope_str} (ports: {ports_display}, {threads} threads)...{C_RESET}")
+
+timeout_sec = max(0.05, timeout_ms / 1000.0)
+
+def check_tcp(ep):
+    ip, port = ep
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(timeout_sec)
+    try:
+        res = s.connect_ex((ip, port))
+        s.close()
+        return ep if res == 0 else None
+    except Exception:
+        s.close()
+        return None
+
+t_scan_start = time.time()
+open_endpoints = []
+with ThreadPoolExecutor(max_workers=max(1, min(threads, len(endpoints)))) as pool:
+    futures = [pool.submit(check_tcp, ep) for ep in endpoints]
+    for fut in as_completed(futures):
+        res = fut.result()
+        if res:
+            open_endpoints.append(res)
+
+def probe_ollama(ep):
+    ip, port = ep
+    url = f"http://{ip}:{port}"
+    t0 = time.time()
+    try:
+        req = urllib.request.Request(f"{url}/api/version", headers={"User-Agent": "kimo-scanner"})
+        with urllib.request.urlopen(req, timeout=1.8) as resp:
+            ver_data = json.loads(resp.read().decode("utf-8", "replace"))
+            version = ver_data.get("version", "unknown")
+            lat_ms = round((time.time() - t0) * 1000, 1)
+    except urllib.error.HTTPError as e:
+        if e.code in (401, 403):
+            return {
+                "url": url, "host": ip, "port": port, "version": "auth-required",
+                "latency_ms": round((time.time() - t0) * 1000, 1), "model_count": 0,
+                "disk_bytes": 0, "disk_gb": 0, "vram_str": "unknown",
+                "resident": [], "models": [], "role": "auth required", "state": "auth"
+            }
+        return None
+    except Exception:
+        return None
+
+    models = []
+    disk_bytes = 0
+    try:
+        req = urllib.request.Request(f"{url}/api/tags", headers={"User-Agent": "kimo-scanner"})
+        with urllib.request.urlopen(req, timeout=1.8) as resp:
+            data = json.loads(resp.read().decode("utf-8", "replace"))
+            models = data.get("models", [])
+            disk_bytes = sum(int(m.get("size") or 0) for m in models)
+    except Exception:
+        pass
+
+    resident = []
+    try:
+        req = urllib.request.Request(f"{url}/api/ps", headers={"User-Agent": "kimo-scanner"})
+        with urllib.request.urlopen(req, timeout=1.8) as resp:
+            data = json.loads(resp.read().decode("utf-8", "replace"))
+            resident = data.get("models", [])
+    except Exception:
+        pass
+
+    # Role classification
+    if ip in LOOPBACK:
+        if port in forwards:
+            fhost, fport = forwards[port]
+            role = f"tunnel -> {fhost}:{fport}"
+        else:
+            role = "local daemon"
+    elif ip == REMOTE_HOST_IP:
+        tunnel_port = next((p for p, f in forwards.items() if f[0] == REMOTE_HOST_IP or f[0] == ip), None)
+        if tunnel_port:
+            role = f"remote GPU server (tunnel: :{tunnel_port})"
+        else:
+            role = "remote GPU server"
+    elif ip in local_addrs:
+        role = "local host (LAN interface)"
+    else:
+        role = "LAN node"
+
+    vram_str = "Idle"
+    if resident:
+        r0 = resident[0]
+        r_name = r0.get("name", "unknown")
+        r_vram = r0.get("size_vram", 0)
+        if r_vram > 0:
+            vram_str = f"{r_name} ({round(r_vram / 1e9, 1)} GB)"
+        else:
+            vram_str = f"{r_name}"
+
+    return {
+        "url": url,
+        "host": ip,
+        "port": port,
+        "version": version,
+        "latency_ms": lat_ms,
+        "model_count": len(models),
+        "disk_bytes": disk_bytes,
+        "disk_gb": round(disk_bytes / 1e9, 1),
+        "vram_str": vram_str,
+        "resident": resident,
+        "models": models,
+        "role": role,
+        "state": "live"
+    }
+
+instances = []
+if open_endpoints:
+    with ThreadPoolExecutor(max_workers=max(1, min(threads, len(open_endpoints)))) as pool:
+        futures = [pool.submit(probe_ollama, ep) for ep in open_endpoints]
+        for fut in as_completed(futures):
+            res = fut.result()
+            if res:
+                instances.append(res)
+
+scan_duration = round(time.time() - t_scan_start, 2)
+
+# Sort instances: local first, then remote GPU server, then by IP
+def sort_key(inst):
+    h, p = inst["host"], inst["port"]
+    if h in LOOPBACK and p == 11434:
+        return (0, h, p)
+    if h in LOOPBACK:
+        return (1, h, p)
+    if h == REMOTE_HOST_IP:
+        return (2, h, p)
+    if h in local_addrs:
+        return (3, h, p)
+    return (4, h, p)
+
+instances.sort(key=sort_key)
+
+# Pick best remote candidate for --save
+remote_candidates = [
+    inst for inst in instances
+    if inst["host"] not in LOOPBACK and inst["host"] not in local_addrs and inst["state"] == "live"
+]
+if not remote_candidates:
+    remote_candidates = [
+        inst for inst in instances
+        if inst["host"] in LOOPBACK and inst["port"] in forwards and inst["state"] == "live"
+    ]
+
+if candidate_file and remote_candidates:
+    best = sorted(remote_candidates, key=lambda c: (c["host"] == REMOTE_HOST_IP, c["model_count"]), reverse=True)[0]
+    try:
+        with open(candidate_file, "w") as cf:
+            cf.write(best["url"])
+    except Exception:
+        pass
+
+if as_json:
+    json_out = []
+    for inst in instances:
+        entry = {
+            "endpoint": inst["url"],
+            "host": inst["host"],
+            "port": inst["port"],
+            "state": inst["state"],
+            "version": inst["version"],
+            "latency_ms": inst["latency_ms"],
+            "model_count": inst["model_count"],
+            "disk_bytes": inst["disk_bytes"],
+            "disk_gb": inst["disk_gb"],
+            "role": inst["role"],
+            "vram_resident": [
+                {
+                    "name": m.get("name"),
+                    "size": m.get("size", 0),
+                    "size_vram": m.get("size_vram", 0),
+                    "parameter_size": m.get("details", {}).get("parameter_size", ""),
+                    "quantization_level": m.get("details", {}).get("quantization_level", ""),
+                    "context_length": m.get("details", {}).get("context_length") or m.get("context_length"),
+                    "expires_at": m.get("expires_at", "")
+                }
+                for m in inst["resident"]
+            ],
+            "models": [
+                {
+                    "name": m.get("name"),
+                    "size": m.get("size", 0),
+                    "parameter_size": m.get("details", {}).get("parameter_size", ""),
+                    "quantization_level": m.get("details", {}).get("quantization_level", ""),
+                    "format": m.get("details", {}).get("format", ""),
+                    "family": m.get("details", {}).get("family", ""),
+                    "context_length": m.get("details", {}).get("context_length"),
+                    "modified_at": m.get("modified_at", "")
+                }
+                for m in inst["models"]
+            ]
+        }
+        json_out.append(entry)
+    print(json.dumps(json_out, indent=2))
+    sys.exit(0)
+
+if not instances:
+    print(f"\n{C_YELLOW}[!] Scan complete in {scan_duration}s: No Ollama instances found across {len(endpoints)} scanned endpoint(s).{C_RESET}")
+    print("  Troubleshooting suggestions:")
+    print("    • Ensure Ollama is running and bound to all interfaces (OLLAMA_HOST=0.0.0.0:11434).")
+    print("    • Use -p / --ports to check non-standard ports (e.g. kimo scan --all-ports).")
+    print("    • Check firewall / security group permissions between hosts.")
+    sys.exit(0)
+
+print(f"{C_GREEN}[✓] Scan complete in {scan_duration}s ({len(endpoints)} endpoint(s) probed, {len(instances)} Ollama instance(s) discovered){C_RESET}\n")
+
+# Format instances table
+max_url = max(24, *(len(r["url"]) for r in instances))
+max_vram = max(14, *(len(r["vram_str"]) for r in instances))
+
+header_cols = [
+    ("ENDPOINT", max_url, "left", C_BOLD),
+    ("STATE", 6, "left", C_BOLD),
+    ("VERSION", 9, "left", C_BOLD),
+    ("LATENCY", 8, "right", C_BOLD),
+    ("MODELS", 6, "right", C_BOLD),
+    ("DISK GB", 8, "right", C_BOLD),
+    ("VRAM RESIDENCY", max_vram, "left", C_BOLD),
+    ("ROLE / NOTES", 32, "left", C_BOLD)
+]
+
+print(f"{C_BOLD}DISCOVERED OLLAMA INSTANCES:{C_RESET}")
+print("  " + " ".join(pad_ansi(t, w, a, c) for t, w, a, c in header_cols))
+print("  " + " ".join("-" * w for _, w, _, _ in header_cols))
+
+STATE_COLOR = {"live": C_GREEN, "auth": C_YELLOW, "down": C_RED}
+
+for r in instances:
+    state_col = STATE_COLOR.get(r["state"], C_YELLOW)
+    vram_col = C_CYAN if r["vram_str"] != "Idle" else C_DIM
+    cols = [
+        (r["url"], max_url, "left", None),
+        (r["state"], 6, "left", state_col),
+        (r["version"], 9, "left", None),
+        (f"{r['latency_ms']}ms", 8, "right", None),
+        (str(r["model_count"]), 6, "right", None),
+        (f"{r['disk_gb']} GB", 8, "right", None),
+        (r["vram_str"], max_vram, "left", vram_col),
+        (r["role"], 32, "left", None)
+    ]
+    print("  " + " ".join(pad_ansi(t, w, a, c) for t, w, a, c in cols))
+
+if deep:
+    print(f"\n{C_BOLD}DEEP MODEL INVENTORY:{C_RESET}")
+    for inst in instances:
+        print(f"\n  {C_CYAN}[●] {inst['url']}{C_RESET} {C_BOLD}(v{inst['version']} – {inst['model_count']} models, {inst['disk_gb']} GB disk){C_RESET}")
+        print(f"      Role: {inst['role']}")
+        if not inst["models"]:
+            print(f"      {C_DIM}No models installed on this host.{C_RESET}")
+            continue
+
+        resident_map = {m["name"]: m for m in inst["resident"]}
+        m_rows = []
+        for m in inst["models"]:
+            name = m.get("name", "")
+            details = m.get("details", {})
+            params = details.get("parameter_size", "-") or "-"
+            quant = details.get("quantization_level", "-") or "-"
+            size_gb = round(m.get("size", 0) / 1e9, 1)
+            ctx = details.get("context_length")
+            ctx_str = f"{round(ctx / 1024)}k" if ctx else "-"
+            if name in resident_map:
+                vram_b = resident_map[name].get("size_vram", 0)
+                vram_gb = round(vram_b / 1e9, 1)
+                vram_status = f"● {vram_gb} GB (Resident)"
+                vram_color = C_GREEN
+            else:
+                vram_status = "○ Idle"
+                vram_color = C_DIM
+            m_rows.append({
+                "name": name,
+                "params": params,
+                "quant": quant,
+                "disk": f"{size_gb} GB",
+                "ctx": ctx_str,
+                "vram_status": vram_status,
+                "vram_color": vram_color
+            })
+
+        name_w = max(30, *(len(r["name"]) for r in m_rows))
+        print(f"      {C_BOLD}Models Catalog:{C_RESET}")
+        m_header_cols = [
+            ("MODEL", name_w, "left", C_BOLD),
+            ("PARAMS", 8, "left", C_BOLD),
+            ("QUANT", 8, "left", C_BOLD),
+            ("DISK", 9, "right", C_BOLD),
+            ("CONTEXT", 9, "right", C_BOLD),
+            ("VRAM STATUS", 22, "left", C_BOLD)
+        ]
+        print("        " + " ".join(pad_ansi(t, w, a, c) for t, w, a, c in m_header_cols))
+        print("        " + " ".join("-" * w for _, w, _, _ in m_header_cols))
+
+        for r in m_rows:
+            cols = [
+                (r["name"], name_w, "left", None),
+                (r["params"], 8, "left", None),
+                (r["quant"], 8, "left", None),
+                (r["disk"], 9, "right", None),
+                (r["ctx"], 9, "right", None),
+                (r["vram_status"], 22, "left", r["vram_color"])
+            ]
+            print("        " + " ".join(pad_ansi(t, w, a, c) for t, w, a, c in cols))
+PYEOF
+
+    # Handle --save or --set-remote
+    if [[ "${json_output}" == "true" ]]; then
+        if [[ -n "${set_remote}" ]]; then
+            local dest_url="${set_remote}"
+            [[ "${dest_url}" != http* ]] && dest_url="http://${dest_url}"
+            cmd_config set remote_url "${dest_url}" >/dev/null 2>&1
+            load_kimo_config
+        elif [[ "${save_remote}" == "true" && -s "${candidate_file}" ]]; then
+            local chosen_url
+            chosen_url=$(<"${candidate_file}")
+            cmd_config set remote_url "${chosen_url}" >/dev/null 2>&1
+            load_kimo_config
+        fi
+    else
+        if [[ -n "${set_remote}" ]]; then
+            local dest_url="${set_remote}"
+            [[ "${dest_url}" != http* ]] && dest_url="http://${dest_url}"
+            echo ""
+            cmd_config set remote_url "${dest_url}"
+            load_kimo_config
+            echo "  ${C_DIM}Run '${0##*/} --remote list' or '${0##*/} config' to verify.${C_RESET}"
+        elif [[ "${save_remote}" == "true" ]]; then
+            if [[ -s "${candidate_file}" ]]; then
+                local chosen_url
+                chosen_url=$(<"${candidate_file}")
+                echo ""
+                cmd_config set remote_url "${chosen_url}"
+                load_kimo_config
+                echo "  ${C_DIM}Run '${0##*/} --remote list' or '${0##*/} config' to verify.${C_RESET}"
+            else
+                echo ""
+                echo "${C_YELLOW}[!] Notice: No remote Ollama instance discovered to save into configuration.${C_RESET}" >&2
+            fi
+        fi
+    fi
+    rm -f "${candidate_file}"
 }
 
 # -----------------------------------------------------------------------------
@@ -5100,7 +5841,7 @@ _kimo() {
         cword=$COMP_CWORD
     fi
 
-    local commands="list ls search find ps top warm preload stop unload tune set-ctx param bench eval benchmark info show tag alias rm delete pull download sync run launch install setup update upgrade doctor diagnose diag config cfg completion version status health hosts check ping stream logs rotate-token help"
+    local commands="list ls search find ps top warm preload stop unload tune set-ctx param bench eval benchmark info show tag alias rm delete pull download sync run launch install setup update upgrade doctor diagnose diag config cfg completion version status health hosts scan discover check ping stream logs rotate-token help"
     local global_opts="--remote --local --host --json --no-color -v --version -h --help"
     local supported_clis="claude grok kimi agy codex qwen cursor opencode cyberstrike openclaw hermes"
     local config_subcmds="get set unset list file help"
@@ -5253,6 +5994,11 @@ _kimo() {
                 COMPREPLY=( $(compgen -W "--json -h --help" -- "${cur}") )
             fi
             ;;
+        scan|discover)
+            if [[ "${cur}" == -* ]]; then
+                COMPREPLY=( $(compgen -W "-p --ports --all-ports -t --threads --timeout -m --models --deep --all-interfaces --save --set-remote --json -h --help" -- "${cur}") )
+            fi
+            ;;
         *)
             if [[ "${cur}" == -* ]]; then
                 COMPREPLY=( $(compgen -W "${global_opts}" -- "${cur}") )
@@ -5292,6 +6038,8 @@ _kimo() {
         'doctor:Run system and ecosystem diagnostics'
         'config:Manage persistent configuration'
         'hosts:Inventory reachable cluster nodes'
+        'scan:Discover Ollama instances across network'
+        'discover:Alias for scan'
         'check:Health and latency check'
         'status:Operational snapshot'
         'stream:Pin remote model availability'
@@ -5342,6 +6090,20 @@ _kimo() {
                         '--force[Force overwrite]' \
                         '*: :->models' && return 0
                     ;;
+                scan|discover)
+                    _arguments \
+                        '(-p --ports)'{-p,--ports}'[Ports to scan]:ports:' \
+                        '--all-ports[Scan common Ollama and proxy ports]' \
+                        '(-t --threads)'{-t,--threads}'[Worker threads]:threads:' \
+                        '--timeout[Probe timeout in ms]:timeout:' \
+                        '(-m --models --deep)'{-m,--models,--deep}'[Deep model inspection]' \
+                        '--all-interfaces[Scan all interfaces including Docker]' \
+                        '--save[Save discovered remote node to config]' \
+                        '--set-remote[Set specific node as remote]:endpoint:' \
+                        '--json[Output in JSON format]' \
+                        '(-h --help)'{-h,--help}'[Show help]' \
+                        '*: :_hosts' && return 0
+                    ;;
                 *)
                     local -a models
                     models=(${(f)"$(kimo list 2>/dev/null | awk 'NR>2 && $1 !~ /^(Total|---|Hosts)/ {print $1}')"})
@@ -5383,7 +6145,7 @@ EOFZSH
 # first --host).
 if [[ "${HOST_MODE}" == "multi" ]]; then
     case "${COMMAND}" in
-        check|ping|hosts|ps|top|list|ls|search|find|stop|unload|info|show|status|health|status-report|report|logs|log|rotate-token|rotate|install|setup|update|upgrade|doctor|diagnose|diag|config|cfg|completion|sync|version|help|-h|--help) ;;
+        check|ping|hosts|scan|discover|ps|top|list|ls|search|find|stop|unload|info|show|status|health|status-report|report|logs|log|rotate-token|rotate|install|setup|update|upgrade|doctor|diagnose|diag|config|cfg|completion|sync|version|help|-h|--help) ;;
         *)
             _model="${ARGS[0]:-}"
             if [[ "${COMMAND}" == "launch" ]]; then
@@ -5416,6 +6178,9 @@ case "${COMMAND}" in
         ;;
     hosts)
         cmd_hosts
+        ;;
+    scan|discover)
+        cmd_scan "${ARGS[@]}"
         ;;
     ps)
         cmd_ps "${ARGS[@]}"

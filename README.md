@@ -9,6 +9,7 @@
 ## Features
 
 - **Multi-Host Routing**: Seamlessly query or execute against local daemons and remote GPU servers over SSH tunnels or direct LAN connections.
+- **Network Discovery & LAN Scanning**: Fast, multithreaded network discovery tool (`scan` / `discover`) identifying active Ollama instances across local subnets, IP ranges, or CIDR blocks with deep model catalog and VRAM residency inspection.
 - **Real-Time VRAM Monitor**: Live interactive GPU/CPU residency monitor (`top` / `ps --watch`) tracking memory usage across cluster hosts.
 - **Cluster Model Replication**: One-click bidirectional synchronization and digest verification across cluster hosts (`sync`).
 - **Streaming Model Benchmarking**: True time-to-first-token (TTFT) profiling, generation throughput (tok/s), memory residency, and structured JSON output (`bench`).
@@ -89,10 +90,11 @@ kimo [options] <command> [arguments...]
 | Command | Description | Example |
 |---|---|---|
 | `check`, `ping` | Connectivity, latency, and health check for local and remote hosts | `kimo check` |
+| `hosts` | Detailed table of reachable servers, versions, models, disk GB | `kimo hosts` |
+| `scan`, `discover [target]` | Discover active Ollama instances on LAN/subnets (`-m`, `--save`) | `kimo scan -m` |
 | `doctor` | All-in-one health diagnostics (system, tunnel, daemons, CLIs) | `kimo doctor` |
 | `config [subcmd]` | View and manage persistent defaults in `~/.config/kimo/config` | `kimo config set default_host remote` |
 | `status`, `health` | Operational snapshot: tunnel, remote API, VRAM residency, timer | `kimo status` |
-| `hosts` | Detailed table of reachable servers, versions, models, disk GB | `kimo hosts` |
 | `list [filter]` | List all installed models across hosts, highlighting active VRAM | `kimo list nemotron` |
 | `search <query>` | Search models across catalogs by name, parameters, capabilities | `kimo search 27b` |
 | `ps` | Display models currently resident in GPU/CPU VRAM with memory stats | `kimo ps` |
@@ -286,6 +288,53 @@ Features:
 - Smart directional resolution: auto-detects which host has the model and replicates to the other.
 - Integrated streaming pull progress on the destination host.
 - Conflict detection with actionable `--force` guidance when digests differ.
+
+---
+
+## Network Discovery & Instance Scanning (`scan` / `discover`)
+
+`kimo scan` is a high-performance multithreaded network discovery tool designed to probe local physical interfaces, CIDR subnets, IP ranges, or specific endpoints to identify reachable Ollama instances, measure round-trip latency, inspect model catalogs, and report GPU VRAM residency:
+
+```bash
+# Auto-detect physical LAN subnet (e.g. 192.168.1.0/24) and loopback
+kimo scan
+
+# Deep model inspection: full model inventory, parameter counts, quantizations, and VRAM status
+kimo scan -m
+
+# Scan specific subnet with custom port
+kimo scan 192.168.1.0/24 -p 11434
+
+# Scan custom IP range
+kimo scan 192.168.1.100-150
+
+# Scan all common Ollama & reverse-proxy ports (11434-11438, 8000, 8080)
+kimo scan --all-ports
+
+# Automatically discover and save remote node to persistent ~/.config/kimo/config
+kimo scan --save
+
+# Point remote_url directly to a discovered node
+kimo scan --set-remote 192.168.1.104:11434
+
+# Output discovery results in structured JSON format for automation and CI
+kimo scan --json
+```
+
+### Options:
+
+| Option | Description |
+|---|---|
+| `-p, --ports <ports>` | Comma-separated list of ports to scan (default: `11434,11438`) |
+| `--all-ports` | Scan common Ollama and proxy ports (`11434-11438, 8000, 8080`) |
+| `-t, --threads <num>` | Concurrency worker threads (default: `64`) |
+| `--timeout <ms>` | Socket connection timeout in milliseconds (default: `400`) |
+| `-m, --models, --deep` | Deep model inspection (model list, size, params, quant, VRAM residency) |
+| `--all-interfaces` | Scan all interfaces including virtual container bridges (Docker, CNI) |
+| `--save` | Automatically save the best discovered remote node to `~/.config/kimo/config` |
+| `--set-remote <endpoint>` | Set specified discovered endpoint as `remote_url` in config |
+| `--json` | Output discovery results in structured JSON |
+| `-h, --help` | Show scan help and usage information |
 
 ---
 
