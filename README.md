@@ -149,6 +149,9 @@ kimo config set default_model kalidroid-27b:latest
 # Set default thinking effort for Kimi Code CLI
 kimo config set kimi_effort xhigh
 
+# Set default context window for Kimi Code CLI (e.g. 256k tokens)
+kimo config set kimi_context 262144
+
 # Query a specific setting value
 kimo config get default_host
 
@@ -168,6 +171,7 @@ kimo config path
 | `remote_url` | Endpoint URL for the remote Ollama GPU host | `http://127.0.0.1:11438` |
 | `local_url` | Endpoint URL for the local Ollama daemon | `http://127.0.0.1:11434` |
 | `kimi_effort` | Default thinking effort for Kimi (`low`, `medium`, `high`, `xhigh`, `max`) | `default` |
+| `kimi_context` | Default context window length in tokens for Kimi Code CLI | `auto` (model architecture/runtime) |
 | `no_color` | Disable ANSI terminal color codes (`true`/`false`) | `false` |
 
 ---

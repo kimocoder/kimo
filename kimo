@@ -63,6 +63,9 @@ load_kimo_config() {
     if [[ -n "${KIMO_CONFIG_VALUES[kimi_effort]:-}" && -z "${KIMO_KIMI_EFFORT:-}" && -z "${OM_KIMI_EFFORT:-}" ]]; then
         KIMO_KIMI_EFFORT="${KIMO_CONFIG_VALUES[kimi_effort]}"
     fi
+    if [[ -n "${KIMO_CONFIG_VALUES[kimi_context]:-}" && -z "${KIMO_KIMI_CONTEXT:-}" ]]; then
+        KIMO_KIMI_CONTEXT="${KIMO_CONFIG_VALUES[kimi_context]}"
+    fi
     if [[ "${KIMO_CONFIG_VALUES[no_color]:-}" == "true" && -z "${FORCE_NO_COLOR:-}" && "${NO_COLOR:-0}" != "1" ]]; then
         FORCE_NO_COLOR=true
     fi
@@ -1408,10 +1411,16 @@ cmd_warm() {
     fi
 
     echo "${C_CYAN}[*] Pre-warming model '${resolved_model}' into GPU VRAM on ${active_host} (keep_alive: ${duration})...${C_RESET}"
+    local tp_warm warm_opts="{}"
+    tp_warm=$(tuned_params "${resolved_model}" || true)
+    if [[ -n "${tp_warm}" ]]; then
+        warm_opts="${tp_warm}"
+    fi
+
     local resp
     resp=$(curl -s -X POST "${active_host}/api/generate" \
         -H "Content-Type: application/json" \
-        -d "$(jq -nc --arg m "${resolved_model}" --arg k "${duration}" '{model: $m, keep_alive: $k}')")
+        -d "$(jq -nc --arg m "${resolved_model}" --arg k "${duration}" --argjson opt "${warm_opts}" '{model: $m, keep_alive: $k, stream: false, options: $opt}')")
 
     if echo "${resp}" | grep -q '"done_reason":"load"'; then
         echo "${C_GREEN}[✓] Successfully pre-warmed '${resolved_model}' into VRAM (resident for ${duration}).${C_RESET}"
@@ -3445,7 +3454,11 @@ launch_usage() {
 ${C_BOLD}kimo launch${C_RESET} – Launch external LLM agent CLIs routed to Ollama models
 
 ${C_YELLOW}Usage:${C_RESET}
-  ${0##*/} [global-options] launch <cli> [--model <model>] [cli-arguments...]
+  ${0##*/} [global-options] launch <cli> [--model <model>] [--ctx <tokens>] [cli-arguments...]
+
+${C_YELLOW}Launch Options:${C_RESET}
+  --model <model>           Target model name (defaults to preset per CLI)
+  -c, --ctx, --context <N>  Override context window length in tokens (for kimi, grok, etc.)
 
 ${C_YELLOW}Supported CLIs:${C_RESET}
   ${C_CYAN}claude${C_RESET}        Anthropic Claude Code CLI
@@ -3464,13 +3477,13 @@ ${C_YELLOW}CLI Integration Mechanics:${C_RESET}
                 shim is spawned on a free localhost port and modelProvider is patched
                 for the duration of the session, then cleanly restored on exit.
   ${C_BOLD}grok${C_RESET}         Grok Build takes no endpoint flag; its catalog and inference are directed
-                to the resolved host via GROK_MODELS_BASE_URL. A tuned num_ctx (tune --ctx)
-                becomes that model's context_window in config.toml, restored on exit.
+                to the resolved host via GROK_MODELS_BASE_URL. A tuned or specified num_ctx
+                (--ctx, tune --ctx) becomes that model's context_window in config.toml, restored on exit.
   ${C_BOLD}kimi${C_RESET}         Kimi Code registers an additive, idempotent provider and model alias in
                 ~/.kimi-code/config.toml for the resolved host and launches with -m <alias>.
-                Tuned num_ctx (capped at runtime num_ctx for 85% auto-compaction) becomes
-                max_context_size. Thinking models declare support_efforts low..max so the
-                in-session /effort picker works (mapped via reasoning_key).
+                Context length (--ctx, KIMO_KIMI_CONTEXT, or tuned num_ctx) becomes
+                max_context_size (capped at model architecture maximum). Thinking models declare
+                support_efforts low..max so the in-session /effort picker works (mapped via reasoning_key).
   ${C_BOLD}claude${C_RESET}       Directs Claude Code to the target host via ANTHROPIC_BASE_URL.
   ${C_BOLD}codex/qwen${C_RESET}   Configured with custom Ollama API endpoints and model parameters.
   ${C_BOLD}cyberstrike${C_RESET}  Cyberstrike AI-Powered Penetration Testing Agent. Automatically registers
@@ -3478,6 +3491,8 @@ ${C_YELLOW}CLI Integration Mechanics:${C_RESET}
                  addressing targets via the 'ollama/<model>' format.
 
 ${C_YELLOW}Environment Overrides:${C_RESET}
+  KIMO_KIMI_CONTEXT         Override Kimi model max context size in tokens (or 'kimo config set kimi_context <N>')
+  KIMO_CONTEXT              Global context window override in tokens for external CLIs
   KIMO_KIMI_EFFORT          Default thinking effort (low, medium, high, xhigh, max)
   KIMO_KIMI_EFFORTS         Supported thinking efforts list (e.g. low,medium,high,max)
   KIMO_KIMI_CAPABILITIES    Override detected model capabilities (e.g. tool_use,thinking)
@@ -3487,11 +3502,11 @@ ${C_YELLOW}Environment Overrides:${C_RESET}
   KIMO_KIMI_CONFIG_LOCK     Lockfile for concurrent Kimi config updates (/tmp/kimo-kimi-config.lock)
 
 ${C_YELLOW}Examples:${C_RESET}
-  ${0##*/} launch grok --model kalidroid-27b:latest
+  ${0##*/} launch grok --model kalidroid-27b:latest --ctx 65536
+  ${0##*/} --remote launch kimi --model kalidroid-27b:latest --ctx 262144
   ${0##*/} --remote launch claude --model nemotron3:33b
   ${0##*/} launch cyberstrike --model kalidroid-27b:latest
   ${0##*/} launch agy --model kalidroid-27b:latest
-  ${0##*/} --remote launch kimi --model kalidroid-27b:latest
 EOF
 }
 
@@ -3505,6 +3520,7 @@ cmd_launch() {
 
     local target_model="${DEFAULT_MODELS[$provider]:-}"
     local cli_passthrough_args=()
+    local opt_launch_ctx=""
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -3521,12 +3537,30 @@ cmd_launch() {
                 target_model="${1#*=}"
                 shift
                 ;;
+            -c|--ctx|--context)
+                shift
+                if [[ -z "${1:-}" ]]; then
+                    echo "${C_RED}Error: --ctx requires a token count argument.${C_RESET}" >&2
+                    exit 1
+                fi
+                opt_launch_ctx="$1"
+                shift
+                ;;
+            --ctx=*|--context=*)
+                opt_launch_ctx="${1#*=}"
+                shift
+                ;;
             *)
                 cli_passthrough_args+=("$1")
                 shift
                 ;;
         esac
     done
+
+    if [[ -n "${opt_launch_ctx}" && ! "${opt_launch_ctx}" =~ ^[0-9]+$ ]]; then
+        echo "${C_RED}Error: --ctx must be a positive integer in tokens (got '${opt_launch_ctx}').${C_RESET}" >&2
+        exit 1
+    fi
 
     if [[ -z "${target_model}" ]]; then
         target_model="${provider}"
@@ -3610,6 +3644,10 @@ cmd_launch() {
         echo "${C_DIM}[*] Tuned defaults for '${resolved_model}': $(echo "${tp}" | jq -c .)${C_RESET}"
     fi
 
+    if [[ -n "${opt_launch_ctx}" ]]; then
+        export OLLAMA_CONTEXT_LENGTH="${opt_launch_ctx}"
+    fi
+
     if [[ -n "${cli_cmd}" ]] && command -v "${cli_cmd}" >/dev/null 2>&1; then
         echo "${C_GREEN}[*] Launching external CLI '${cli_cmd}' (Model: ${resolved_model}, Host: ${active_host})...${C_RESET}"
         case "${cli_cmd}" in
@@ -3642,11 +3680,11 @@ cmd_launch() {
                 # key there would leak it off this box. Ollama ignores the value.
                 export XAI_API_KEY="ollama"
 
-                # A tuned num_ctx cannot reach grok through the environment, so it
-                # goes into config.toml as this model's context_window. Read from the
-                # tuning itself rather than $OLLAMA_CONTEXT_LENGTH, which a caller
-                # may have set for unrelated reasons.
-                if [[ -n "${tp:-}" ]]; then
+                # A tuned or specified num_ctx goes into config.toml as this model's
+                # context_window. Read from launch flag, config/env, or tuning.
+                if [[ -n "${opt_launch_ctx}" ]]; then
+                    grok_ctx="${opt_launch_ctx}"
+                elif [[ -n "${tp:-}" ]]; then
                     grok_ctx=$(echo "${tp}" | jq -r '.num_ctx? // empty') || grok_ctx=""
                 fi
                 if [[ -n "${grok_ctx}" ]] && grok_patch_context "${resolved_model}" "${grok_ctx}"; then
@@ -3677,36 +3715,38 @@ cmd_launch() {
                 local kimi_show="" kimi_caps="" kimi_ctx="" kimi_alias=""
                 kimi_show=$(curl -s --connect-timeout 2 -m 5 "${active_host}/api/show" \
                     -d "$(jq -nc --arg m "${resolved_model}" '{model: $m}')") || kimi_show=""
-                if [[ -n "${tp:-}" ]]; then
-                    kimi_ctx=$(echo "${tp}" | jq -r '.num_ctx? // empty') || kimi_ctx=""
-                fi
-                # The runtime num_ctx (Modelfile PARAMETER, in .parameters) is what
-                # the Ollama server actually enforces - NOT model_info's
-                # *.context_length, which is only the architecture maximum.
-                # Declaring the larger number is fatal for agent sessions: kimi
-                # auto-compacts at 85% of the DECLARED window, so with 262144
-                # declared it stays passive while Ollama silently truncates the
-                # oldest messages past 131072 - and once truncation eats the
-                # initial user prompt of a subagent run, every remaining
-                # user-role message is a <tool_response> wrapper, which
-                # kalidroid's Jinja template rejects with a hard 500 ("No user
-                # query found in messages."). Cap the declaration at the runtime
-                # value so compaction always fires first. A tuned --ctx larger
-                # than the runtime is unenforceable here anyway: the /v1 path
-                # carries no per-request num_ctx.
-                local kimi_runtime_ctx=""
+
+                local kimi_runtime_ctx="" kimi_arch_ctx=""
                 if [[ -n "${kimi_show}" ]]; then
                     kimi_runtime_ctx=$(echo "${kimi_show}" | jq -r '(.parameters // "") | if test("num_ctx") then (capture("num_ctx\\s+(?<v>[0-9]+)") | .v) else empty end' 2>/dev/null) || kimi_runtime_ctx=""
+                    kimi_arch_ctx=$(echo "${kimi_show}" | jq -r '[.model_info // {} | to_entries[] | select(.key | endswith("context_length")) | .value] | max // empty' 2>/dev/null) || kimi_arch_ctx=""
                 fi
-                if [[ "${kimi_runtime_ctx}" =~ ^[0-9]+$ ]]; then
-                    if [[ ! "${kimi_ctx}" =~ ^[0-9]+$ ]] || ((kimi_ctx > kimi_runtime_ctx)); then
-                        kimi_ctx="${kimi_runtime_ctx}"
+
+                # Context length precedence:
+                # 1. Explicit launch CLI flag (--ctx / --context)
+                # 2. Environment variable (KIMO_KIMI_CONTEXT or KIMO_CONTEXT)
+                # 3. Model tuning registry (tune --ctx)
+                # 4. Model runtime Modelfile parameter (num_ctx)
+                # 5. Model architecture maximum (context_length)
+                local requested_ctx="${opt_launch_ctx:-${KIMO_KIMI_CONTEXT:-${KIMO_CONTEXT:-}}}"
+                if [[ -z "${requested_ctx}" && -n "${tp:-}" ]]; then
+                    requested_ctx=$(echo "${tp}" | jq -r '.num_ctx? // empty') || requested_ctx=""
+                fi
+
+                if [[ -n "${requested_ctx}" && "${requested_ctx}" =~ ^[0-9]+$ ]]; then
+                    kimi_ctx="${requested_ctx}"
+                    if [[ "${kimi_arch_ctx}" =~ ^[0-9]+$ ]] && ((kimi_ctx > kimi_arch_ctx)); then
+                        echo "${C_YELLOW}[!] Warning: Requested context (${kimi_ctx}) exceeds model architecture maximum (${kimi_arch_ctx}). Capping to ${kimi_arch_ctx}.${C_RESET}" >&2
+                        kimi_ctx="${kimi_arch_ctx}"
                     fi
+                elif [[ "${kimi_runtime_ctx}" =~ ^[0-9]+$ ]]; then
+                    kimi_ctx="${kimi_runtime_ctx}"
+                elif [[ "${kimi_arch_ctx}" =~ ^[0-9]+$ ]]; then
+                    kimi_ctx="${kimi_arch_ctx}"
                 fi
-                if [[ -z "${kimi_ctx}" && -n "${kimi_show}" ]]; then
-                    # No tuning and no runtime num_ctx: fall back to the
-                    # architecture maximum - the best observable estimate.
-                    kimi_ctx=$(echo "${kimi_show}" | jq -r '[.model_info // {} | to_entries[] | select(.key | endswith("context_length")) | .value] | max // empty' 2>/dev/null) || kimi_ctx=""
+
+                if [[ -n "${kimi_ctx}" ]]; then
+                    export OLLAMA_CONTEXT_LENGTH="${kimi_ctx}"
                 fi
 
                 # Capabilities decide whether kimi enables thinking at all: with
@@ -4503,12 +4543,14 @@ ${C_YELLOW}Available Keys:${C_RESET}
   ${C_BOLD}remote_url${C_RESET}         Default remote server endpoint URL
   ${C_BOLD}local_url${C_RESET}          Default local daemon endpoint URL
   ${C_BOLD}kimi_effort${C_RESET}        Default thinking effort for Kimi Code CLI (low, medium, high, xhigh, max)
+  ${C_BOLD}kimi_context${C_RESET}       Override context window length for Kimi in tokens (e.g. 262144)
   ${C_BOLD}no_color${C_RESET}           Disable ANSI color escapes (true/false)
 
 ${C_YELLOW}Examples:${C_RESET}
   ${0##*/} config                         # View all effective configurations
   ${0##*/} config set default_host remote # Always default to remote server
   ${0##*/} config set kimi_effort xhigh   # Set default thinking effort
+  ${0##*/} config set kimi_context 262144 # Set 256k context for Kimi Code CLI
   ${0##*/} config get default_host        # Query specific setting
   ${0##*/} config unset default_host      # Revert to built-in default
 EOF
@@ -4528,7 +4570,7 @@ cmd_config() {
             printf "  ${C_CYAN}%-18s %-32s %-20s${C_RESET}\n" "KEY" "CURRENT VALUE" "SOURCE"
             echo "  ----------------------------------------------------------------------------------"
 
-            local known_keys=("default_host" "default_model" "remote_url" "local_url" "kimi_effort" "no_color")
+            local known_keys=("default_host" "default_model" "remote_url" "local_url" "kimi_effort" "kimi_context" "no_color")
             for k in "${known_keys[@]}"; do
                 local val=""
                 local src="built-in default"
@@ -4551,6 +4593,10 @@ cmd_config() {
                     kimi_effort)
                         val="${KIMO_KIMI_EFFORT:-${OM_KIMI_EFFORT:-default}}"
                         [[ -n "${KIMO_KIMI_EFFORT:-}" || -n "${OM_KIMI_EFFORT:-}" ]] && src="config/env"
+                        ;;
+                    kimi_context)
+                        val="${KIMO_KIMI_CONTEXT:-auto (model architecture / runtime)}"
+                        [[ -n "${KIMO_KIMI_CONTEXT:-}" ]] && src="config/env"
                         ;;
                     no_color)
                         val="${FORCE_NO_COLOR:-false}"
@@ -4584,11 +4630,15 @@ cmd_config() {
                 return 1
             fi
             case "${key}" in
-                default_host|default_model|remote_url|local_url|kimi_effort|no_color) ;;
+                default_host|default_model|remote_url|local_url|kimi_effort|kimi_context|no_color) ;;
                 *)
                     echo "${C_YELLOW}[!] Warning: '${key}' is not a standard kimo configuration key.${C_RESET}" >&2
                     ;;
             esac
+            if [[ "${key}" == "kimi_context" && ! "${val}" =~ ^[0-9]+$ ]]; then
+                echo "${C_RED}Error: 'kimi_context' must be a positive integer in tokens (e.g. 65536, 131072, 262144).${C_RESET}" >&2
+                return 1
+            fi
             mkdir -p "${KIMO_CONFIG_DIR}"
             touch "${KIMO_CONFIG_FILE}"
 
@@ -4954,7 +5004,7 @@ _kimo() {
     local global_opts="--remote --local --host --json --no-color -v --version -h --help"
     local supported_clis="claude grok kimi agy codex qwen opencode cyberstrike openclaw hermes"
     local config_subcmds="get set unset list file help"
-    local config_keys="default_host preferred_cli vram_reserve_mb timeout_sec"
+    local config_keys="default_host default_model remote_url local_url kimi_effort kimi_context no_color"
     local log_services="tunnel keepalive timer apache all"
 
     local cmd=""
@@ -4997,7 +5047,7 @@ _kimo() {
                 return 0
             fi
             if [[ "${cur}" == -* ]]; then
-                COMPREPLY=( $(compgen -W "--model -h --help" -- "${cur}") )
+                COMPREPLY=( $(compgen -W "--model -c --ctx --context -h --help" -- "${cur}") )
             else
                 COMPREPLY=( $(compgen -W "${supported_clis}" -- "${cur}") )
             fi
