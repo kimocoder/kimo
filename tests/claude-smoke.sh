@@ -1,0 +1,154 @@
+#!/usr/bin/env bash
+# Headless smoke tests for kimo's 'claude' launch branch.
+#
+# Mocked layer (always): a fake 'claude' on PATH records the argv/env that kimo
+# passes, so we can assert the invocation contract without launching the TUI:
+#   * --model present
+#   * ANTHROPIC_BASE_URL / ANTHROPIC_API_BASE point at the resolved host
+#   * CLAUDE_CODE_EFFORT_LEVEL and the CLAUDE_CODE_* defaults are exported
+#   * ANTHROPIC_API_KEY is scrubbed to 'ollama' for non-plain-local hosts, and
+#     only forwards a real ANTHROPIC_API_KEY/AUTH_TOKEN to a plain local daemon
+#   * kimo never overrides API_TIMEOUT_MS (claude's own default is 600000 ms)
+#
+# Live layer (opt-in, --live): if a real 'claude' and a reachable Ollama host
+# are available, run a headless -p turn and require a sane answer. Slow and
+# network-dependent, so it is skipped by default.
+#
+# Usage: tests/claude-smoke.sh [--live]
+
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+KIMO="${ROOT_DIR}/kimo"
+LIVE=0
+[[ "${1:-}" == "--live" ]] && LIVE=1
+
+TMPDIR_C="$(mktemp -d)"
+cleanup() { rm -rf "${TMPDIR_C}"; }
+trap cleanup EXIT
+
+FAKE_DIR="${TMPDIR_C}/bin"
+mkdir -p "${FAKE_DIR}"
+CAPTURE="${TMPDIR_C}/call.txt"
+export CLAUDE_SMOKE_OUT="${CAPTURE}"
+
+cat > "${FAKE_DIR}/claude" <<'FAKE'
+#!/usr/bin/env bash
+out="${CLAUDE_SMOKE_OUT:?CLAUDE_SMOKE_OUT unset}"
+{
+    printf 'ARGV\n'
+    printf '%s\n' "$@"
+    printf 'ENV\n'
+    printf 'ANTHROPIC_API_KEY=%s\n' "${ANTHROPIC_API_KEY-}"
+    printf 'ANTHROPIC_AUTH_TOKEN=%s\n' "${ANTHROPIC_AUTH_TOKEN-<unset>}"
+    printf 'ANTHROPIC_BASE_URL=%s\n' "${ANTHROPIC_BASE_URL-}"
+    printf 'ANTHROPIC_API_BASE=%s\n' "${ANTHROPIC_API_BASE-}"
+    printf 'CLAUDE_CODE_EFFORT_LEVEL=%s\n' "${CLAUDE_CODE_EFFORT_LEVEL-}"
+    printf 'CLAUDE_CODE_MAX_OUTPUT_TOKENS=%s\n' "${CLAUDE_CODE_MAX_OUTPUT_TOKENS-}"
+    printf 'CLAUDE_CODE_AUTO_COMPACT_WINDOW=%s\n' "${CLAUDE_CODE_AUTO_COMPACT_WINDOW-}"
+    printf 'API_TIMEOUT_MS=%s\n' "${API_TIMEOUT_MS-<unset>}"
+} > "${out}"
+exit 0
+FAKE
+chmod +x "${FAKE_DIR}/claude"
+
+pass=0 fail=0
+ok()   { printf '  \033[32mPASS\033[0m %s\n' "$1"; pass=$((pass + 1)); }
+bad()  { printf '  \033[31mFAIL\033[0m %s\n' "$1"; fail=$((fail + 1)); }
+check() { # <description> <expected> <actual>
+    if [[ "$2" == "$3" ]]; then ok "$1 ($3)"; else bad "$1: expected '$2', got '$3'"; fi
+}
+
+flag_val() { awk -v f="$2" '$0==f{getline; print; exit}' "$1"; }
+has_flag() { awk -v f="$2" '$0==f{found=1} END{exit !found}' "$1"; }
+env_val()  { sed -n "s/^$2=//p" "$1" | head -n1; }
+
+# Host ports are deliberately unassigned (9) so no real Ollama is contacted and
+# no live model gets unloaded as a launch side effect.
+run_launch() { # <host-mode-args...> ; sets CAPTURE
+    rm -f "${CAPTURE}"
+    PATH="${FAKE_DIR}:${PATH}" "${KIMO}" "$@" launch claude --model kalidroid-27b:latest \
+        >/dev/null 2>&1 || true
+}
+LOCAL_HOST="http://127.0.0.1:9"          # loopback, unreachable
+REMOTE_HOST="http://192.168.1.131:9"     # LAN address, unreachable
+TUNNEL_HOST="http://127.0.0.1:11438"     # ssh -L tunnel (loopback but off-box)
+
+SENTINEL="sk-ant-REAL-SENTINEL-do-not-leak"
+export ANTHROPIC_API_KEY="${SENTINEL}"
+export ANTHROPIC_AUTH_TOKEN="${SENTINEL}"
+
+echo "[*] mocked: invocation contract"
+run_launch --host "${LOCAL_HOST}"
+if [[ ! -f "${CAPTURE}" ]]; then
+    bad "fake claude was never exec'd (no capture); cannot assert"
+else
+    if has_flag "${CAPTURE}" --model && [[ -n "$(flag_val "${CAPTURE}" --model)" ]]; then
+        ok "--model present: $(flag_val "${CAPTURE}" --model)"
+    else
+        bad "--model missing"
+    fi
+    check "ANTHROPIC_BASE_URL is the host" "${LOCAL_HOST}" "$(env_val "${CAPTURE}" ANTHROPIC_BASE_URL)"
+    check "ANTHROPIC_API_BASE is the host/v1" "${LOCAL_HOST}/v1" "$(env_val "${CAPTURE}" ANTHROPIC_API_BASE)"
+    check "CLAUDE_CODE_EFFORT_LEVEL default" "low" "$(env_val "${CAPTURE}" CLAUDE_CODE_EFFORT_LEVEL)"
+    check "CLAUDE_CODE_MAX_OUTPUT_TOKENS default" "8192" "$(env_val "${CAPTURE}" CLAUDE_CODE_MAX_OUTPUT_TOKENS)"
+    check "CLAUDE_CODE_AUTO_COMPACT_WINDOW default" "100000" "$(env_val "${CAPTURE}" CLAUDE_CODE_AUTO_COMPACT_WINDOW)"
+fi
+
+echo "[*] mocked: api-key scrub"
+run_launch --host "${LOCAL_HOST}"
+check "plain local host forwards the real key" "${SENTINEL}" "$(env_val "${CAPTURE}" ANTHROPIC_API_KEY)"
+check "plain local host keeps ANTHROPIC_AUTH_TOKEN" "${SENTINEL}" "$(env_val "${CAPTURE}" ANTHROPIC_AUTH_TOKEN)"
+
+( export OLLAMA_REMOTE_URL="${REMOTE_HOST}"; run_launch --remote )
+check "remote host scrubs ANTHROPIC_API_KEY to ollama" "ollama" "$(env_val "${CAPTURE}" ANTHROPIC_API_KEY)"
+check "remote host unsets ANTHROPIC_AUTH_TOKEN" "<unset>" "$(env_val "${CAPTURE}" ANTHROPIC_AUTH_TOKEN)"
+
+run_launch --host "${REMOTE_HOST}"
+check "LAN host scrubs ANTHROPIC_API_KEY to ollama" "ollama" "$(env_val "${CAPTURE}" ANTHROPIC_API_KEY)"
+
+run_launch --host "${TUNNEL_HOST}"
+check "ssh -L tunnel host scrubs ANTHROPIC_API_KEY to ollama" "ollama" "$(env_val "${CAPTURE}" ANTHROPIC_API_KEY)"
+
+echo "[*] mocked: effort + timeout passthrough"
+CLAUDE_CODE_EFFORT_LEVEL=high run_launch --host "${LOCAL_HOST}"
+check "existing CLAUDE_CODE_EFFORT_LEVEL is honoured" "high" "$(env_val "${CAPTURE}" CLAUDE_CODE_EFFORT_LEVEL)"
+
+run_launch --host "${LOCAL_HOST}"
+check "kimo does not set API_TIMEOUT_MS (claude default 600000)" "<unset>" "$(env_val "${CAPTURE}" API_TIMEOUT_MS)"
+
+API_TIMEOUT_MS=90000 run_launch --host "${LOCAL_HOST}"
+check "user API_TIMEOUT_MS passes through untouched" "90000" "$(env_val "${CAPTURE}" API_TIMEOUT_MS)"
+
+echo
+echo "mocked smoke: ${pass} passed, ${fail} failed"
+
+# ---------------------------------------------------------------------------
+# Optional live turn: requires the real claude CLI.
+# ---------------------------------------------------------------------------
+if [[ "${LIVE}" -eq 1 ]]; then
+    echo
+    echo "[*] live: headless -p turn"
+    real_claude="$(PATH="${PATH}" command -v claude || true)"
+    host="${KIMO_SMOKE_HOST:-http://127.0.0.1:11434}"
+    model="${KIMO_SMOKE_MODEL:-kalidroid-27b:latest}"
+    if [[ -z "${real_claude}" ]]; then
+        echo "  SKIP claude CLI not found"
+    elif ! curl -s -m 3 "${host}/api/tags" >/dev/null 2>&1; then
+        echo "  SKIP no Ollama at ${host}"
+    else
+        out="${TMPDIR_C}/live.txt"
+        if ANTHROPIC_BASE_URL="${host}" ANTHROPIC_API_KEY=ollama \
+                API_TIMEOUT_MS=600000 timeout 300 "${real_claude}" \
+                -p 'Reply with exactly: PONG' --output-format json \
+                --model "${model}" >"${out}" 2>&1; then
+            if grep -qi 'PONG' "${out}"; then ok "live answer contains PONG"; else bad "live answer lacked PONG: $(head -c 200 "${out}")"; fi
+        else
+            bad "live turn failed (rc=$?): $(head -c 200 "${out}")"
+        fi
+    fi
+    echo
+    echo "total: ${pass} passed, ${fail} failed"
+fi
+
+[[ "${fail}" -eq 0 ]]

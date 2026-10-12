@@ -9,7 +9,7 @@ SHELL   := /bin/bash
 
 SCRIPT  := kimo
 
-.PHONY: all help install uninstall link unlink check lint clean install-completion uninstall-completion
+.PHONY: all help install uninstall link unlink check lint test-qwen test-claude test-agy test-opencode test-kimi clean install-completion uninstall-completion
 
 all: help
 
@@ -25,6 +25,11 @@ help:
 	@echo "  make uninstall-completion  Remove installed shell tab-completions"
 	@echo "  make check                 Verify bash syntax and execute basic CLI sanity checks"
 	@echo "  make lint                  Run shellcheck (error severity) against $(SCRIPT)"
+	@echo "  make test-qwen             Headless smoke test of the 'qwen' launch branch (LIVE=1 adds a live -p turn)"
+	@echo "  make test-claude           Headless smoke test of the 'claude' launch branch (LIVE=1 adds a live -p turn)"
+	@echo "  make test-agy              Headless smoke test of the 'agy' launch branch (LIVE=1 adds a live -p turn)"
+	@echo "  make test-opencode         Headless smoke test of the 'opencode' launch branch (LIVE=1 adds a live run turn)"
+	@echo "  make test-kimi             Headless smoke test of the 'kimi' launch branch (LIVE=1 adds a live -p turn)"
 	@echo "  make clean                 Remove temporary and backup files"
 	@echo "  make help                  Display this help message"
 	@echo ""
@@ -93,6 +98,26 @@ lint:
 	@echo "[*] Running shellcheck on $(SCRIPT)..."
 	@command -v shellcheck >/dev/null 2>&1 && shellcheck -S error $(SCRIPT) || echo "[!] shellcheck not found, skipping."
 	@echo "[✓] Lint check passed."
+
+test-qwen:
+	@echo "[*] Running 'qwen' launch smoke tests..."
+	@tests/qwen-smoke.sh $(if $(LIVE),--live,)
+
+test-claude:
+	@echo "[*] Running 'claude' launch smoke tests..."
+	@tests/claude-smoke.sh $(if $(LIVE),--live,)
+
+test-agy:
+	@echo "[*] Running 'agy' launch smoke tests..."
+	@tests/agy-smoke.sh $(if $(LIVE),--live,)
+
+test-opencode:
+	@echo "[*] Running 'opencode' launch smoke tests..."
+	@tests/opencode-smoke.sh $(if $(LIVE),--live,)
+
+test-kimi:
+	@echo "[*] Running 'kimi' launch smoke tests..."
+	@tests/kimi-smoke.sh $(if $(LIVE),--live,)
 
 clean:
 	@echo "[*] Cleaning temporary and backup files..."

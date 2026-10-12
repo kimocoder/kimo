@@ -60,6 +60,10 @@ make check
 | `make uninstall-completion`| Removes installed completion scripts |
 | `make check` | Validates bash syntax (`bash -n`) and executes basic CLI sanity tests |
 | `make lint` | Runs `shellcheck` with error filtering on `kimo` |
+| `make test-qwen` | Headless smoke test of the `qwen` launch branch: asserts the argv/env kimo passes (api-key scrubbing, `QWEN_CODE_API_TIMEOUT_MS`). Add `LIVE=1` for an opt-in live `-p` turn against a reachable Ollama host (`KIMO_SMOKE_HOST`/`KIMO_SMOKE_MODEL` override) |
+| `make test-claude` | Headless smoke test of the `claude` launch branch: asserts the env kimo passes (api-key scrubbing, `CLAUDE_CODE_*` defaults, `API_TIMEOUT_MS` passthrough). Add `LIVE=1` for an opt-in live `-p` turn |
+| `make test-agy` | Headless smoke test of the `agy` launch branch: asserts shim liveness/reaping, settings patch + restore, and that `GEMINI_API_KEY` is never scrubbed (it only reaches the loopback shim, whose upstream requests carry no auth). Add `LIVE=1` for an opt-in live `-p` turn |
+| `make test-opencode` | Headless smoke test of the `opencode` launch branch: asserts the argv/env kimo passes (host env, `OPENAI_API_KEY`/`ANTHROPIC_API_KEY` scrub for non-local hosts). opencode routes via its own provider config and reads no base-url env, so the scrub is defence-in-depth. Add `LIVE=1` for an opt-in live `run` turn against an isolated `HOME` with a throwaway provider (`KIMO_SMOKE_HOST`/`KIMO_SMOKE_MODEL` override) |
 | `make clean` | Removes temporary and backup files (`*~`, `*.tmp`, `*.bak`) |
 | `make help` | Displays list of available make targets and options |
 
@@ -436,7 +440,9 @@ kimo completion zsh > ~/.zsh/completion/_kimo
 `kimo launch` wraps popular coding and conversational CLIs to redirect traffic to your target Ollama instance:
 
 ```bash
-# Launch Claude Code on remote model
+# Launch Claude Code on remote model. A real ANTHROPIC_API_KEY/AUTH_TOKEN is
+# only forwarded to a plain local daemon; remote/LAN/tunnel hosts get 'ollama'
+# so the secret never leaves this box.
 kimo --remote launch claude --model nemotron3:33b
 
 # Launch Kimi Code CLI with thinking model support. Registers the target host's
@@ -446,6 +452,13 @@ kimo --remote launch kimi --model kalidroid-27b:latest
 
 # Launch Grok Build TUI with tuned context
 kimo --remote launch grok --model kalidroid-27b:latest
+
+# Launch Qwen Code CLI (thinking + tools) routed to Ollama. A real
+# OPENAI_API_KEY is only forwarded to a plain local daemon; remote/LAN/tunnel
+# hosts get a placeholder ('ollama') so the token never leaves this box.
+# QWEN_CODE_API_TIMEOUT_MS is raised to 600000 so large models do not trip
+# qwen's 45s default on their first token.
+kimo --remote launch qwen --model kalidroid-27b:latest
 
 # Launch Google Antigravity CLI via automatic Gemini-to-Ollama wire shim
 kimo launch agy --model kalidroid-27b:latest
@@ -464,6 +477,7 @@ kimo launch cursor --model kalidroid-27b:latest
 - `KIMO_KIMI_EFFORT` (or `OM_KIMI_EFFORT`): Default thinking effort level for Kimi Code CLI (`low`, `medium`, `high`, `xhigh`, `max`).
 - `KIMO_KIMI_CAPABILITIES` (or `OM_KIMI_CAPABILITIES`): Override detected capabilities (`tool_use`, `thinking`, `image_in`).
 - `KIMO_KIMI_REGISTER_ALL`: Register every model the host serves into the kimi config (default `1`). Set `0` to only register the launched model.
+- `QWEN_CODE_API_TIMEOUT_MS`: Per-request timeout for `launch qwen`. Defaults to `600000` when unset; set your own value to override.
 - `KIMO_AGY_CLAIM_DIR`: Session claim directory for concurrent Antigravity sessions.
 - `KIMO_GROK_CLAIM_DIR`: Session claim directory for concurrent Grok sessions.
 - `KIMO_KIMI_CONFIG_LOCK`: File lock path for concurrent Kimi config updates.

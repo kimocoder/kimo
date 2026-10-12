@@ -540,6 +540,29 @@ is_remote_model() {
     resolve_model_name "$1" "${REMOTE_HOST_URL}" >/dev/null 2>&1
 }
 
+# True when a host URL is a plain loopback Ollama endpoint on THIS box, i.e. a
+# real bearer token may be forwarded to it without leaving the machine. False
+# for the remote Desktop even when reached through its 127.0.0.1 ssh -L tunnel
+# (which is loopback on this side but forwards off-box), for the direct LAN
+# address, and for any user-configured remote URL.
+host_is_plain_local() {
+    local url="${1:-}"
+    [[ -z "${url}" ]] && return 1
+    [[ "${url}" == "${REMOTE_TUNNEL_URL}" ]] && return 1
+    [[ "${url}" == "${REMOTE_DIRECT_URL}" ]] && return 1
+    [[ -n "${REMOTE_HOST_URL:-}" && "${url}" == "${REMOTE_HOST_URL}" ]] && return 1
+    local rest="${url#*://}" host
+    if [[ "${rest}" == \[* ]]; then
+        host="${rest#[}"; host="${host%%]*}"
+    else
+        host="${rest%%[:/]*}"
+    fi
+    case "${host}" in
+        127.0.0.1|localhost|::1|0.0.0.0) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 # Read per-model tuned defaults (JSON) for an exact resolved model name.
 # Prints the JSON object when tuned, empty output otherwise.
 tuned_params() {
@@ -4123,6 +4146,13 @@ grok_cleanup() {
 # an alias per model, exactly like the xai/groq/alibaba entries users keep in
 # that file - so, unlike grok/agy, there is nothing to revert on exit.
 #
+# Besides the provider + aliases, registration also pins `default_model` to the
+# launched alias. kimi's non-interactive `-p/--prompt` mode resolves the model
+# ONLY from config.toml's default_model and silently ignores `-m <alias>`
+# (verified on kimi 2.1.1): without it a `kimo launch kimi ... -- -p ...` turn
+# dies with "no default model configured". Interactive -m with a set
+# default_model still selects the launched alias, so this is safe for both.
+#
 # The whole host catalogue is registered, not just the launched tag: otherwise
 # 'launch kimi' leaves the /model picker with a single entry. The batch is one
 # tomlkit read-modify-write under the config lock (see kimi_register_all_models).
@@ -4135,8 +4165,10 @@ KIMI_CONFIG_LOCK="${KIMO_KIMI_CONFIG_LOCK:-${KIMI_CONFIG_LOCK:-${TMPDIR:-/tmp}/k
 # user's formatting, comments and key order survive (same contract as
 # _grok_write_config: values travel via argv, never interpolated into the
 # program). The model spec JSON array rides in argv[4] - NOT stdin, which the
-# heredoc already owns. Exits 3 when tomlkit is missing, 4 on unparseable TOML.
-# argv: path pid base_url specs-json
+# heredoc already owns. argv[5], when present, is the launched alias written to
+# default_model (kimi's headless prompt mode requires it). Exits 3 when tomlkit
+# is missing, 4 on unparseable TOML.
+# argv: path pid base_url specs-json [default_alias]
 # specs-json: [{"alias","model","ctx","caps","efforts","deff","off","rkey","display_name"}, ...]
 _kimi_write_models() {
     python3 - "$@" <<'PY'
@@ -4149,6 +4181,7 @@ except ImportError:
     sys.exit(3)
 
 path, pid, base_url, specs_raw = sys.argv[1:5]
+default_alias = sys.argv[5] if len(sys.argv) > 5 else ""
 
 try:
     specs = json.loads(specs_raw)
@@ -4213,6 +4246,12 @@ for spec in specs:
     _set(mdl, "off_effort", spec.get("off"))
     _set(mdl, "reasoning_key", spec.get("rkey"))
     _set(mdl, "display_name", spec.get("display_name"))
+
+# Pin default_model to the launched alias: kimi's -p prompt mode resolves the
+# model from default_model and ignores -m, so without this a headless turn has
+# "no default model configured". Interactive -m still selects the alias.
+if default_alias:
+    doc["default_model"] = default_alias
 
 # Written through the original inode so config.toml keeps its mode and owner.
 with open(path, "w", encoding="utf-8") as fh:
@@ -4296,10 +4335,10 @@ kimi_register_model() {
         # _kimi_write_models is a shell function.
         exec 9>"${KIMI_CONFIG_LOCK}"
         flock 9
-        _kimi_write_models "${KIMI_CONFIG}" "${pid}" "${host_url}/v1" "[${spec}]" || rc=$?
+        _kimi_write_models "${KIMI_CONFIG}" "${pid}" "${host_url}/v1" "[${spec}]" "${alias}" || rc=$?
         exec 9>&-
     else
-        _kimi_write_models "${KIMI_CONFIG}" "${pid}" "${host_url}/v1" "[${spec}]" || rc=$?
+        _kimi_write_models "${KIMI_CONFIG}" "${pid}" "${host_url}/v1" "[${spec}]" "${alias}" || rc=$?
     fi
     if ((rc != 0)); then
         _kimi_config_error "${rc}"
@@ -4356,10 +4395,10 @@ kimi_register_all_models() {
     if command -v flock >/dev/null 2>&1; then
         exec 9>"${KIMI_CONFIG_LOCK}"
         flock 9
-        _kimi_write_models "${KIMI_CONFIG}" "${pid}" "${host_url}/v1" "${specs}" || rc=$?
+        _kimi_write_models "${KIMI_CONFIG}" "${pid}" "${host_url}/v1" "${specs}" "${alias}" || rc=$?
         exec 9>&-
     else
-        _kimi_write_models "${KIMI_CONFIG}" "${pid}" "${host_url}/v1" "${specs}" || rc=$?
+        _kimi_write_models "${KIMI_CONFIG}" "${pid}" "${host_url}/v1" "${specs}" "${alias}" || rc=$?
     fi
     if ((rc != 0)); then
         _kimi_config_error "${rc}"
@@ -4397,6 +4436,8 @@ ${C_YELLOW}CLI Integration Mechanics:${C_RESET}
   ${C_BOLD}agy${C_RESET}          Google Antigravity CLI speaks only the Gemini wire protocol. A per-session
                 shim is spawned on a free localhost port and modelProvider is patched
                 for the duration of the session, then cleanly restored on exit.
+                GEMINI_API_KEY is never scrubbed: it only reaches the loopback shim,
+                whose upstream requests carry no auth, so the secret never leaves this box.
   ${C_BOLD}grok${C_RESET}         Grok Build takes no endpoint flag; its catalog and inference are directed
                 to the resolved host via GROK_MODELS_BASE_URL. A tuned or specified num_ctx
                 (--ctx, tune --ctx) becomes that model's context_window in config.toml, restored on exit.
@@ -4407,8 +4448,20 @@ ${C_YELLOW}CLI Integration Mechanics:${C_RESET}
                 Context length (--ctx, KIMO_KIMI_CONTEXT, or tuned num_ctx) becomes
                 max_context_size (capped at model architecture maximum). Thinking models declare
                 support_efforts low..max so the in-session /effort picker works (mapped via reasoning_key).
-  ${C_BOLD}claude${C_RESET}       Directs Claude Code to the target host via ANTHROPIC_BASE_URL.
-  ${C_BOLD}codex/qwen${C_RESET}   Configured with custom Ollama API endpoints and model parameters.
+  ${C_BOLD}claude${C_RESET}       Directs Claude Code to the target host via ANTHROPIC_BASE_URL. A real
+                ANTHROPIC_API_KEY/AUTH_TOKEN is forwarded only to a plain local daemon;
+                remote/LAN/tunnel hosts get a placeholder ('ollama') so the secret never
+                leaves this box. API_TIMEOUT_MS is left untouched (claude defaults to 600000 ms).
+  ${C_BOLD}codex${C_RESET}        Configured with a custom Ollama API endpoint and model parameters.
+  ${C_BOLD}qwen${C_RESET}         Routed via --openai-base-url/--auth-type openai (thinking + tools ride the
+                OpenAI wire). A real OPENAI_API_KEY is forwarded only to a plain local daemon;
+                remote/LAN/tunnel hosts get a placeholder ('ollama') so the token never leaves
+                this box. QWEN_CODE_API_TIMEOUT_MS is raised to 600000 to clear qwen's 45s default.
+  ${C_BOLD}opencode${C_RESET}    Routing is provider-config driven (~/.config/opencode/opencode.jsonc):
+                no ANTHROPIC_*/OPENAI_* base-url env is read for inference (verified on
+                opencode 1.19.0), so a real key cannot ride the env to the target host the way
+                it can for qwen/claude. OPENAI_API_KEY/ANTHROPIC_API_KEY are still scrubbed for
+                any non-local host, defence-in-depth in case a future SDK layer honours them.
   ${C_BOLD}cyberstrike${C_RESET}  Cyberstrike AI-Powered Penetration Testing Agent. Automatically registers
                  and routes the Ollama endpoint via 'cyberstrike provider' and CYBERSTRIKE_CONFIG_CONTENT,
                  addressing targets via the 'ollama/<model>' format.
@@ -4424,6 +4477,7 @@ ${C_YELLOW}Environment Overrides:${C_RESET}
   KIMO_KIMI_CAPABILITIES    Override detected model capabilities (e.g. tool_use,thinking)
   KIMO_KIMI_REASONING_KEY   Wire parameter name for thinking budget (default: reasoning)
   KIMO_KIMI_REGISTER_ALL    Register every model the host serves (default: 1); set 0 to only the launched tag
+  QWEN_CODE_API_TIMEOUT_MS  Per-request timeout for 'launch qwen' (default: 600000 ms)
   KIMO_AGY_CLAIM_DIR        Claim directory for concurrent Antigravity sessions (/tmp/kimo-agy-claims)
   KIMO_GROK_CLAIM_DIR       Claim directory for concurrent Grok sessions (/tmp/kimo-grok-claims)
   KIMO_KIMI_CONFIG_LOCK     Lockfile for concurrent Kimi config updates (/tmp/kimo-kimi-config.lock)
@@ -4592,6 +4646,19 @@ cmd_launch() {
         echo "${C_GREEN}[*] Launching external CLI '${cli_cmd}' (Model: ${resolved_model}, Host: ${active_host})...${C_RESET}"
         case "${cli_cmd}" in
             claude)
+                # Same token-scrub rule as qwen: claude sends ANTHROPIC_API_KEY
+                # as 'x-api-key' (and ANTHROPIC_AUTH_TOKEN as a Bearer token) to
+                # ANTHROPIC_BASE_URL (= active_host), which may be the LAN Desktop
+                # or its ssh -L tunnel; only a plain local daemon may see the real
+                # secret. Ollama ignores the value. No timeout override is needed
+                # here: claude's request timeout already defaults to 600000 ms
+                # (API_TIMEOUT_MS), so it does not hit qwen's old 45s wall.
+                if host_is_plain_local "${active_host}"; then
+                    export ANTHROPIC_API_KEY="${ANTHROPIC_API_KEY:-ollama}"
+                else
+                    export ANTHROPIC_API_KEY="ollama"
+                    unset ANTHROPIC_AUTH_TOKEN
+                fi
                 export CLAUDE_CODE_EFFORT_LEVEL="${CLAUDE_CODE_EFFORT_LEVEL:-low}"
                 exec "${cli_cmd}" --model "${resolved_model}" "${cli_passthrough_args[@]}"
                 ;;
@@ -4603,8 +4670,24 @@ cmd_launch() {
                 export OPENAI_MODEL="${resolved_model}"
                 export QWEN_MODEL="${resolved_model}"
                 export OPENAI_BASE_URL="${active_host}/v1"
-                export OPENAI_API_KEY="${OPENAI_API_KEY:-ollama}"
-                exec "${cli_cmd}" --openai-base-url "${active_host}/v1" --openai-api-key "${OPENAI_API_KEY:-ollama}" --auth-type openai --model "${resolved_model}" "${cli_passthrough_args[@]}"
+                # A real OPENAI_API_KEY is only safe to forward to a plain local
+                # daemon. --openai-api-key is the highest-precedence layer and
+                # active_host may be the LAN Desktop or its ssh -L tunnel, where
+                # a bearer token would leak off this box; Ollama ignores it. The
+                # env var is scrubbed too (defence in depth) in case any qwen
+                # path falls back to it.
+                local qwen_key="ollama"
+                if host_is_plain_local "${active_host}"; then
+                    qwen_key="${OPENAI_API_KEY:-ollama}"
+                fi
+                export OPENAI_API_KEY="${qwen_key}"
+                # qwen defaults to a 45s per-request timeout (contentGenerator
+                # .timeout), which large models blow through on the first token
+                # (cold load + long thinking) - every agentic request then dies
+                # with 'Request timeout after 45s'. Raise it unless the user set
+                # their own.
+                export QWEN_CODE_API_TIMEOUT_MS="${QWEN_CODE_API_TIMEOUT_MS:-600000}"
+                exec "${cli_cmd}" --openai-base-url "${active_host}/v1" --openai-api-key "${qwen_key}" --auth-type openai --model "${resolved_model}" "${cli_passthrough_args[@]}"
                 ;;
             grok)
                 # grok (xAI's Grok Build TUI) exposes no --base-url/--provider flag.
@@ -4865,6 +4948,26 @@ cmd_launch() {
                 export OPENAI_API_BASE="${active_host}/v1"
                 export OPENAI_API_KEY="${OPENAI_API_KEY:-ollama}"
                 exec "${cursor_bin}" --model "${resolved_model}" "${cli_passthrough_args[@]}"
+                ;;
+            opencode)
+                # opencode routes inference purely through its own provider
+                # config (~/.config/opencode/opencode.jsonc): custom
+                # 'openai-compatible' providers carry a fixed baseURL, and none
+                # of the ANTHROPIC_*/OPENAI_* base-url env that kimo exports is
+                # read for inference (verified against opencode 1.19.0), so a
+                # real key cannot ride the env to active_host the way it can for
+                # qwen/claude. Both keys are still scrubbed for any non-local
+                # host, defence-in-depth in case a future SDK layer starts
+                # honouring the base-url env. No timeout override is needed.
+                if host_is_plain_local "${active_host}"; then
+                    export OPENAI_API_KEY="${OPENAI_API_KEY:-ollama}"
+                    export ANTHROPIC_API_KEY="${ANTHROPIC_API_KEY:-ollama}"
+                else
+                    export OPENAI_API_KEY="ollama"
+                    export ANTHROPIC_API_KEY="ollama"
+                    unset ANTHROPIC_AUTH_TOKEN
+                fi
+                exec "${cli_cmd}" --model "${resolved_model}" "${cli_passthrough_args[@]}"
                 ;;
             *)
                 exec "${cli_cmd}" --model "${resolved_model}" "${cli_passthrough_args[@]}"
