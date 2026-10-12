@@ -100,7 +100,8 @@ kimo [options] <command> [arguments...]
 |---|---|---|
 | `check`, `ping` | Connectivity, latency, and health check for local and remote hosts | `kimo check` |
 | `hosts` | Detailed table of reachable servers, versions, models, disk GB | `kimo hosts` |
-| `scan`, `discover [target]` | Discover active Ollama instances on LAN/subnets (`-m`, `--save`) | `kimo scan -m` |
+| `init [opts]` | Interactive initial setup & network discovery wizard | `kimo init` |
+| `scan`, `discover [target]` | Discover active Ollama instances on LAN/subnets (`-i`, `-m`, `--save`) | `kimo scan -i` |
 | `doctor` | All-in-one health diagnostics (system, tunnel, daemons, CLIs) | `kimo doctor` |
 | `config [subcmd]` | View and manage persistent defaults in `~/.config/kimo/config` | `kimo config set default_host remote` |
 | `status`, `health` | Operational snapshot: tunnel, remote API, VRAM residency, timer | `kimo status` |
@@ -373,11 +374,19 @@ Features:
 
 ---
 
-## Network Discovery & Instance Scanning (`scan` / `discover`)
+## Network Discovery & Instance Scanning (`scan` / `discover` / `init`)
 
-`kimo scan` is a high-performance multithreaded network discovery tool designed to probe local physical interfaces, CIDR subnets, IP ranges, or specific endpoints to identify reachable Ollama instances, measure round-trip latency, inspect model catalogs, and report GPU VRAM residency:
+`kimo scan` is a high-performance multithreaded network discovery tool designed to probe local physical interfaces, CIDR subnets, IP ranges, or specific endpoints to identify reachable Ollama instances, measure round-trip latency, inspect model catalogs, and report GPU VRAM residency.
+
+`kimo init` provides an interactive setup wizard that scans your local network, presents reachable Ollama endpoints in a numbered selection menu, and writes the selected remote endpoint directly to persistent configuration (`~/.config/kimo/config`). On first run or when no remote configuration is present and the remote endpoint is unreachable, interactive commands will automatically offer to launch discovery.
 
 ```bash
+# Interactive setup wizard: scan network and configure remote endpoint
+kimo init
+
+# Interactively discover and select which node to set as remote_url
+kimo scan -i
+
 # Auto-detect physical LAN subnet (e.g. 192.168.1.0/24) and loopback
 kimo scan
 
@@ -393,7 +402,7 @@ kimo scan 192.168.1.100-150
 # Scan all common Ollama & reverse-proxy ports (11434-11438, 8000, 8080)
 kimo scan --all-ports
 
-# Automatically discover and save remote node to persistent ~/.config/kimo/config
+# Automatically discover and save best remote node to persistent ~/.config/kimo/config
 kimo scan --save
 
 # Point remote_url directly to a discovered node
@@ -413,6 +422,7 @@ kimo scan --json
 | `--timeout <ms>` | Socket connection timeout in milliseconds (default: `400`) |
 | `-m, --models, --deep` | Deep model inspection (model list, size, params, quant, VRAM residency) |
 | `--all-interfaces` | Scan all interfaces including virtual container bridges (Docker, CNI) |
+| `-i, --interactive` | Interactively select discovered instance to configure as `remote_url` |
 | `--save` | Automatically save the best discovered remote node to `~/.config/kimo/config` |
 | `--set-remote <endpoint>` | Set specified discovered endpoint as `remote_url` in config |
 | `--json` | Output discovery results in structured JSON |

@@ -6,18 +6,44 @@
 set -euo pipefail
 
 # Remote server configuration
-# NOTE: 192.168.1.131 binds ollama to 127.0.0.1:11434 only, so direct LAN
-# connections are refused by design. The reachable path from this host is the
-# SSH tunnel (ollama-remote-tunnel.service):
-#   127.0.0.1:11438 -> 127.0.0.1:11434 on 192.168.1.131
-# Resolution order: $OLLAMA_REMOTE_URL > tunnel > direct. Probing uses a short
-# timeout so --help / local-only commands never hang.
-REMOTE_HOST_IP="192.168.1.131"
-REMOTE_HOST_PORT="11434"
-REMOTE_DIRECT_URL="http://${REMOTE_HOST_IP}:${REMOTE_HOST_PORT}"
-REMOTE_TUNNEL_URL="http://127.0.0.1:11438"
-REMOTE_DAEMON_URL="http://${REMOTE_HOST_IP}:11436"
+# Dynamic resolution order:
+#   1. $OLLAMA_REMOTE_URL / config file 'remote_url'
+#   2. Active SSH tunnel forward (127.0.0.1:11438) -> detected destination host
+#   3. Direct remote host probe (if remote_host is set in config or environment)
+# Probing uses a short timeout so --help / local-only commands never hang.
+REMOTE_HOST_PORT="${KIMO_REMOTE_HOST_PORT:-11434}"
+REMOTE_TUNNEL_URL="${KIMO_REMOTE_TUNNEL_URL:-http://127.0.0.1:11438}"
+REMOTE_HOST_IP="${KIMO_REMOTE_HOST_IP:-}"
+REMOTE_DIRECT_URL=""
+REMOTE_DAEMON_URL=""
 KIMO_VERSION="1.1.0"
+
+# Inspect /proc/*/cmdline to detect if an active SSH tunnel forwards a local port
+_detect_tunnel_target() {
+    local lport="${1:-11438}" target=""
+    for cmd in /proc/[0-9]*/cmdline; do
+        [[ -f "${cmd}" ]] || continue
+        if grep -a -q ":${lport}:" "${cmd}" 2>/dev/null; then
+            local words=()
+            while IFS= read -r -d '' arg; do
+                words+=("${arg}")
+            done < "${cmd}" 2>/dev/null || true
+            for ((i=${#words[@]}-1; i>=1; i--)); do
+                local w="${words[i]}"
+                [[ "${w}" == -* ]] && continue
+                [[ "${w}" =~ :${lport}: ]] && continue
+                if [[ "${w}" =~ ^([a-zA-Z0-9._-]+@)?([a-zA-Z0-9.-]+)$ ]]; then
+                    local h="${BASH_REMATCH[2]}"
+                    if [[ "${h}" != "127.0.0.1" && "${h}" != "localhost" && "${h}" != "::1" ]]; then
+                        target="${h}"
+                        break 2
+                    fi
+                fi
+            done
+        fi
+    done
+    echo "${target}"
+}
 
 # WebBridge (Kimi's real-browser relay, see 'kimo doctor' web bridge section).
 # Its daemon listens on 127.0.0.1:10086 and is steered over a local /command
@@ -96,6 +122,27 @@ load_kimo_config() {
     fi
     if [[ -n "${KIMO_CONFIG_VALUES[web_max_results]:-}" ]]; then
         WEB_MAX_RESULTS="${KIMO_CONFIG_VALUES[web_max_results]}"
+    fi
+
+    # Dynamically derive REMOTE_HOST_IP if not explicitly set
+    if [[ -z "${REMOTE_HOST_IP}" ]]; then
+        if [[ -n "${KIMO_CONFIG_VALUES[remote_host]:-}" ]]; then
+            REMOTE_HOST_IP="${KIMO_CONFIG_VALUES[remote_host]}"
+        elif [[ -n "${REMOTE_HOST_URL:-}" && "${REMOTE_HOST_URL}" != *127.0.0.1* && "${REMOTE_HOST_URL}" != *localhost* ]]; then
+            REMOTE_HOST_IP=$(echo "${REMOTE_HOST_URL}" | sed -E 's|https?://([^:/]+).*|\1|')
+        else
+            local t_host
+            t_host=$(_detect_tunnel_target 11438)
+            [[ -n "${t_host}" ]] && REMOTE_HOST_IP="${t_host}"
+        fi
+    fi
+
+    if [[ -n "${REMOTE_HOST_IP}" && "${REMOTE_HOST_IP}" != "127.0.0.1" && "${REMOTE_HOST_IP}" != "localhost" ]]; then
+        REMOTE_DIRECT_URL="http://${REMOTE_HOST_IP}:${REMOTE_HOST_PORT}"
+        REMOTE_DAEMON_URL="http://${REMOTE_HOST_IP}:11436"
+    else
+        REMOTE_DIRECT_URL=""
+        REMOTE_DAEMON_URL=""
     fi
 }
 load_kimo_config
@@ -185,7 +232,7 @@ ${C_YELLOW}Usage:${C_RESET}
   ${0##*/} [options] <command> [arguments...]
 
 ${C_YELLOW}Global Options:${C_RESET}
-  ${C_CYAN}--remote${C_RESET}                     Route to remote server (${REMOTE_TUNNEL_URL} tunnel -> 192.168.1.131)
+  ${C_CYAN}--remote${C_RESET}                     Route to remote server (${REMOTE_HOST_URL:-${REMOTE_TUNNEL_URL}}${REMOTE_HOST_IP:+ -> ${REMOTE_HOST_IP}})
   ${C_CYAN}--local${C_RESET}                      Route strictly to local daemon (${LOCAL_HOST_URL})
   ${C_CYAN}--host <address>${C_RESET}             Specify custom Ollama host (repeatable for multi-host routing)
   ${C_CYAN}--json${C_RESET}                       Output responses in structured JSON format
@@ -214,9 +261,10 @@ ${C_YELLOW}External LLM CLI Hub:${C_RESET}
   ${C_CYAN}update [cli|all]${C_RESET}             Check installed CLIs (--check); apply only confirmed newer releases (--apply)
 
 ${C_YELLOW}Cluster & Remote Operations:${C_RESET}
+  ${C_CYAN}init [opts]${C_RESET}                  Interactive initial setup & network discovery wizard
   ${C_CYAN}check, ping${C_RESET}                  Probe connectivity, latency, and health across daemons & tunnels
   ${C_CYAN}hosts${C_RESET}                        Inventory table of reachable servers, models, versions, and disks
-  ${C_CYAN}scan, discover [target]${C_RESET}      Scan LAN/subnets for active Ollama instances (--models, --save)
+  ${C_CYAN}scan, discover [target]${C_RESET}      Scan LAN/subnets for active Ollama instances (-i, --models, --save)
   ${C_CYAN}status, health${C_RESET}               Operational snapshot: tunnel, remote API, VRAM residency, timer
   ${C_CYAN}doctor${C_RESET}                       Run system, cluster, and CLI ecosystem health diagnostics
   ${C_CYAN}sync <model|--all>${C_RESET}           Replicate and synchronize models across cluster hosts
@@ -396,12 +444,12 @@ resolve_remote_url() {
         echo "${REMOTE_TUNNEL_URL}"
         return
     fi
-    if probe_ollama_url "${REMOTE_DIRECT_URL}"; then
+    if [[ -n "${REMOTE_DIRECT_URL:-}" ]] && probe_ollama_url "${REMOTE_DIRECT_URL}"; then
         echo "${REMOTE_DIRECT_URL}"
         return
     fi
     # The Desktop's own Ollama daemon (no bridge, no token; dashboard ep1 uses it).
-    if probe_ollama_url "${REMOTE_DAEMON_URL}"; then
+    if [[ -n "${REMOTE_DAEMON_URL:-}" ]] && probe_ollama_url "${REMOTE_DAEMON_URL}"; then
         echo "${REMOTE_DAEMON_URL}"
         return
     fi
@@ -611,18 +659,18 @@ target = OM_TARGET_HOST
 mode = OM_HOST_MODE
 as_json = OM_OPT_JSON.lower() == "true"
 
-hosts_to_check = []
+remote_label = f'Remote ({OM_REMOTE_HOST_IP})' if OM_REMOTE_HOST_IP and OM_REMOTE_HOST_IP != 'remote' else 'Remote Host'
 if mode == 'multi':
     hosts_to_check.extend((u.split('://', 1)[-1], u) for u in OM_MULTI_HOSTS.split())
 elif mode == 'custom':
     hosts_to_check.append(('Custom Host', target))
 elif mode == 'remote':
-    hosts_to_check.append((f'Remote ({OM_REMOTE_HOST_IP})', remote_url))
+    hosts_to_check.append((remote_label, remote_url))
 elif mode == 'local':
     hosts_to_check.append(('Local Daemon', local_url))
 else:
     hosts_to_check.append(('Local Daemon', local_url))
-    hosts_to_check.append((f'Remote ({OM_REMOTE_HOST_IP})', remote_url))
+    hosts_to_check.append((remote_label, remote_url))
 
 results = []
 for label, url in hosts_to_check:
@@ -988,8 +1036,8 @@ ${C_YELLOW}Targets:${C_RESET}
   <none>              Auto-detect active physical LAN subnets (e.g. 192.168.1.0/24) + localhost
   <cidr>              Scan specific CIDR subnet (e.g. 192.168.1.0/24, 10.0.0.0/24)
   <ip-range>          Scan IP range (e.g. 192.168.1.100-200, 192.168.1.50-192.168.1.150)
-  <host>              Probe specific host or IP (e.g. 192.168.1.131, localhost, gpu-node)
-  <endpoint>          Probe specific endpoint (e.g. 192.168.1.131:11434, http://192.168.1.104:11434)
+  <host>              Probe specific host or IP (e.g. 192.168.1.104, localhost, gpu-node)
+  <endpoint>          Probe specific endpoint (e.g. 192.168.1.104:11434, http://gpu-box:11434)
 
 ${C_YELLOW}Options:${C_RESET}
   ${C_CYAN}-p, --ports <ports>${C_RESET}      Comma-separated list of ports to scan (default: 11434,11438)
@@ -998,6 +1046,7 @@ ${C_YELLOW}Options:${C_RESET}
   ${C_CYAN}--timeout <ms>${C_RESET}           Socket connection timeout in milliseconds (default: 400)
   ${C_CYAN}-m, --models, --deep${C_RESET}     Deep model inspection (list models, sizes, quant, VRAM residency)
   ${C_CYAN}--all-interfaces${C_RESET}         Scan all network interfaces including docker bridges
+  ${C_CYAN}-i, --interactive${C_RESET}        Interactively select discovered instance to save as remote_url
   ${C_CYAN}--save${C_RESET}                   Save discovered remote endpoint into persistent config
   ${C_CYAN}--set-remote <endpoint>${C_RESET}   Set specified discovered endpoint as remote_url in config
   ${C_CYAN}--json${C_RESET}                   Output scan results in structured JSON format
@@ -1008,7 +1057,8 @@ ${C_YELLOW}Examples:${C_RESET}
   ${0##*/} scan -m                            # Scan with deep model catalog and VRAM breakdown
   ${0##*/} scan 192.168.1.0/24 -p 11434       # Scan specific subnet on standard Ollama port
   ${0##*/} scan 192.168.1.100-150             # Scan IP range
-  ${0##*/} scan --save                        # Discover and persist remote node to ~/.config/kimo/config
+  ${0##*/} scan -i                            # Discover and choose which node to set as remote_url
+  ${0##*/} scan --save                        # Discover and persist best remote node to ~/.config/kimo/config
   ${0##*/} scan --set-remote 192.168.1.104:11434 # Point remote_url directly to discovered node
   ${0##*/} scan --json                        # Machine-readable JSON output for scripting
 EOF
@@ -1020,6 +1070,7 @@ cmd_scan() {
     local timeout_ms=400
     local deep=false
     local all_ifaces=false
+    local interactive=false
     local save_remote=false
     local set_remote=""
     local json_output=false
@@ -1067,6 +1118,10 @@ cmd_scan() {
                 all_ifaces=true
                 shift
                 ;;
+            -i|--interactive)
+                interactive=true
+                shift
+                ;;
             --save)
                 save_remote=true
                 shift
@@ -1103,6 +1158,7 @@ cmd_scan() {
     # same-UID attacker pre-seed a symlink that the scanner's "w" write follows.
     local candidate_file
     candidate_file=$(mktemp) || return 1
+    trap 'rm -f "${candidate_file}" "${candidate_file}.list"' EXIT INT TERM
 
     OM_SCAN_TARGETS="${targets[*]:-}" \
     OM_SCAN_PORTS="${ports}" \
@@ -1138,7 +1194,7 @@ deep = env.get("OM_SCAN_DEEP", "false").lower() == "true"
 all_ifaces = env.get("OM_SCAN_ALL_IFACES", "false").lower() == "true"
 as_json = env.get("OM_SCAN_JSON", "false").lower() == "true"
 candidate_file = env.get("OM_CANDIDATE_FILE", "")
-REMOTE_HOST_IP = env.get("OM_REMOTE_HOST_IP", "192.168.1.131")
+REMOTE_HOST_IP = env.get("OM_REMOTE_HOST_IP", "")
 
 C_RESET = env.get("OM_C_RESET", "")
 C_BOLD = env.get("OM_C_BOLD", "")
@@ -1439,7 +1495,7 @@ def probe_ollama(ep):
             role = f"tunnel -> {fhost}:{fport}"
         else:
             role = "local daemon"
-    elif ip == REMOTE_HOST_IP:
+    elif REMOTE_HOST_IP and ip == REMOTE_HOST_IP:
         tunnel_port = next((p for p, f in forwards.items() if f[0] == REMOTE_HOST_IP or f[0] == ip), None)
         if tunnel_port:
             role = f"remote GPU server (tunnel: :{tunnel_port})"
@@ -1494,13 +1550,21 @@ def sort_key(inst):
         return (0, h, p)
     if h in LOOPBACK:
         return (1, h, p)
-    if h == REMOTE_HOST_IP:
+    if REMOTE_HOST_IP and h == REMOTE_HOST_IP:
         return (2, h, p)
     if h in local_addrs:
         return (3, h, p)
     return (4, h, p)
 
 instances.sort(key=sort_key)
+
+if candidate_file:
+    try:
+        with open(candidate_file + ".list", "w", encoding="utf-8") as lf:
+            for inst in instances:
+                lf.write(f"{inst['url']}\t{inst['role']}\t{inst['model_count']}\t{inst['latency_ms']}\n")
+    except Exception:
+        pass
 
 # Pick best remote candidate for --save
 remote_candidates = [
@@ -1514,7 +1578,7 @@ if not remote_candidates:
     ]
 
 if candidate_file and remote_candidates:
-    best = sorted(remote_candidates, key=lambda c: (c["host"] == REMOTE_HOST_IP, c["model_count"]), reverse=True)[0]
+    best = sorted(remote_candidates, key=lambda c: (bool(REMOTE_HOST_IP and c["host"] == REMOTE_HOST_IP), c["model_count"]), reverse=True)[0]
     try:
         with open(candidate_file, "w") as cf:
             cf.write(best["url"])
@@ -1673,7 +1737,7 @@ if deep:
             print("        " + " ".join(pad_ansi(t, w, a, c) for t, w, a, c in cols))
 PYEOF
 
-    # Handle --save or --set-remote
+    # Handle --save, --set-remote, or -i/--interactive
     if [[ "${json_output}" == "true" ]]; then
         if [[ -n "${set_remote}" ]]; then
             local dest_url="${set_remote}"
@@ -1687,7 +1751,37 @@ PYEOF
             load_kimo_config
         fi
     else
-        if [[ -n "${set_remote}" ]]; then
+        if [[ "${interactive}" == "true" ]]; then
+            if [[ ! -s "${candidate_file}.list" ]]; then
+                echo ""
+                echo "${C_YELLOW}[!] Notice: No live Ollama instances discovered to configure.${C_RESET}" >&2
+            else
+                echo ""
+                echo "${C_BOLD}Select an Ollama endpoint to configure as remote_url:${C_RESET}"
+                local idx=1
+                local ep_urls=()
+                while IFS=$'\t' read -r ep_url ep_role ep_models ep_lat; do
+                    [[ -z "${ep_url}" ]] && continue
+                    ep_urls+=("${ep_url}")
+                    printf "  ${C_CYAN}%2d)${C_RESET} ${C_BOLD}%-30s${C_RESET} %-26s %2s model(s)  (%s ms)\n" \
+                        "${idx}" "${ep_url}" "${ep_role}" "${ep_models}" "${ep_lat}"
+                    ((idx++))
+                done < "${candidate_file}.list"
+                echo "  ${C_CYAN} q)${C_RESET} Cancel / Keep current configuration"
+                echo ""
+                local choice=""
+                read -r -p "Enter selection [1-${#ep_urls[@]}]: " choice || choice=""
+                if [[ "${choice}" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#ep_urls[@]} )); then
+                    local chosen_url="${ep_urls[$((choice-1))]}"
+                    echo ""
+                    cmd_config set remote_url "${chosen_url}"
+                    load_kimo_config
+                    echo "  ${C_DIM}Run '${0##*/} --remote list' or '${0##*/} config' to verify.${C_RESET}"
+                else
+                    echo "  ${C_DIM}Selection cancelled.${C_RESET}"
+                fi
+            fi
+        elif [[ -n "${set_remote}" ]]; then
             local dest_url="${set_remote}"
             [[ "${dest_url}" != http* ]] && dest_url="http://${dest_url}"
             echo ""
@@ -1708,7 +1802,45 @@ PYEOF
             fi
         fi
     fi
-    rm -f "${candidate_file}"
+    rm -f "${candidate_file}" "${candidate_file}.list"
+    trap - EXIT INT TERM
+}
+
+init_usage() {
+    cat <<EOF
+${C_BOLD}kimo init${C_RESET} – Interactive setup and network discovery wizard
+
+${C_YELLOW}Usage:${C_RESET}
+  ${0##*/} init [options] [targets...]
+
+${C_YELLOW}Options:${C_RESET}
+  ${C_CYAN}-p, --ports <ports>${C_RESET}      Comma-separated list of ports to scan (default: 11434,11438)
+  ${C_CYAN}--all-ports${C_RESET}              Scan common Ollama & proxy ports (11434-11438, 8000, 8080)
+  ${C_CYAN}-t, --threads <num>${C_RESET}      Concurrency worker threads (default: 64)
+  ${C_CYAN}--timeout <ms>${C_RESET}           Socket connection timeout in milliseconds (default: 400)
+  ${C_CYAN}-m, --models, --deep${C_RESET}     Deep model inspection during scan
+  ${C_CYAN}--all-interfaces${C_RESET}         Scan all network interfaces including docker bridges
+  ${C_CYAN}-h, --help${C_RESET}               Show this help message
+
+${C_YELLOW}Examples:${C_RESET}
+  ${0##*/} init                               # Run interactive network scan and set remote_url
+  ${0##*/} init 192.168.1.0/24                # Scan specific subnet interactively
+EOF
+}
+
+cmd_init() {
+    for arg in "$@"; do
+        case "${arg}" in
+            -h|--help)
+                init_usage
+                return 0
+                ;;
+        esac
+    done
+    echo "${C_BOLD}=== Kimo Setup & Discovery Wizard ===${C_RESET}"
+    echo "Scanning local network for active Ollama instances..."
+    echo ""
+    cmd_scan --interactive "$@"
 }
 
 # -----------------------------------------------------------------------------
@@ -1740,17 +1872,18 @@ mode = OM_HOST_MODE
 as_json = OM_OPT_JSON.lower() == "true"
 
 hosts_to_query = []
+remote_label = f'remote ({OM_REMOTE_HOST_IP})' if OM_REMOTE_HOST_IP and OM_REMOTE_HOST_IP != 'remote' else 'remote'
 if mode == 'multi':
     hosts_to_query.extend((u.split('://', 1)[-1], u) for u in OM_MULTI_HOSTS.split())
 elif mode == 'custom':
     hosts_to_query.append(('custom', target))
 elif mode == 'remote':
-    hosts_to_query.append((f'remote ({OM_REMOTE_HOST_IP})', remote_url))
+    hosts_to_query.append((remote_label, remote_url))
 elif mode == 'local':
     hosts_to_query.append(('local', local_url))
 else:
     hosts_to_query.append(('local', local_url))
-    hosts_to_query.append((f'remote ({OM_REMOTE_HOST_IP})', remote_url))
+    hosts_to_query.append((remote_label, remote_url))
 
 all_ps = []
 for label, url in hosts_to_query:
@@ -6473,7 +6606,8 @@ cmd_doctor() {
     else
         echo "  ${C_YELLOW}[!] Endpoint${C_RESET}      : Unreachable at ${REMOTE_HOST_URL} (HTTP ${remote_code:-timeout})"
         warnings=$((warnings + 1))
-        recs+=("Ensure remote server 192.168.1.131 is online and SSH tunnel is active")
+        local target_hint="${REMOTE_HOST_IP:-${REMOTE_HOST_URL}}"
+        recs+=("Ensure remote server (${target_hint}) is online or run 'kimo scan -i' / 'kimo init' to discover instances")
     fi
 
     echo ""
@@ -6546,7 +6680,7 @@ _kimo() {
         cword=$COMP_CWORD
     fi
 
-    local commands="list ls search find ps top warm preload stop unload tune set-ctx param bench eval benchmark info show tag alias rm delete pull download sync run launch install setup update upgrade doctor diagnose diag config cfg completion freetier free-tier kimi-sync quotas gemini gemini-sync kimi-gemini version status health hosts scan discover check ping stream logs rotate-token help"
+    local commands="list ls search find ps top warm preload stop unload tune set-ctx param bench eval benchmark info show tag alias rm delete pull download sync run launch install setup update upgrade doctor diagnose diag config cfg completion freetier free-tier kimi-sync quotas gemini gemini-sync kimi-gemini version status health hosts init scan discover check ping stream logs rotate-token help"
     local global_opts="--remote --local --host --json --no-color -v --version -h --help"
     local supported_clis="claude grok kimi agy codex qwen cursor opencode cyberstrike openclaw hermes"
     local config_subcmds="get set unset list file help"
@@ -6737,9 +6871,9 @@ _kimo() {
                 COMPREPLY=( $(compgen -W "--json -h --help" -- "${cur}") )
             fi
             ;;
-        scan|discover)
+        scan|discover|init)
             if [[ "${cur}" == -* ]]; then
-                COMPREPLY=( $(compgen -W "-p --ports --all-ports -t --threads --timeout -m --models --deep --all-interfaces --save --set-remote --json -h --help" -- "${cur}") )
+                COMPREPLY=( $(compgen -W "-p --ports --all-ports -t --threads --timeout -m --models --deep --all-interfaces -i --interactive --save --set-remote --json -h --help" -- "${cur}") )
             fi
             ;;
         *)
@@ -6812,6 +6946,7 @@ _kimo() {
         'doctor:Run system and ecosystem diagnostics'
         'config:Manage persistent configuration'
         'hosts:Inventory reachable cluster nodes'
+        'init:Interactive initial setup and network discovery wizard'
         'scan:Discover Ollama instances across network'
         'discover:Alias for scan'
         'check:Health and latency check'
@@ -6932,7 +7067,7 @@ _kimo() {
                         '--force[Force overwrite]' \
                         '*: :->models' && return 0
                     ;;
-                scan|discover)
+                scan|discover|init)
                     _arguments \
                         '(-p --ports)'{-p,--ports}'[Ports to scan]:ports:' \
                         '--all-ports[Scan common Ollama and proxy ports]' \
@@ -6940,6 +7075,7 @@ _kimo() {
                         '--timeout[Probe timeout in ms]:timeout:' \
                         '(-m --models --deep)'{-m,--models,--deep}'[Deep model inspection]' \
                         '--all-interfaces[Scan all interfaces including Docker]' \
+                        '(-i --interactive)'{-i,--interactive}'[Interactively select remote node to save]' \
                         '--save[Save discovered remote node to config]' \
                         '--set-remote[Set specific node as remote]:endpoint:' \
                         '--json[Output in JSON format]' \
@@ -8051,7 +8187,7 @@ cmd_gemini() {
 # first --host).
 if [[ "${HOST_MODE}" == "multi" ]]; then
     case "${COMMAND}" in
-        check|ping|hosts|scan|discover|ps|top|list|ls|search|find|stop|unload|info|show|status|health|status-report|report|logs|log|rotate-token|rotate|install|setup|update|upgrade|doctor|diagnose|diag|config|cfg|completion|sync|freetier|free-tier|kimi-sync|quotas|gemini|gemini-sync|kimi-gemini|version|help|-h|--help) ;;
+        check|ping|hosts|init|scan|discover|ps|top|list|ls|search|find|stop|unload|info|show|status|health|status-report|report|logs|log|rotate-token|rotate|install|setup|update|upgrade|doctor|diagnose|diag|config|cfg|completion|sync|freetier|free-tier|kimi-sync|quotas|gemini|gemini-sync|kimi-gemini|version|help|-h|--help) ;;
         *)
             _model="${ARGS[0]:-}"
             if [[ "${COMMAND}" == "launch" ]]; then
@@ -8078,12 +8214,48 @@ if [[ "${HOST_MODE}" == "multi" ]]; then
     esac
 fi
 
+# First-run / unconfigured auto-discovery prompt:
+# Offer discovery if invoking a remote-dependent command when remote endpoint is unconfigured & unreachable
+if [[ -t 0 && "${OPT_JSON:-false}" != "true" && "${KIMO_NO_AUTOSCAN:-0}" != "1" ]]; then
+    _remote_needed=false
+    if [[ "${HOST_MODE}" == "remote" ]]; then
+        _remote_needed=true
+    else
+        case "${COMMAND}" in
+            check|ping|hosts|sync)
+                _remote_needed=true
+                ;;
+        esac
+    fi
+
+    if [[ "${_remote_needed}" == "true" && -z "${KIMO_CONFIG_VALUES[remote_url]:-}" ]]; then
+        if ! probe_ollama_url "${REMOTE_HOST_URL}"; then
+            if [[ -z "${REMOTE_DIRECT_URL:-}" ]] || ! probe_ollama_url "${REMOTE_DIRECT_URL}"; then
+                echo "${C_YELLOW}[!] Notice: Remote Ollama endpoint is not configured and unreachable (${REMOTE_HOST_URL}).${C_RESET}"
+                read -r -p "Would you like to scan your network to discover active Ollama instances? [Y/n] " _autoscan_resp
+                if [[ -z "${_autoscan_resp}" || "${_autoscan_resp}" =~ ^[Yy] ]]; then
+                    echo ""
+                    cmd_init
+                    if [[ "${HOST_MODE}" == "remote" ]]; then
+                        TARGET_HOST="${REMOTE_HOST_URL}"
+                    fi
+                    echo ""
+                fi
+            fi
+        fi
+    fi
+    unset _remote_needed _autoscan_resp
+fi
+
 case "${COMMAND}" in
     check|ping)
         cmd_check
         ;;
     hosts)
         cmd_hosts
+        ;;
+    init)
+        cmd_init "${ARGS[@]}"
         ;;
     scan|discover)
         cmd_scan "${ARGS[@]}"
