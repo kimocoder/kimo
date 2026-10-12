@@ -1,0 +1,24 @@
+{
+  "name": "kimo",
+  "version": "1.0.0",
+  "description": "**Unified Local & Remote Model Management & External CLI Hub**",
+  "main": ".eslintrc.js",
+  "directories": {
+    "test": "tests"
+  },
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/kimocoder/kimo.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/kimocoder/kimo/issues"
+  },
+  "homepage": "https://github.com/kimocoder/kimo#readme"
+}
