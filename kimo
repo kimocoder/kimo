@@ -201,6 +201,7 @@ ${C_YELLOW}Maintenance, Config & Completion:${C_RESET}
   ${C_CYAN}logs [service|all]${C_RESET}           Show recent journald output (tunnel, keepalive, timer, apache, all)
   ${C_CYAN}status-report${C_RESET}                Append operational status snapshot to /var/log/ollama-status-report.log
   ${C_CYAN}rotate-token${C_RESET}                 Generate new public API token, rewrite proxy conf & reload Apache
+  ${C_CYAN}freetier [opts]${C_RESET}              Sync Kimi config with Model Studio free-tier quotas (bl usage free)
 
 ${C_YELLOW}Supported CLIs (${0##*/} launch):${C_RESET}
   ${C_BOLD}claude${C_RESET}      Anthropic Claude Code CLI via OpenAI-compatible endpoint bridge
@@ -241,6 +242,9 @@ ${C_YELLOW}Examples:${C_RESET}
   ${0##*/} config                                     # View current configuration and sources
   ${0##*/} config set default_host remote             # Default all commands to remote GPU server
   ${0##*/} completion bash > /etc/bash_completion.d/kimo # Enable tab-completion for bash
+  ${0##*/} freetier --check-auth                      # Is the Model Studio console session live?
+  ${0##*/} freetier --verify --verify-prune           # Probe free-tier models, drop dead, write Kimi config
+  ${0##*/} freetier --set-default first               # ...and make the top model the Kimi default
 
   ${C_DIM}# Cluster & Multi-Host Management:${C_RESET}
   ${0##*/} check                                      # Health & latency probe for all endpoints
@@ -6226,7 +6230,7 @@ _kimo() {
         cword=$COMP_CWORD
     fi
 
-    local commands="list ls search find ps top warm preload stop unload tune set-ctx param bench eval benchmark info show tag alias rm delete pull download sync run launch install setup update upgrade doctor diagnose diag config cfg completion version status health hosts scan discover check ping stream logs rotate-token help"
+    local commands="list ls search find ps top warm preload stop unload tune set-ctx param bench eval benchmark info show tag alias rm delete pull download sync run launch install setup update upgrade doctor diagnose diag config cfg completion freetier free-tier kimi-sync quotas version status health hosts scan discover check ping stream logs rotate-token help"
     local global_opts="--remote --local --host --json --no-color -v --version -h --help"
     local supported_clis="claude grok kimi agy codex qwen cursor opencode cyberstrike openclaw hermes"
     local config_subcmds="get set unset list file help"
@@ -6402,6 +6406,11 @@ _kimo() {
         completion)
             COMPREPLY=( $(compgen -W "bash zsh" -- "${cur}") )
             ;;
+        freetier|free-tier|kimi-sync|quotas)
+            if [[ "${cur}" == -* ]]; then
+                COMPREPLY=( $(compgen -W "--check-auth --dry-run --from-json --save-json --min-remaining --min-days-left --qwen-only --include --exclude --sort --limit --verify --verify-prune --verify-timeout --jobs --set-default --context-window --max-output --base-url --api-key --config --list-only --output-json --verbose -h --help" -- "${cur}") )
+            fi
+            ;;
         doctor|diagnose|diag)
             if [[ "${cur}" == -* ]]; then
                 COMPREPLY=( $(compgen -W "--json -h --help" -- "${cur}") )
@@ -6473,6 +6482,7 @@ _kimo() {
         'rm:Delete a model'
         'pull:Pull a model with live progress'
         'sync:Replicate models across cluster hosts'
+        'freetier:Sync Kimi config with Model Studio free-tier quotas'
         'run:Run an Ollama model directly'
         'launch:Launch external agent CLI'
         'install:Install external LLM CLIs'
@@ -6535,6 +6545,34 @@ _kimo() {
                     shells=(bash zsh)
                     _describe -t shells 'shell' shells
                     ;;
+                freetier|free-tier|kimi-sync|quotas)
+                    _arguments \
+                        '--check-auth[Check console session]' \
+                        '--dry-run[Plan and print, write nothing]' \
+                        '--from-json[Read rows JSON]:file:_files' \
+                        '--save-json[Dump fetched rows JSON]:file:_files' \
+                        '--min-remaining[Minimum remaining quota]:n:' \
+                        '--min-days-left[Minimum days to expiry]:n:' \
+                        '--qwen-only[Restrict to qwen/qwq/qvq ids]' \
+                        '--include[Keep only models matching regex]:regex:' \
+                        '--exclude[Drop models matching regex]:regex:' \
+                        '--sort[Selection order]:sort:(remaining name expires)' \
+                        '--limit[Cap selection]:n:' \
+                        '--verify[Probe each model first]' \
+                        '--verify-prune[Drop models that fail the probe]' \
+                        '--verify-timeout[Per-probe timeout]:seconds:' \
+                        '--jobs[Parallel probe workers]:n:' \
+                        '--set-default[Rewrite default_model]:value:(first none)' \
+                        '--context-window[max_context_size]:n:' \
+                        '--max-output[max_output_size]:n:' \
+                        '--base-url[Base URL]:url:' \
+                        '--api-key[API key]:key:' \
+                        '--config[Target config.toml]:file:_files' \
+                        '--list-only[Print selected ids and exit]' \
+                        '--output-json[Emit JSON rows]' \
+                        '--verbose[Verbose progress]' \
+                        '(-h --help)'{-h,--help}'[Show help]' && return 0
+                    ;;
                 sync)
                     _arguments \
                         '--from[Source host]:host:' \
@@ -6591,6 +6629,514 @@ EOFZSH
 }
 
 # -----------------------------------------------------------------------------
+# Command: freetier  (Model Studio free-tier quota sync for Kimi Code)
+# Fetch free-tier quotas via the Bailian CLI (`bl usage free`) and rewrite the
+# managed [providers.alibaba] / [models."alibaba/..."] block of the Kimi Code
+# config.toml so it only lists models that still have quota remaining. Every
+# other provider/model (kimo's ollama-* aliases, managed:kimi-code, anthropic,
+# alibaba-token-plan, ...) is preserved. Ported from kimi-freetier-sync.sh;
+# same data source, filters and TOML target.
+# -----------------------------------------------------------------------------
+KIMI_FT_PROVIDER="alibaba"
+KIMI_FT_ALIAS_PREFIX="alibaba/"
+KIMI_FT_BASE_URL_DEFAULT="https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
+KIMI_FT_CONSOLE_URL="https://modelstudio.console.alibabacloud.com/ap-southeast-1/costing-balance/free-quota"
+KIMI_FT_CONSOLE_SITE="international"
+KIMI_FT_BAILIAN_CONFIG="${BAILIAN_CONFIG:-${HOME:-/root}/.bailian/config.json}"
+KIMI_FT_QWEN_SETTINGS="${HOME:-/root}/.qwen/settings.json"
+
+# Filters ported from populate-freetier-qwen.py (same semantics).
+KIMI_FT_QWEN_RE='^(qwen|qwq|qvq)'
+KIMI_FT_REALTIME_RE='realtime|livetranslate|s2s|webrtc|aoq'
+KIMI_FT_NONCHAT_RE='image|wan2|z-image|tts|asr|embed|tingwu|vl-ocr|-mt-|rerank|ccai|character|voice|-vace|kf2v|i2v|t2v'
+KIMI_FT_TOKEN_TYPES='Text|Vision|Multimodal'
+# bl prints {"error": {...}} (often on stderr) and can still exit 0.
+KIMI_FT_AUTH_ERR_RE='not logged in|session is not|expired|auth login|unauthorized|unauthenticated|forbidden|invalid token'
+KIMI_FT_BL_TIMEOUT="${KIMO_KIMI_FT_BL_TIMEOUT:-180}"
+
+_freetier_login_recipe() {
+    cat >&2 <<EOF
+${C_YELLOW}kimo freetier: the Model Studio console session is dead - quota data needs a
+live console login (an API key alone cannot see free quotas).${C_RESET}
+
+Run:
+  bl auth login --console --console-site ${KIMI_FT_CONSOLE_SITE}
+
+On a headless host, capture the callback URL instead:
+  BROWSER=/bin/false NO_COLOR=1 bl auth login --console --console-site ${KIMI_FT_CONSOLE_SITE} 2>&1 | tee /tmp/bl-login.log
+  # grab the 127.0.0.1:PORT URL it prints, then from a machine with a browser:
+  ssh -N -L PORT:127.0.0.1:PORT <this-host>
+  # open http://127.0.0.1:PORT/... in that browser (15-minute window)
+
+Then re-run.
+EOF
+}
+
+# _freetier_bl_usage_free -> rows JSON on stdout; returns 3 on auth error.
+_freetier_bl_usage_free() {
+    if ! command -v bl >/dev/null 2>&1; then
+        echo "${C_RED}Error: the 'bl' (Bailian CLI) is required to fetch free-tier quotas.${C_RESET}" >&2
+        echo "${C_RED}  Install with: bl skill init   (or pass --from-json to skip the live fetch)${C_RESET}" >&2
+        return 1
+    fi
+    local out err rc payload
+    out=$(mktemp) || return 1
+    err=$(mktemp) || { rm -f "${out}"; return 1; }
+    set +e
+    NO_COLOR=1 timeout "${KIMI_FT_BL_TIMEOUT}" bl usage free --all --output json \
+        --console-site "${KIMI_FT_CONSOLE_SITE}" >"${out}" 2>"${err}"
+    rc=$?
+    set -e
+    payload=$(cat "${out}")
+    if ! printf '%s' "${payload}" | jq -e 'type == "array"' >/dev/null 2>&1; then
+        local blob code msg
+        blob=$(cat "${out}" "${err}")
+        code=$(printf '%s' "${blob}" | jq -r '.error.code // empty' 2>/dev/null | head -1)
+        msg=$(printf '%s' "${blob}" | jq -r '.error.message // empty' 2>/dev/null | head -1)
+        if [[ "${code}" == "3" ]] || printf '%s %s' "${code}" "${msg}" | grep -Eiq "${KIMI_FT_AUTH_ERR_RE}"; then
+            rm -f "${out}" "${err}"
+            _freetier_login_recipe
+            return 3
+        fi
+        rm -f "${out}" "${err}"
+        if [[ "${rc}" -eq 124 ]]; then
+            echo "${C_RED}Error: 'bl usage free' timed out after ${KIMI_FT_BL_TIMEOUT}s.${C_RESET}" >&2
+            return 1
+        fi
+        echo "${C_RED}Error: unexpected 'bl usage free' payload (rc=${rc}): $(printf '%s' "${blob}" | head -c 300)${C_RESET}" >&2
+        return 1
+    fi
+    cat "${out}"
+    rm -f "${out}" "${err}"
+}
+
+# Same workspace key the qwen sync resolved: settings.env in ~/.qwen first
+# (qwen loads it, so it is the key qwen probes proved valid), then shell env,
+# then the Bailian CLI profile.
+_freetier_resolve_key() {
+    if [[ -n "${KIMI_FT_API_KEY}" ]]; then
+        printf '%s' "${KIMI_FT_API_KEY}"
+        return 0
+    fi
+    local k=""
+    if [[ -f "${KIMI_FT_QWEN_SETTINGS}" ]]; then
+        k=$(jq -r '.env.MODELSTUDIO_API_KEY // .env.DASHSCOPE_API_KEY // empty' "${KIMI_FT_QWEN_SETTINGS}" 2>/dev/null)
+    fi
+    if [[ -z "${k}" && -n "${DASHSCOPE_API_KEY:-}" ]]; then k="${DASHSCOPE_API_KEY}"; fi
+    if [[ -z "${k}" && -f "${KIMI_FT_BAILIAN_CONFIG}" ]]; then
+        k=$(jq -r '. as $c | .[$c.active_config // "default"].api_key // empty' "${KIMI_FT_BAILIAN_CONFIG}" 2>/dev/null)
+    fi
+    if [[ -z "${k}" ]]; then
+        echo "${C_RED}Error: no API key found (pass --api-key, set DASHSCOPE_API_KEY, or fix ${KIMI_FT_QWEN_SETTINGS}).${C_RESET}" >&2
+        return 1
+    fi
+    printf '%s' "${k}"
+}
+
+_freetier_load_rows() {
+    if [[ -n "${KIMI_FT_FROM_JSON}" ]]; then
+        if [[ ! -f "${KIMI_FT_FROM_JSON}" ]]; then
+            echo "${C_RED}Error: --from-json file not found: ${KIMI_FT_FROM_JSON}${C_RESET}" >&2
+            return 1
+        fi
+        # jq -e prints the (normalized) rows array to stdout, which the caller
+        # captures - mirroring the standalone script's load_rows().
+        if ! jq -e 'if type=="array" then . elif (.rows? // .data?) then (.rows // .data) else error("no rows array") end' "${KIMI_FT_FROM_JSON}" 2>/dev/null; then
+            echo "${C_RED}Error: bad --from-json payload in ${KIMI_FT_FROM_JSON}${C_RESET}" >&2
+            return 1
+        fi
+        return 0
+    fi
+    _freetier_bl_usage_free
+}
+
+_freetier_filter_rows() {
+    jq --argjson min_rem "${KIMI_FT_MIN_REMAINING}" --argjson min_days "${KIMI_FT_MIN_DAYS_LEFT}" \
+       --argjson qwen_only "${KIMI_FT_QWEN_ONLY}" --arg sort "${KIMI_FT_SORT}" --argjson limit "${KIMI_FT_LIMIT}" \
+       --arg token_types "${KIMI_FT_TOKEN_TYPES}" --arg realtime_re "${KIMI_FT_REALTIME_RE}" \
+       --arg nonchat_re "${KIMI_FT_NONCHAT_RE}" --arg include_re "${KIMI_FT_INCLUDE_RE}" --arg exclude_re "${KIMI_FT_EXCLUDE_RE}" \
+       --arg qwen_re "${KIMI_FT_QWEN_RE}" '
+    def to_num: if type=="number" then . elif type=="string" then (tonumber // 0) else 0 end;
+    def lc: tostring | ascii_downcase;
+    def exp_ok($min_days):
+      ((.expires // "") | lc | gsub("^\\s+|\\s+$";"")) as $e
+      | if (["expired","invalid","exhausted","used up","used"] | index($e)) != null then false
+        elif (["","-","none","null","unlimited","never","no expiry","valid","permanent","n/a"] | index($e)) != null then true
+        else
+          (try ($e | strptime("%Y-%m-%d") | mktime) catch
+           (try ($e | strptime("%Y/%m/%d") | mktime) catch
+            (try ($e | strptime("%d.%m.%Y") | mktime) catch
+             (try ($e | strptime("%Y-%m") | mktime) catch
+              (try ($e | strptime("%Y") | mktime) catch null))))) as $t
+          | if $t == null then true
+            else (($t - now) / 86400) >= $min_days end
+        end;
+    ($token_types | ascii_downcase | split("|")) as $tok
+    | [ .[]
+        | select(((.model // "") | tostring) != "")
+        | select(($qwen_only == 0) or (.model | test($qwen_re; "i")))
+        | select((.remaining | to_num) >= $min_rem and (.remaining | to_num) > 0)
+        | select(exp_ok($min_days))
+        | select(((.type // "") | lc) as $t | ($t == "") or ($tok | index($t) != null))
+        | select(.model | test($realtime_re; "i") | not)
+        | select(.model | test($nonchat_re; "i") | not)
+        | select(($include_re == "") or (.model | test($include_re; "i")))
+        | select(($exclude_re == "") or (.model | test($exclude_re; "i") | not))
+      ]
+    | (if $sort == "name" then sort_by(.model | lc)
+       elif $sort == "expires" then sort_by(.expires // "9999")
+       else sort_by(.remaining | to_num) | reverse end)
+    | if $limit > 0 then .[:$limit] else . end
+  '
+}
+
+# Network-level failures (000) are flaky under parallel load - retry those;
+# HTTP answers (200/401/403/...) are deterministic and final.
+_freetier_probe_one() {
+    local model="$1" base="$2" tout="$3" outdir="$4" key body code attempt detail=""
+    key=$(cat "${outdir}/.key")
+    body=$(mktemp) || return 1
+    for attempt in 1 2 3; do
+        code=$(curl -sS -m "${tout}" -o "${body}" -w '%{http_code}' \
+            -X POST "${base}/chat/completions" \
+            -H 'Content-Type: application/json' -H "Authorization: Bearer ${key}" \
+            -d "{\"model\":\"${model}\",\"messages\":[{\"role\":\"user\",\"content\":\"ping\"}],\"max_tokens\":1}" \
+            2>/dev/null) || code="000"
+        [[ "${code}" != "000" ]] && break
+        sleep "${attempt}"
+    done
+    if [[ "${code}" != "200" ]]; then
+        detail=$(jq -r '.error | (.code // "") + " " + (.message // "")' "${body}" 2>/dev/null | head -c 160)
+        [[ -n "${detail}" ]] || detail=$(head -c 120 "${body}" 2>/dev/null | tr '\n' ' ')
+    fi
+    # 200 = answers; 429 = throttled but has quota -> ok
+    if [[ "${code}" == "200" || "${code}" == "429" ]]; then
+        printf '%s\tok\tHTTP %s\n' "${model}" "${code}" > "${outdir}/${model}.probe"
+    else
+        printf '%s\tfail\tHTTP %s %s\n' "${model}" "${code}" "${detail}" > "${outdir}/${model}.probe"
+    fi
+    rm -f "${body}"
+}
+export -f _freetier_probe_one
+
+# args: models file (one per line) -> "model\tok|fail\tdetail" lines
+_freetier_run_verify() {
+    local models_file="$1" outdir
+    outdir=$(mktemp -d) || return 1
+    if ! _freetier_resolve_key > "${outdir}/.key"; then
+        rm -rf "${outdir}"
+        return 1
+    fi
+    xargs -P "${KIMI_FT_VERIFY_JOBS}" -I{} bash -c '_freetier_probe_one "$1" "$2" "$3" "$4"' _ {} \
+        "${KIMI_FT_BASE_URL}" "${KIMI_FT_VERIFY_TIMEOUT}" "${outdir}" < "${models_file}" >/dev/null 2>&1 || true
+    while IFS= read -r m; do
+        if [[ -f "${outdir}/${m}.probe" ]]; then
+            cat "${outdir}/${m}.probe"
+        else
+            printf '%s\tfail\tprobe missing\n' "${m}"
+        fi
+    done < "${models_file}"
+    rm -rf "${outdir}"
+}
+
+# rows JSON on stdin; $1 = resolved key
+_freetier_emit_block() {
+    jq -r --arg provider "${KIMI_FT_PROVIDER}" --arg prefix "${KIMI_FT_ALIAS_PREFIX}" --arg base "${KIMI_FT_BASE_URL}" \
+       --arg key "$1" --argjson ctx "${KIMI_FT_CONTEXT_WINDOW}" --argjson maxout "${KIMI_FT_MAX_OUTPUT}" '
+    "# >>> kimi-freetier-sync managed block (regenerated; do not hand-edit) >>>",
+    "[providers." + $provider + "]",
+    "type = \"openai\"",
+    "base_url = \"" + $base + "\"",
+    "api_key = \"" + $key + "\"",
+    "",
+    ( .[] |
+      "[models.\"" + $prefix + .model + "\"]",
+      "provider = \"" + $provider + "\"",
+      "model = \"" + .model + "\"",
+      "max_context_size = " + ($ctx | tostring),
+      "max_output_size = " + ($maxout | tostring),
+      "capabilities = [ " +
+        ([ "\"tool_use\"" ]
+         + (if (.type // "") == "Vision" then ["\"image_in\""]
+            elif (.type // "") == "Multimodal" then ["\"image_in\"", "\"video_in\""]
+            else [] end)
+        | join(", ")) + " ]",
+      "display_name = \"" + .model + " (free tier)\"",
+      ""
+    ),
+    "# <<< kimi-freetier-sync managed block <<<"
+  '
+}
+
+# args: rows JSON (selected) on stdin
+_freetier_write_config() {
+    local rows key n default_alias="" candidate
+    rows=$(cat)
+    if ! key=$(_freetier_resolve_key); then return 1; fi
+    n=$(printf '%s' "${rows}" | jq length)
+    case "${KIMI_FT_SET_DEFAULT}" in
+        ""|none) default_alias="" ;;
+        first) default_alias="${KIMI_FT_ALIAS_PREFIX}$(printf '%s' "${rows}" | jq -r '.[0].model // ""')" ;;
+        *) default_alias="${KIMI_FT_SET_DEFAULT}" ;;
+    esac
+
+    if [[ "${KIMI_FT_DRY_RUN}" -eq 1 ]]; then
+        echo "${C_DIM}[dry-run] would replace the ${KIMI_FT_PROVIDER} group with ${n} entries in ${KIMI_FT_CONFIG}${C_RESET}" >&2
+        [[ -n "${default_alias}" ]] && echo "${C_DIM}[dry-run] default_model -> ${default_alias}${C_RESET}" >&2
+        printf '%s\n' "${rows}" | jq -r '.[].model'
+        return 0
+    fi
+
+    candidate=$(mktemp) || return 1
+    if [[ -f "${KIMI_FT_CONFIG}" ]]; then
+        # Strip every managed section: [providers.alibaba] + subtables (but NOT
+        # [providers.alibaba-token-plan]) and all [models."alibaba/..."] blocks.
+        awk -v provider="${KIMI_FT_PROVIDER}" -v prefix="${KIMI_FT_ALIAS_PREFIX}" '
+          /^\[/ {
+            if ($0 ~ "^\\[providers\\." provider "(\\.|])" ||
+                $0 ~ "^\\[models\\.\"" prefix) skip=1; else skip=0;
+          }
+          !skip { print }
+        ' "${KIMI_FT_CONFIG}" > "${candidate}"
+    else
+        mkdir -p "$(dirname "${KIMI_FT_CONFIG}")"
+        printf '# %s/config.toml\n' "${KIMI_CONFIG%/*}" > "${candidate}"
+    fi
+
+    printf '\n' >> "${candidate}"
+    printf '%s' "${rows}" | _freetier_emit_block "${key}" >> "${candidate}"
+
+    if [[ -n "${default_alias}" ]]; then
+        if grep -q '^default_model\s*=' "${candidate}"; then
+            sed -i 's|^default_model\s*=.*|default_model = "'"${default_alias}"'"|' "${candidate}"
+        else
+            sed -i '1i default_model = "'"${default_alias}"'"' "${candidate}"
+        fi
+    fi
+
+    # Validate: kimi's own parser+schema when available, else a TOML parse check.
+    if command -v kimi >/dev/null 2>&1; then
+        if ! kimi doctor config "${candidate}" >/dev/null 2>&1; then
+            kimi doctor config "${candidate}" >&2 || true
+            rm -f "${candidate}"
+            echo "${C_RED}Error: kimi doctor rejected the candidate; ${KIMI_FT_CONFIG} untouched.${C_RESET}" >&2
+            return 1
+        fi
+    elif command -v python3 >/dev/null 2>&1; then
+        if ! python3 -c 'import sys,tomllib; tomllib.load(open(sys.argv[1],"rb"))' "${candidate}"; then
+            rm -f "${candidate}"
+            echo "${C_RED}Error: TOML parse failed; ${KIMI_FT_CONFIG} untouched.${C_RESET}" >&2
+            return 1
+        fi
+    else
+        echo "${C_YELLOW}[!] warning: no kimi/python3 validator found; writing unvalidated${C_RESET}" >&2
+    fi
+
+    if [[ -f "${KIMI_FT_CONFIG}" ]]; then
+        local backup
+        backup="${KIMI_FT_CONFIG}.before-freetier-$(date -u +%Y%m%dT%H%M%S%z)"
+        cp -p "${KIMI_FT_CONFIG}" "${backup}"
+        chmod 600 "${backup}"
+        echo "${C_DIM}backup: ${backup}${C_RESET}" >&2
+    fi
+    chmod 600 "${candidate}"
+    mv "${candidate}" "${KIMI_FT_CONFIG}"
+    echo "${C_GREEN}[+] wrote ${KIMI_FT_CONFIG}: ${n} free-tier models under [${KIMI_FT_PROVIDER}]${default_alias:+ default_model=${default_alias}}${C_RESET}" >&2
+}
+
+_freetier_usage() {
+    cat <<EOF
+${C_BOLD}kimo freetier${C_RESET} - sync Kimi Code config.toml with Model Studio (international) free-tier quotas
+
+${C_YELLOW}Source:${C_RESET} ${KIMI_FT_CONSOLE_URL}
+  Fetched through the Bailian CLI:  bl usage free --all --output json
+  Login when expired:               bl auth login --console --console-site ${KIMI_FT_CONSOLE_SITE}
+
+${C_YELLOW}Writes${C_RESET} (surgical edit, timestamped backup first, everything else preserved):
+  [providers.alibaba] + one [models."alibaba/<id>"] per quota-verified model
+  (managed block marked with "kimi-freetier-sync"). default_model is untouched
+  unless --set-default is given. max_output_size caps max_tokens at 65536.
+
+${C_YELLOW}Options:${C_RESET}
+  --check-auth            Is the console session live? (exit 0 live / 3 dead)
+  --dry-run               Plan and print selected models; write nothing
+  --from-json FILE        Skip live fetch; read rows JSON from FILE
+  --save-json FILE        Also dump fetched rows JSON to FILE
+  --list-only             Print selected model ids and exit
+  --output-json           With --list-only, emit JSON rows instead of ids
+  --verify                Probe each selected model with a 1-token chat first
+  --verify-prune          Also drop models that fail the probe (implies --verify)
+  --verify-timeout N      Per-probe timeout in seconds (default 30)
+  --jobs N                Parallel probe workers (default 6)
+  --qwen-only             Restrict to qwen/qwq/qvq model ids
+  --include RE            Keep only models matching RE
+  --exclude RE            Drop models matching RE
+  --min-remaining N       Require N remaining quota (default 1)
+  --min-days-left N       Require N days before expiry (default 0)
+  --sort name|expires|remaining    Selection order (default remaining)
+  --limit N               Cap selection to N models
+  --set-default first|none|ALIAS   Optionally rewrite default_model
+  --context-window N      max_context_size written per model (default 131072)
+  --max-output N          max_output_size written per model (default 65536)
+  --base-url URL          DashScope compatible-mode base URL
+  --api-key KEY           API key (else ~/.qwen/settings.json, DASHSCOPE_API_KEY, bl profile)
+  --config FILE           Target config.toml (default: ${KIMI_FT_CONFIG})
+  --verbose               Verbose per-model progress on stderr
+  -h, --help              Show this help
+
+${C_YELLOW}Examples:${C_RESET}
+  ${0##*/} freetier --check-auth
+  ${0##*/} freetier --dry-run
+  ${0##*/} freetier --verify --verify-prune
+  ${0##*/} freetier --set-default first
+  ${0##*/} freetier --from-json ~/quota.json --list-only --output-json
+EOF
+    return 0
+}
+
+cmd_freetier() {
+    KIMI_FT_CONFIG="${KIMI_CONFIG}"
+    KIMI_FT_BASE_URL="${DASHSCOPE_BASE_URL:-${KIMI_FT_BASE_URL_DEFAULT}}"
+    KIMI_FT_BASE_URL="${KIMI_FT_BASE_URL%/}"
+    KIMI_FT_API_KEY=""
+    KIMI_FT_FROM_JSON=""
+    KIMI_FT_SAVE_JSON=""
+    KIMI_FT_MIN_REMAINING=1
+    KIMI_FT_MIN_DAYS_LEFT=0
+    KIMI_FT_QWEN_ONLY=0
+    KIMI_FT_INCLUDE_RE=""
+    KIMI_FT_EXCLUDE_RE=""
+    KIMI_FT_SORT="remaining"
+    KIMI_FT_LIMIT=0
+    KIMI_FT_VERIFY=0
+    KIMI_FT_VERIFY_PRUNE=0
+    KIMI_FT_VERIFY_TIMEOUT=30
+    KIMI_FT_VERIFY_JOBS=6
+    KIMI_FT_SET_DEFAULT=""
+    KIMI_FT_CONTEXT_WINDOW="${KIMO_KIMI_FT_CONTEXT:-131072}"
+    KIMI_FT_MAX_OUTPUT="${KIMO_KIMI_FT_MAX_OUTPUT:-65536}"
+    KIMI_FT_DRY_RUN=0
+    KIMI_FT_LIST_ONLY=0
+    KIMI_FT_OUTPUT_JSON=0
+    KIMI_FT_VERBOSE=0
+    KIMI_FT_CHECK_AUTH=0
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --config) KIMI_FT_CONFIG="$2"; shift 2 ;;
+            --base-url) KIMI_FT_BASE_URL="$2"; shift 2 ;;
+            --api-key) KIMI_FT_API_KEY="$2"; shift 2 ;;
+            --from-json) KIMI_FT_FROM_JSON="$2"; shift 2 ;;
+            --save-json) KIMI_FT_SAVE_JSON="$2"; shift 2 ;;
+            --min-remaining) KIMI_FT_MIN_REMAINING="$2"; shift 2 ;;
+            --min-days-left) KIMI_FT_MIN_DAYS_LEFT="$2"; shift 2 ;;
+            --qwen-only) KIMI_FT_QWEN_ONLY=1; shift ;;
+            --include) KIMI_FT_INCLUDE_RE="$2"; shift 2 ;;
+            --exclude) KIMI_FT_EXCLUDE_RE="$2"; shift 2 ;;
+            --sort) KIMI_FT_SORT="$2"; shift 2 ;;
+            --limit) KIMI_FT_LIMIT="$2"; shift 2 ;;
+            --verify) KIMI_FT_VERIFY=1; shift ;;
+            --verify-prune) KIMI_FT_VERIFY=1; KIMI_FT_VERIFY_PRUNE=1; shift ;;
+            --verify-timeout) KIMI_FT_VERIFY_TIMEOUT="$2"; shift 2 ;;
+            --jobs) KIMI_FT_VERIFY_JOBS="$2"; shift 2 ;;
+            --set-default) KIMI_FT_SET_DEFAULT="$2"; shift 2 ;;
+            --context-window) KIMI_FT_CONTEXT_WINDOW="$2"; shift 2 ;;
+            --max-output) KIMI_FT_MAX_OUTPUT="$2"; shift 2 ;;
+            --dry-run) KIMI_FT_DRY_RUN=1; shift ;;
+            --list-only) KIMI_FT_LIST_ONLY=1; shift ;;
+            --output-json) KIMI_FT_OUTPUT_JSON=1; shift ;;
+            --verbose) KIMI_FT_VERBOSE=1; shift ;;
+            --check-auth) KIMI_FT_CHECK_AUTH=1; shift ;;
+            -h|--help) _freetier_usage; return 0 ;;
+            *) echo "${C_RED}Error: unknown flag: $1 (try --help)${C_RESET}" >&2; return 1 ;;
+        esac
+    done
+
+    if ! command -v jq >/dev/null 2>&1 || ! command -v curl >/dev/null 2>&1 || ! command -v awk >/dev/null 2>&1; then
+        echo "${C_RED}Error: kimo freetier requires jq, curl and awk.${C_RESET}" >&2
+        return 1
+    fi
+
+    KIMI_FT_BASE_URL="${KIMI_FT_BASE_URL%/}"
+
+    if [[ "${KIMI_FT_CHECK_AUTH}" -eq 1 ]]; then
+        echo "${C_DIM}probing console session with a real quota call...${C_RESET}" >&2
+        # stdout is the (huge) rows dump; stderr stays visible so an expired
+        # session prints the login recipe. if/else captures the real status
+        # ($? inside else is the condition's status), so we can distinguish
+        # "dead session" (3) from "unexpected payload" (1).
+        local ft_auth_rc=0
+        if _freetier_bl_usage_free >/dev/null; then
+            ft_auth_rc=0
+        else
+            ft_auth_rc=$?
+        fi
+        if [[ "${ft_auth_rc}" -eq 0 ]]; then
+            echo "${C_GREEN}console session: LIVE${C_RESET}" >&2
+            return 0
+        fi
+        if [[ "${ft_auth_rc}" -eq 3 ]]; then
+            echo "${C_YELLOW}[!] console session: expired (login required, see recipe above)${C_RESET}" >&2
+            return 3
+        fi
+        echo "${C_YELLOW}[!] console session: unknown state (rc=${ft_auth_rc})${C_RESET}" >&2
+        return "${ft_auth_rc}"
+    fi
+
+    local rows selected n models_file results ok_ids
+    if ! rows=$(_freetier_load_rows); then return 1; fi
+    if [[ -n "${KIMI_FT_SAVE_JSON}" ]]; then
+        printf '%s\n' "${rows}" | jq '.' > "${KIMI_FT_SAVE_JSON}"
+        echo "${C_DIM}saved rows -> ${KIMI_FT_SAVE_JSON}${C_RESET}" >&2
+    fi
+
+    selected=$(printf '%s' "${rows}" | _freetier_filter_rows)
+    n=$(printf '%s' "${selected}" | jq length)
+    if [[ "${n}" -lt 1 ]]; then
+        echo "${C_RED}Error: no models with quota left after filtering (see ${KIMI_FT_CONSOLE_URL})${C_RESET}" >&2
+        return 1
+    fi
+    echo "${C_DIM}selected ${n} models with quota left${C_RESET}" >&2
+
+    if [[ "${KIMI_FT_VERBOSE}" -eq 1 ]]; then
+        printf '%s' "${selected}" | jq -r '.[] | "  \(.model)\tremaining=\(.remaining)\texpires=\(.expires // "-")"' >&2
+    fi
+
+    if [[ "${KIMI_FT_VERIFY}" -eq 1 ]]; then
+        models_file=$(mktemp) || return 1
+        printf '%s' "${selected}" | jq -r '.[].model' > "${models_file}"
+        echo "${C_DIM}probing ${n} models at ${KIMI_FT_BASE_URL} ...${C_RESET}" >&2
+        results=$(_freetier_run_verify "${models_file}")
+        ok_ids=$(printf '%s\n' "${results}" | awk -F'\t' '$2=="ok"{print $1}')
+        printf '%s\n' "${results}" | awk -F'\t' '{printf "  %-36s %-4s %s\n", $1, $2, $3}' >&2
+        if [[ "${KIMI_FT_VERIFY_PRUNE}" -eq 1 ]]; then
+            selected=$(printf '%s' "${selected}" | jq --arg ok "${ok_ids}" '
+              ($ok | split("\n") | map(select(. != ""))) as $ids
+              | [ .[] | select(.model as $m | $ids | index($m) != null) ]')
+            n=$(printf '%s' "${selected}" | jq length)
+            if [[ "${n}" -lt 1 ]]; then
+                rm -f "${models_file}"
+                echo "${C_RED}Error: every probed model failed; nothing written.${C_RESET}" >&2
+                return 1
+            fi
+            echo "${C_DIM}after verify-prune: ${n} models${C_RESET}" >&2
+        fi
+        rm -f "${models_file}"
+    fi
+
+    if [[ "${KIMI_FT_LIST_ONLY}" -eq 1 ]]; then
+        if [[ "${KIMI_FT_OUTPUT_JSON}" -eq 1 || "${OPT_JSON}" == "true" ]]; then
+            printf '%s\n' "${selected}" | jq '.'
+        else
+            printf '%s' "${selected}" | jq -r '.[].model'
+        fi
+        return 0
+    fi
+
+    printf '%s' "${selected}" | _freetier_write_config
+}
+
+# -----------------------------------------------------------------------------
 # Main Dispatcher
 # -----------------------------------------------------------------------------
 # With several --host values, read-only/aggregate commands query every host;
@@ -6598,7 +7144,7 @@ EOFZSH
 # first --host).
 if [[ "${HOST_MODE}" == "multi" ]]; then
     case "${COMMAND}" in
-        check|ping|hosts|scan|discover|ps|top|list|ls|search|find|stop|unload|info|show|status|health|status-report|report|logs|log|rotate-token|rotate|install|setup|update|upgrade|doctor|diagnose|diag|config|cfg|completion|sync|version|help|-h|--help) ;;
+        check|ping|hosts|scan|discover|ps|top|list|ls|search|find|stop|unload|info|show|status|health|status-report|report|logs|log|rotate-token|rotate|install|setup|update|upgrade|doctor|diagnose|diag|config|cfg|completion|sync|freetier|free-tier|kimi-sync|quotas|version|help|-h|--help) ;;
         *)
             _model="${ARGS[0]:-}"
             if [[ "${COMMAND}" == "launch" ]]; then
@@ -6709,6 +7255,9 @@ case "${COMMAND}" in
         ;;
     completion)
         cmd_completion "${ARGS[@]}"
+        ;;
+    freetier|free-tier|kimi-sync|quotas)
+        cmd_freetier "${ARGS[@]}"
         ;;
     version)
         echo "kimo v${KIMO_VERSION}"

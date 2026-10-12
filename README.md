@@ -114,6 +114,7 @@ kimo [options] <command> [arguments...]
 | `install [cli\|all]` | Install/update external CLIs (`kimi`, `claude`, `grok`, `codex`, `qwen`, etc.) | `kimo install kimi` |
 | `update [cli\|all]`  | Check for updates for all installed CLIs, or apply updates | `kimo update` |
 | `completion [sh]`    | Generate shell tab-completion script for Bash or Zsh | `kimo completion bash` |
+| `freetier [opts]`    | Sync Kimi config with Model Studio free-tier quotas (`bl usage free`) | `kimo freetier --verify-prune` |
 
 ---
 
@@ -176,6 +177,31 @@ kimo config path
 | `kimi_effort` | Default thinking effort for Kimi (`low`, `medium`, `high`, `xhigh`, `max`) | `default` |
 | `kimi_context` | Default context window length in tokens for Kimi Code CLI | `auto` (model architecture/runtime) |
 | `no_color` | Disable ANSI terminal color codes (`true`/`false`) | `false` |
+
+---
+
+## Free-Tier Quota Sync (`freetier`)
+
+`kimo freetier` keeps the Kimi Code CLI pointed at the Model Studio (international) models that still have free-tier quota. It queries the free-quota console page through the Bailian CLI (`bl usage free --all --output json`, needs a live console login), filters to models with quota remaining, optionally live-probes each model, and rewrites the managed `[providers.alibaba]` + `[models."alibaba/..."]` block of `~/.kimi-code/config.toml` — a surgical edit with a timestamped backup first. Every other provider/model (kimo's `ollama-*` aliases, `managed:kimi-code`, `anthropic`, `alibaba-token-plan`, ...) is preserved. `default_model` is untouched unless you pass `--set-default`.
+
+```bash
+# Is the Model Studio console session live? (exit 0 live / 3 expired)
+kimo freetier --check-auth
+
+# Plan what would be written (writes nothing)
+kimo freetier --dry-run
+
+# Probe each candidate model, drop dead ones, then write config.toml
+kimo freetier --verify --verify-prune
+
+# Also make the top remaining-quota model the Kimi default
+kimo freetier --set-default first
+
+# Offline: reuse a previously saved quota dump
+kimo freetier --from-json ~/quota.json --list-only
+```
+
+The console session (an API key alone cannot see free quotas) is refreshed with `bl auth login --console --console-site international`; `kimo freetier --check-auth` prints the full recipe, including the headless-host callback flow, when it has expired. The API key used for probing/writing is resolved from `--api-key`, `~/.qwen/settings.json`, `DASHSCOPE_API_KEY`, then the `bl` profile. `max_output_size` is capped at 65536 because the DashScope endpoint rejects larger `max_tokens`.
 
 ---
 
