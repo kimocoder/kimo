@@ -1,15 +1,18 @@
 module.exports = {
+  root: true,
   env: {
+    browser: true,
     node: true,
     es2021: true,
-    browser: true,
   },
-  extends: 'eslint:recommended',
+  extends: [
+    'eslint:recommended',
+  ],
   parserOptions: {
     ecmaVersion: 'latest',
     sourceType: 'module',
   },
   rules: {
-    // Add your custom rules here
+    // Add project-specific rules here
   },
 };
