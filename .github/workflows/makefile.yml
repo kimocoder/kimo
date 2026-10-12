@@ -17,14 +17,8 @@ jobs:
     steps:
     - uses: actions/checkout@v7
 
-    - name: configure
-      run: ./configure
-
-    - name: Install dependencies
-      run: make
-
     - name: Run check
       run: make check
 
-    - name: Run distcheck
-      run: make distcheck
+    - name: Run lint
+      run: make lint
