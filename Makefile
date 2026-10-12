@@ -9,7 +9,7 @@ SHELL   := /bin/bash
 
 SCRIPT  := kimo
 
-.PHONY: all help install uninstall link unlink check lint test-qwen test-claude test-agy test-opencode test-kimi test-codex test-cursor test-grok test-gh test-thinking-tools test-gemini test-scan clean install-completion uninstall-completion
+.PHONY: all help install uninstall link unlink check lint test test-check test-web test-qwen test-claude test-agy test-opencode test-kimi test-codex test-cursor test-grok test-gh test-thinking-tools test-gemini test-scan clean install-completion uninstall-completion
 
 all: help
 
@@ -25,6 +25,9 @@ help:
 	@echo "  make uninstall-completion  Remove installed shell tab-completions"
 	@echo "  make check                 Verify bash syntax and execute basic CLI sanity checks"
 	@echo "  make lint                  Run shellcheck (error severity) against $(SCRIPT)"
+	@echo "  make test                  Run all headless smoke tests"
+	@echo "  make test-check            Headless smoke test of check & ping connectivity"
+	@echo "  make test-web              Headless smoke test of WebBridge and web research"
 	@echo "  make test-qwen             Headless smoke test of the 'qwen' launch branch (LIVE=1 adds a live -p turn)"
 	@echo "  make test-claude           Headless smoke test of the 'claude' launch branch (LIVE=1 adds a live -p turn)"
 	@echo "  make test-agy              Headless smoke test of the 'agy' launch branch (LIVE=1 adds a live -p turn)"
@@ -105,6 +108,18 @@ lint:
 	@echo "[*] Running shellcheck on $(SCRIPT)..."
 	@command -v shellcheck >/dev/null 2>&1 && shellcheck -S error $(SCRIPT) || echo "[!] shellcheck not found, skipping."
 	@echo "[✓] Lint check passed."
+
+test: test-check test-web test-scan test-gh test-thinking-tools test-gemini test-qwen test-claude test-agy test-opencode test-kimi test-codex test-cursor test-grok
+	@echo ""
+	@echo "[✓] All test suites completed successfully."
+
+test-check:
+	@echo "[*] Running check and ping connectivity smoke tests..."
+	@tests/check-smoke.sh
+
+test-web:
+	@echo "[*] Running WebBridge and web research smoke tests..."
+	@tests/web-smoke.sh
 
 test-qwen:
 	@echo "[*] Running 'qwen' launch smoke tests..."

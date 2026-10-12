@@ -209,6 +209,7 @@ setup_colors() {
         C_BLUE=$'\033[0;34m'
         C_MAGENTA=$'\033[0;35m'
         C_CYAN=$'\033[0;36m'
+        # shellcheck disable=SC2034
         C_WHITE=$'\033[1;37m'
     else
         C_RESET=""
@@ -220,6 +221,7 @@ setup_colors() {
         C_BLUE=""
         C_MAGENTA=""
         C_CYAN=""
+        # shellcheck disable=SC2034
         C_WHITE=""
     fi
 }
@@ -659,6 +661,7 @@ target = OM_TARGET_HOST
 mode = OM_HOST_MODE
 as_json = OM_OPT_JSON.lower() == "true"
 
+hosts_to_check = []
 remote_label = f'Remote ({OM_REMOTE_HOST_IP})' if OM_REMOTE_HOST_IP and OM_REMOTE_HOST_IP != 'remote' else 'Remote Host'
 if mode == 'multi':
     hosts_to_check.extend((u.split('://', 1)[-1], u) for u in OM_MULTI_HOSTS.split())
@@ -3681,8 +3684,9 @@ cmd_sync() {
         esac
     }
 
-    local src_url="$(_resolve_sync_host "${opt_from}")"
-    local dst_url="$(_resolve_sync_host "${opt_to}")"
+    local src_url dst_url
+    src_url="$(_resolve_sync_host "${opt_from}")"
+    dst_url="$(_resolve_sync_host "${opt_to}")"
 
     _sync_host_label() {
         local u="$1"
@@ -3705,8 +3709,9 @@ cmd_sync() {
         local s_url="$2"
         local d_url="$3"
 
-        local s_label="$(_sync_host_label "${s_url}")"
-        local d_label="$(_sync_host_label "${d_url}")"
+        local s_label d_label
+        s_label="$(_sync_host_label "${s_url}")"
+        d_label="$(_sync_host_label "${d_url}")"
 
         echo "${C_BOLD}[*] Synchronizing '${m}' from ${s_label} -> ${d_label}...${C_RESET}"
 
@@ -3752,8 +3757,9 @@ cmd_sync() {
             return 1
         fi
 
-        local s_label="$(_sync_host_label "${s_url}")"
-        local d_label="$(_sync_host_label "${d_url}")"
+        local s_label d_label
+        s_label="$(_sync_host_label "${s_url}")"
+        d_label="$(_sync_host_label "${d_url}")"
 
         echo "${C_BOLD}Scanning for models to synchronize from ${s_label} -> ${d_label}...${C_RESET}"
         local s_tags d_tags
@@ -5067,10 +5073,11 @@ cmd_launch() {
                 export OPENAI_API_BASE="${active_host}/v1"
                 export OPENAI_BASE_URL="${active_host}/v1"
                 export OLLAMA_HOST="${active_host}"
-                export CYBERSTRIKE_CONFIG_CONTENT="$(jq -nc \
+                CYBERSTRIKE_CONFIG_CONTENT="$(jq -nc \
                     --arg api "${active_host}/v1" \
                     --arg m "${resolved_model}" \
                     '{provider: {ollama: {name: "ollama", api: $api, models: {($m): {name: $m}}}}}' 2>/dev/null || true)"
+                export CYBERSTRIKE_CONFIG_CONTENT
 
                 local cs_model="${resolved_model}"
                 [[ "${cs_model}" != *"/"* ]] && cs_model="ollama/${cs_model}"
@@ -6259,7 +6266,7 @@ cmd_config() {
             printf "  ${C_CYAN}%-18s %-32s %-20s${C_RESET}\n" "KEY" "CURRENT VALUE" "SOURCE"
             echo "  ----------------------------------------------------------------------------------"
 
-            local known_keys=("default_host" "default_model" "remote_url" "local_url" "kimi_effort" "kimi_context" "no_color")
+            local known_keys=("default_host" "default_model" "remote_url" "local_url" "kimi_effort" "kimi_context" "no_color" "webbridge_url" "webbridge_port" "web_engine" "web_max_results")
             for k in "${known_keys[@]}"; do
                 local val=""
                 case "${k}" in
@@ -6283,6 +6290,18 @@ cmd_config() {
                         ;;
                     no_color)
                         val="${FORCE_NO_COLOR:-false}"
+                        ;;
+                    webbridge_url)
+                        val="${WEBBRIDGE_URL}"
+                        ;;
+                    webbridge_port)
+                        val="${WEBBRIDGE_PORT}"
+                        ;;
+                    web_engine)
+                        val="${WEB_ENGINE}"
+                        ;;
+                    web_max_results)
+                        val="${WEB_MAX_RESULTS}"
                         ;;
                 esac
 
@@ -6522,6 +6541,16 @@ cmd_doctor() {
         recs+=("Ensure /tmp has 1777 permissions: chmod 1777 /tmp")
     fi
 
+    # WebBridge Daemon (browser relay)
+    local wb_code
+    wb_code=$(curl -s -m 2 -o /dev/null -w "%{http_code}" "${WEBBRIDGE_URL%/command}/" 2>/dev/null) || wb_code="000"
+    if [[ "${wb_code}" =~ ^[1-5][0-9][0-9]$ ]]; then
+        echo "  ${C_GREEN}[✓] WebBridge${C_RESET}     : Listening at ${WEBBRIDGE_URL} (HTTP ${wb_code})"
+        passed=$((passed + 1))
+    else
+        echo "  ${C_DIM}[○] WebBridge${C_RESET}     : Not running on port ${WEBBRIDGE_PORT} (optional browser relay)"
+    fi
+
     echo ""
     # 3. Local Ollama Daemon
     echo "${C_YELLOW}[3/5] Local Ollama Daemon (${LOCAL_HOST_URL}):${C_RESET}"
@@ -6680,11 +6709,11 @@ _kimo() {
         cword=$COMP_CWORD
     fi
 
-    local commands="list ls search find ps top warm preload stop unload tune set-ctx param bench eval benchmark info show tag alias rm delete pull download sync run launch install setup update upgrade doctor diagnose diag config cfg completion freetier free-tier kimi-sync quotas gemini gemini-sync kimi-gemini version status health hosts init scan discover check ping stream logs rotate-token help"
+    local commands="list ls search find ps top warm preload stop unload tune set-ctx param bench eval benchmark info show tag alias rm delete pull download sync run launch install setup update upgrade doctor diagnose diag config cfg completion freetier free-tier kimi-sync quotas gemini gemini-sync kimi-gemini version status health hosts init scan discover check ping stream logs status-report report rotate-token web help"
     local global_opts="--remote --local --host --json --no-color -v --version -h --help"
     local supported_clis="claude grok kimi agy codex qwen cursor opencode cyberstrike openclaw hermes"
     local config_subcmds="get set unset list file help"
-    local config_keys="default_host default_model remote_url local_url kimi_effort kimi_context no_color"
+    local config_keys="default_host default_model remote_url local_url kimi_effort kimi_context no_color webbridge_url webbridge_port web_engine web_max_results"
     local log_services="tunnel keepalive timer apache all"
 
     local cmd=""
@@ -6876,6 +6905,13 @@ _kimo() {
                 COMPREPLY=( $(compgen -W "-p --ports --all-ports -t --threads --timeout -m --models --deep --all-interfaces -i --interactive --save --set-remote --json -h --help" -- "${cur}") )
             fi
             ;;
+        web)
+            if [[ "${cur}" == -* ]]; then
+                COMPREPLY=( $(compgen -W "--json -h --help" -- "${cur}") )
+            elif [[ $cword -eq $((cmd_idx + 1)) ]]; then
+                COMPREPLY=( $(compgen -W "status search fetch url help" -- "${cur}") )
+            fi
+            ;;
         *)
             if [[ "${cur}" == -* ]]; then
                 COMPREPLY=( $(compgen -W "${global_opts}" -- "${cur}") )
@@ -6954,6 +6990,8 @@ _kimo() {
         'stream:Pin remote model availability'
         'logs:Show recent journald output'
         'rotate-token:Generate new public API token'
+        'status-report:Append status snapshot to log'
+        'web:WebBridge browser relay and quota-free research'
         'completion:Generate shell autocompletions'
         'version:Show version information'
         'help:Show help message'
@@ -7081,6 +7119,11 @@ _kimo() {
                         '--json[Output in JSON format]' \
                         '(-h --help)'{-h,--help}'[Show help]' \
                         '*: :_hosts' && return 0
+                    ;;
+                web)
+                    _arguments \
+                        '1:subcommand:(status search fetch url help)' \
+                        '*:arguments:' && return 0
                     ;;
                 *)
                     local -a models
@@ -8180,6 +8223,170 @@ cmd_gemini() {
 }
 
 # -----------------------------------------------------------------------------
+# Command: web (WebBridge real-browser relay & quota-free research)
+# -----------------------------------------------------------------------------
+cmd_web() {
+    local subcmd="${1:-}"
+    shift || true
+
+    case "${subcmd}" in
+        status)
+            local base_url="${WEBBRIDGE_URL%/command}"
+            local code="000"
+            if command -v curl >/dev/null 2>&1; then
+                code=$(curl -s -m 3 -o /dev/null -w "%{http_code}" "${base_url}/" 2>/dev/null) || code="000"
+            fi
+            [[ -z "${code}" ]] && code="000"
+            local reachable="false"
+            if [[ "${code}" =~ ^[1-5][0-9][0-9]$ ]]; then
+                reachable="true"
+            fi
+            if [[ "${OPT_JSON:-false}" == "true" ]]; then
+                jq -nc \
+                    --arg url "${WEBBRIDGE_URL}" \
+                    --argjson port "${WEBBRIDGE_PORT}" \
+                    --arg code "${code}" \
+                    --argjson reachable "${reachable}" \
+                    --arg engine "${WEB_ENGINE}" \
+                    --argjson max_results "${WEB_MAX_RESULTS}" \
+                    '{url: $url, port: $port, http_code: $code, reachable: $reachable, engine: $engine, max_results: $max_results}'
+                return 0
+            fi
+            if [[ "${reachable}" == "true" ]]; then
+                echo "${C_GREEN}[✓] WebBridge daemon is reachable at ${WEBBRIDGE_URL} (HTTP ${code})${C_RESET}"
+                echo "    Relay port: ${WEBBRIDGE_PORT} | Search engine: ${WEB_ENGINE} | Max results: ${WEB_MAX_RESULTS}"
+            else
+                echo "${C_RED}[✗] WebBridge daemon is offline / unreachable at ${WEBBRIDGE_URL} (HTTP ${code})${C_RESET}"
+                echo "${C_DIM}    Ensure the Kimi WebBridge extension or browser relay is running on port ${WEBBRIDGE_PORT}.${C_RESET}"
+                echo "${C_DIM}    Reference: ~/.agents/skills/custom-web/SKILL.md${C_RESET}"
+                return 1
+            fi
+            ;;
+        url)
+            local target_url="${1:-}"
+            if [[ -z "${target_url}" || "${target_url}" == "-h" || "${target_url}" == "--help" ]]; then
+                echo "${C_RED}Usage: ${0##*/} web url <url>${C_RESET}" >&2
+                return 1
+            fi
+            [[ "${target_url}" =~ ^https?:// ]] || target_url="https://${target_url}"
+            local payload
+            payload=$(jq -nc --arg u "${target_url}" \
+                '{"action":"navigate","args":{"url":$u,"newTab":true,"group_title":"kimo-research"},"session":"kimo-web"}')
+            if [[ "${OPT_JSON:-false}" == "true" ]]; then
+                jq -nc --arg url "${WEBBRIDGE_URL}" --arg payload "${payload}" '{endpoint: $url, payload: ($payload | fromjson)}'
+            else
+                echo "${C_BOLD}Ready-to-paste navigation command:${C_RESET}"
+                cat <<EOF
+curl -s -X POST ${WEBBRIDGE_URL} \\
+  -H 'Content-Type: application/json' \\
+  -d '${payload}'
+EOF
+            fi
+            ;;
+        fetch)
+            local target_url="${1:-}"
+            if [[ -z "${target_url}" || "${target_url}" == "-h" || "${target_url}" == "--help" ]]; then
+                echo "${C_RED}Usage: ${0##*/} web fetch <url>${C_RESET}" >&2
+                return 1
+            fi
+            [[ "${target_url}" =~ ^https?:// ]] || target_url="https://${target_url}"
+            local payload
+            payload=$(jq -nc --arg u "${target_url}" \
+                '{"action":"navigate","args":{"url":$u,"newTab":true,"group_title":"kimo-research"},"session":"kimo-web"}')
+            echo "${C_DIM}[*] Navigating to ${target_url} via WebBridge (${WEBBRIDGE_URL})...${C_RESET}"
+            local res
+            if res=$(curl -s -S -m 5 -X POST "${WEBBRIDGE_URL}" \
+                -H 'Content-Type: application/json' \
+                -d "${payload}" 2>&1); then
+                if [[ "${OPT_JSON:-false}" == "true" ]]; then
+                    if echo "${res}" | jq . >/dev/null 2>&1; then
+                        echo "${res}"
+                    else
+                        jq -nc --arg u "${target_url}" --arg r "${res}" '{url: $u, result: $r}'
+                    fi
+                else
+                    echo "${C_GREEN}[✓] Page navigation command dispatched to WebBridge.${C_RESET}"
+                fi
+            else
+                echo "${C_RED}[✗] Failed to connect to WebBridge daemon at ${WEBBRIDGE_URL}.${C_RESET}" >&2
+                echo "${C_DIM}    Manual command:${C_RESET}" >&2
+                printf "    curl -s -X POST %s -H 'Content-Type: application/json' -d '%s'\n" "${WEBBRIDGE_URL}" "${payload}" >&2
+                return 1
+            fi
+            ;;
+        search)
+            local query="$*"
+            if [[ -z "${query}" || "${query}" == "-h" || "${query}" == "--help" ]]; then
+                echo "${C_RED}Usage: ${0##*/} web search <query>${C_RESET}" >&2
+                return 1
+            fi
+            local q_encoded
+            q_encoded=$(python3 -c "import urllib.parse, sys; print(urllib.parse.quote_plus(sys.argv[1]))" "${query}")
+            local search_url
+            case "${WEB_ENGINE}" in
+                bing)
+                    search_url="https://www.bing.com/search?q=${q_encoded}"
+                    ;;
+                google)
+                    search_url="https://www.google.com/search?q=${q_encoded}"
+                    ;;
+                duckduckgo|*)
+                    search_url="https://html.duckduckgo.com/html/?q=${q_encoded}"
+                    ;;
+            esac
+            local payload
+            payload=$(jq -nc --arg u "${search_url}" --arg q "${query}" \
+                '{"action":"navigate","args":{"url":$u,"newTab":true,"group_title":("search: " + $q)},"session":"kimo-web"}')
+            echo "${C_DIM}[*] Searching '${query}' via ${WEB_ENGINE} on WebBridge (${WEBBRIDGE_URL})...${C_RESET}"
+            local res
+            if res=$(curl -s -S -m 5 -X POST "${WEBBRIDGE_URL}" \
+                -H 'Content-Type: application/json' \
+                -d "${payload}" 2>&1); then
+                if [[ "${OPT_JSON:-false}" == "true" ]]; then
+                    if echo "${res}" | jq . >/dev/null 2>&1; then
+                        echo "${res}"
+                    else
+                        jq -nc --arg q "${query}" --arg u "${search_url}" --arg r "${res}" '{query: $q, url: $u, result: $r}'
+                    fi
+                else
+                    echo "${C_GREEN}[✓] Search navigation dispatched to browser tab.${C_RESET}"
+                    echo "${C_DIM}    URL: ${search_url}${C_RESET}"
+                    echo "${C_DIM}    Extraction snippet:${C_RESET}"
+                    printf "    curl -s -X POST %s -H 'Content-Type: application/json' -d '{\"action\":\"evaluate\",\"args\":{\"code\":\"(() => { const a = [...document.querySelectorAll(\\\"a.result__a, h2 a, .b_algo h2 a\\\")]; return JSON.stringify(a.slice(0,%s).map(x => ({t: x.textContent, h: x.href}))); })()\"},\"session\":\"kimo-web\"}'\n" "${WEBBRIDGE_URL}" "${WEB_MAX_RESULTS}"
+                fi
+            else
+                echo "${C_YELLOW}[!] WebBridge daemon unreachable at ${WEBBRIDGE_URL}.${C_RESET}" >&2
+                echo "${C_DIM}    Direct search URL: ${search_url}${C_RESET}" >&2
+                echo "${C_DIM}    Manual command:${C_RESET}" >&2
+                printf "    curl -s -X POST %s -H 'Content-Type: application/json' -d '%s'\n" "${WEBBRIDGE_URL}" "${payload}" >&2
+                return 1
+            fi
+            ;;
+        help|-h|--help|"")
+            cat <<EOF
+${C_BOLD}kimo web${C_RESET} – WebBridge real-browser relay & quota-free research
+
+${C_YELLOW}Usage:${C_RESET}
+  kimo web status                       Probe the WebBridge daemon reachability
+  kimo web search <query>             Search the web via WebBridge (no API key, no Moonshot quota)
+  kimo web fetch <url>                   Open <url> in the user's real browser (via WebBridge)
+  kimo web url <url>                    Print a ready-to-paste curl command for browser navigation
+
+${C_YELLOW}Configuration:${C_RESET}
+  Endpoint:   ${WEBBRIDGE_URL} (port: ${WEBBRIDGE_PORT})
+  Engine:     ${WEB_ENGINE} (duckduckgo | bing | google)
+  Max Limit:  ${WEB_MAX_RESULTS}
+EOF
+            ;;
+        *)
+            echo "${C_RED}Error: Unknown web subcommand '${subcmd}'.${C_RESET}" >&2
+            echo "Try: kimo web status | search | fetch | url" >&2
+            return 1
+            ;;
+    esac
+}
+
+# -----------------------------------------------------------------------------
 # Main Dispatcher
 # -----------------------------------------------------------------------------
 # With several --host values, read-only/aggregate commands query every host;
@@ -8187,7 +8394,7 @@ cmd_gemini() {
 # first --host).
 if [[ "${HOST_MODE}" == "multi" ]]; then
     case "${COMMAND}" in
-        check|ping|hosts|init|scan|discover|ps|top|list|ls|search|find|stop|unload|info|show|status|health|status-report|report|logs|log|rotate-token|rotate|install|setup|update|upgrade|doctor|diagnose|diag|config|cfg|completion|sync|freetier|free-tier|kimi-sync|quotas|gemini|gemini-sync|kimi-gemini|version|help|-h|--help) ;;
+        check|ping|hosts|init|scan|discover|ps|top|list|ls|search|find|stop|unload|info|show|status|health|status-report|report|logs|log|rotate-token|rotate|install|setup|update|upgrade|doctor|diagnose|diag|config|cfg|completion|sync|freetier|free-tier|kimi-sync|quotas|gemini|gemini-sync|kimi-gemini|web|version|help|-h|--help) ;;
         *)
             _model="${ARGS[0]:-}"
             if [[ "${COMMAND}" == "launch" ]]; then
@@ -8340,6 +8547,9 @@ case "${COMMAND}" in
         ;;
     gemini|gemini-sync|kimi-gemini)
         cmd_gemini "${ARGS[@]}"
+        ;;
+    web)
+        cmd_web "${ARGS[@]}"
         ;;
     version)
         echo "kimo v${KIMO_VERSION}"

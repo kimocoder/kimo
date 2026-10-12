@@ -60,6 +60,11 @@ make check
 | `make uninstall-completion`| Removes installed completion scripts |
 | `make check` | Validates bash syntax (`bash -n`) and executes basic CLI sanity tests |
 | `make lint` | Runs `shellcheck` with error filtering on `kimo` |
+| `make test` | Runs the full test suite across all headless smoke test targets |
+| `make test-check` | Headless smoke test of `kimo check` and `kimo ping` connectivity diagnostics |
+| `make test-web` | Headless smoke test of WebBridge browser relay and web research (`kimo web`) |
+| `make test-scan` | Headless smoke test of network scanning, discovery, and first-run wizard |
+| `make test-gh` | Headless smoke test of GitHub CLI (`gh`) integration contracts and update safety |
 | `make test-qwen` | Headless smoke test of the `qwen` launch branch: asserts the argv/env kimo passes (api-key scrubbing, `QWEN_CODE_API_TIMEOUT_MS`). Add `LIVE=1` for an opt-in live `-p` turn against a reachable Ollama host (`KIMO_SMOKE_HOST`/`KIMO_SMOKE_MODEL` override) |
 | `make test-claude` | Headless smoke test of the `claude` launch branch: asserts the env kimo passes (api-key scrubbing, `CLAUDE_CODE_*` defaults incl. unknown-model window enforcement and telemetry/MCP flags with user overrides honoured, `--ctx` → `OLLAMA_CONTEXT_LENGTH`, `API_TIMEOUT_MS` passthrough). Add `LIVE=1` for an opt-in live `-p` turn |
 | `make test-agy` | Headless smoke test of the `agy` launch branch: asserts shim liveness/reaping, settings patch + restore, and that `GEMINI_API_KEY` is never scrubbed (it only reaches the loopback shim, whose upstream requests carry no auth). Add `LIVE=1` for an opt-in live `-p` turn |
@@ -143,7 +148,30 @@ Checks performed:
 2. **Configuration & Storage**: `~/.config/kimo/config`, `/var/lib/ollama/tunings.json`, and `/tmp` permissions.
 3. **Local Daemon**: Reachability, version, API latency, installed catalog count, and active VRAM residency.
 4. **Remote GPU & SSH Tunnel**: `ollama-remote-tunnel.service` state, tunnel endpoint latency, remote model catalog, and remote VRAM state.
-5. **CLI Ecosystem**: Installation status, versions, and paths for all supported CLIs (claude, codex, qwen, grok, kimi, cursor, opencode, cyberstrike, agy, openclaw, hermes).
+5. **CLI Ecosystem**: Installation status, versions, and paths for all supported CLIs (claude, codex, qwen, grok, kimi, cursor, opencode, cyberstrike, agy, openclaw, hermes, gh).
+
+---
+
+## Server Health & Latency Probes (`check` / `ping`)
+
+Quickly probe connectivity, latency, installed model counts, and active VRAM usage across local and remote instances:
+
+```bash
+# Check connectivity and latency across all configured nodes
+kimo check
+
+# Fast connectivity ping alias
+kimo ping
+
+# Probe strictly the local daemon
+kimo --local check
+
+# Route probe to a specific remote or custom host
+kimo --host http://192.168.1.104:11434 check
+
+# Output structured diagnostics in JSON format for automation/dashboards
+kimo check --json
+```
 
 ---
 
@@ -188,6 +216,10 @@ kimo config path
 | `kimi_effort` | Default thinking effort for Kimi (`low`, `medium`, `high`, `xhigh`, `max`) | `default` |
 | `kimi_context` | Default context window length in tokens for Kimi Code CLI | `auto` (model architecture/runtime) |
 | `no_color` | Disable ANSI terminal color codes (`true`/`false`) | `false` |
+| `webbridge_url` | Endpoint URL for the Kimi WebBridge browser relay | `http://127.0.0.1:10086/command` |
+| `webbridge_port` | Listening port for the Kimi WebBridge daemon | `10086` |
+| `web_engine` | Search engine used for web research (`duckduckgo`, `bing`, `google`) | `duckduckgo` |
+| `web_max_results` | Maximum link count extracted by web research helper snippets | `10` |
 
 ---
 
@@ -241,6 +273,30 @@ kimo gemini --set-default gemini/gemini-2.5-flash
 # Launch Kimi Code CLI directly with a registered Gemini model
 kimi -m gemini/gemini-2.5-flash
 kimi -m gemini/gemini-2.5-pro
+```
+
+---
+
+## WebBridge & Quota-Free Research (`web`)
+
+`kimo web` provides direct CLI control over Kimi's local WebBridge browser relay daemon (listening on `127.0.0.1:10086`), enabling quota-free research and real-browser page extraction with zero Moonshot token consumption.
+
+```bash
+# Probe WebBridge daemon reachability and active port/settings
+kimo web status
+kimo web status --json
+
+# Execute web search through configured engine (DuckDuckGo, Bing, Google)
+kimo web search "quantum error correction 2026"
+
+# Open specific URL in the browser session
+kimo web fetch https://docs.ollama.com
+
+# Print a ready-to-paste curl navigation command for scripts
+kimo web url https://news.ycombinator.com
+
+# Launch Kimi Code CLI with automatic WebBridge skill injection (-W)
+kimo launch kimi -W --model kalidroid-27b:latest
 ```
 
 ---
