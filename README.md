@@ -387,7 +387,7 @@ Metrics reported:
 
 ## Shell Autocompletions (`completion`)
 
-`kimo` includes complete tab-completion for Bash and Zsh. It autocompletes commands, global flags, external CLIs, persistent configuration keys, and dynamically suggests installed Ollama models:
+`kimo` includes complete tab-completion for Bash and Zsh. It autocompletes commands, global flags, external CLIs, persistent configuration keys, and suggests installed Ollama models. Model suggestions come from a cached probe of the local daemon and the `127.0.0.1` tunnel (1s budget each, so a stalled remote never blocks a `<TAB>`); results refresh at most once per 30s and live in `~/.cache/kimo/models`:
 
 ```bash
 # Load completion into active Bash session

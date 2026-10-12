@@ -1035,8 +1035,10 @@ cmd_scan() {
         esac
     done
 
-    local candidate_file="/tmp/.kimo_scan_candidate_$$"
-    rm -f "${candidate_file}"
+    # mktemp, never /tmp/.kimo_scan_candidate_$$: a PID-guessable path lets a
+    # same-UID attacker pre-seed a symlink that the scanner's "w" write follows.
+    local candidate_file
+    candidate_file=$(mktemp) || return 1
 
     OM_SCAN_TARGETS="${targets[*]:-}" \
     OM_SCAN_PORTS="${ports}" \
@@ -1874,7 +1876,8 @@ cmd_status() {
           --arg public_url "https://www.kalidroid.com/ollama" \
           --arg public_http "${pubresp:--}" \
           --argjson public_models "${pub_models:-0}" \
-          '{tunnel:{service:"ollama-remote-tunnel.service",state:$tunnel,entered:$tunnel_enter},remote:{url:"'"${REMOTE_HOST_URL}"'",version:$remote_version,latency_ms:$remote_latency_ms,resident:{count:$resident_models,name:$resident_name,vram_gb:$resident_vram_gb,until:$resident_until}},keepalive:{timer_last_run:$timer_last,timer_next_run:$timer_next,service_last_start:$service_last},public:{url:$public_url,http:$public_http,models:$public_models}}'
+          --arg remote_url "${REMOTE_HOST_URL}" \
+          '{tunnel:{service:"ollama-remote-tunnel.service",state:$tunnel,entered:$tunnel_enter},remote:{url:$remote_url,version:$remote_version,latency_ms:$remote_latency_ms,resident:{count:$resident_models,name:$resident_name,vram_gb:$resident_vram_gb,until:$resident_until}},keepalive:{timer_last_run:$timer_last,timer_next_run:$timer_next,service_last_start:$service_last},public:{url:$public_url,http:$public_http,models:$public_models}}'
         exit 0
     fi
 
@@ -3845,7 +3848,8 @@ agy_start_shim() {
     done
     if [[ ! "${AGY_SHIM_PORT}" =~ ^[0-9]+$ ]]; then
         echo "${C_RED}Error: Gemini shim did not announce a port in time.${C_RESET}" >&2
-        AGY_SHIM_PORT=""
+        kill "${AGY_SHIM_PID}" 2>/dev/null || true
+        AGY_SHIM_PID=""
         return 1
     fi
 
@@ -3853,6 +3857,8 @@ agy_start_shim() {
     until curl -sf -m 2 "http://127.0.0.1:${AGY_SHIM_PORT}/healthz" >/dev/null 2>&1; do
         if ((tries++ >= 40)); then
             echo "${C_RED}Error: Gemini shim on port ${AGY_SHIM_PORT} never became healthy.${C_RESET}" >&2
+            kill "${AGY_SHIM_PID}" 2>/dev/null || true
+            AGY_SHIM_PID=""
             return 1
         fi
         if ! kill -0 "${AGY_SHIM_PID}" 2>/dev/null; then
@@ -4936,7 +4942,12 @@ _install_single_cli() {
                 echo "${C_RED}Error: curl or wget is required to install Kimi Code CLI.${C_RESET}" >&2
                 return 1
             fi
-            curl -fsSL https://code.kimi.com/kimi-code/install.sh | bash
+            # Guarded, not a bare pipeline: under set -euo pipefail an installer
+            # that exits nonzero would abort kimo before the friendly error below.
+            if ! curl -fsSL https://code.kimi.com/kimi-code/install.sh | bash; then
+                echo "${C_RED}[!] Kimi Code CLI install script failed.${C_RESET}" >&2
+                return 1
+            fi
             local kimi_path="${HOME:-/root}/.kimi-code/bin"
             [[ -d "${kimi_path}" && ":${PATH}:" != *":${kimi_path}:"* ]] && export PATH="${kimi_path}:${PATH}"
             if command -v kimi >/dev/null 2>&1; then
@@ -4995,7 +5006,12 @@ _install_single_cli() {
                 echo "${C_RED}Error: curl is required to install Grok CLI.${C_RESET}" >&2
                 return 1
             fi
-            curl -fsSL https://x.ai/cli/install.sh | bash
+            # Guarded, not a bare pipeline: see the Kimi branch - a failing
+            # installer must not abort kimo wholesale under set -euo pipefail.
+            if ! curl -fsSL https://x.ai/cli/install.sh | bash; then
+                echo "${C_RED}[!] Grok Build CLI install script failed.${C_RESET}" >&2
+                return 1
+            fi
             local grok_path="${HOME:-/root}/.grok/bin"
             [[ -d "${grok_path}" && ":${PATH}:" != *":${grok_path}:"* ]] && export PATH="${grok_path}:${PATH}"
             if command -v grok >/dev/null 2>&1; then
@@ -5224,8 +5240,7 @@ _install_single_cli() {
                 local cs_tar="cyberstrike-${os}-${arch}.tar.gz"
                 local dl_url="https://github.com/CyberStrikeus/CyberStrike/releases/download/v${cs_ver}/${cs_tar}"
                 local tmp_dir
-                tmp_dir=$(mktemp -d 2>/dev/null || echo "/tmp/cyberstrike-install")
-                mkdir -p "${tmp_dir}"
+                tmp_dir=$(mktemp -d) || { echo "${C_RED}Error: could not create a temporary directory for the Cyberstrike download.${C_RESET}" >&2; return 1; }
                 if curl -fsSL "${dl_url}" -o "${tmp_dir}/${cs_tar}" 2>/dev/null && tar -xzf "${tmp_dir}/${cs_tar}" -C "${tmp_dir}" 2>/dev/null; then
                     local target_dir="/usr/local/bin"
                     [[ ! -w "${target_dir}" ]] && target_dir="${HOME:-/root}/.cyberstrike/bin"
@@ -5700,6 +5715,83 @@ ${C_YELLOW}Examples:${C_RESET}
 EOF
 }
 
+# Effective source of a configuration key, by precedence:
+# environment > config file > built-in default.
+_config_source() {
+    local k="$1"
+    case "${k}" in
+        default_host)
+            if [[ -n "${KIMO_CONFIG_VALUES[default_host]:-}" ]]; then
+                echo "${KIMO_CONFIG_SOURCES[default_host]:-config file}"
+            else
+                echo "built-in default"
+            fi
+            ;;
+        default_model)
+            if [[ -n "${KIMO_DEFAULT_MODEL:-}" && "${KIMO_DEFAULT_MODEL}" != "${KIMO_CONFIG_VALUES[default_model]:-}" ]]; then
+                echo "env:KIMO_DEFAULT_MODEL"
+            elif [[ -n "${KIMO_CONFIG_VALUES[default_model]:-}" ]]; then
+                echo "${KIMO_CONFIG_SOURCES[default_model]:-config file}"
+            else
+                echo "built-in default"
+            fi
+            ;;
+        remote_url)
+            if [[ -n "${OLLAMA_REMOTE_URL:-}" && "${OLLAMA_REMOTE_URL}" != "${KIMO_CONFIG_VALUES[remote_url]:-}" ]]; then
+                echo "env:OLLAMA_REMOTE_URL"
+            elif [[ -n "${KIMO_CONFIG_VALUES[remote_url]:-}" ]]; then
+                echo "${KIMO_CONFIG_SOURCES[remote_url]:-config file}"
+            else
+                echo "built-in default"
+            fi
+            ;;
+        local_url)
+            if [[ -n "${OLLAMA_LOCAL_URL:-}" && "${OLLAMA_LOCAL_URL}" != "${KIMO_CONFIG_VALUES[local_url]:-}" ]]; then
+                echo "env:OLLAMA_LOCAL_URL"
+            elif [[ -n "${KIMO_CONFIG_VALUES[local_url]:-}" ]]; then
+                echo "${KIMO_CONFIG_SOURCES[local_url]:-config file}"
+            else
+                echo "built-in default"
+            fi
+            ;;
+        kimi_effort)
+            if { [[ -n "${KIMO_KIMI_EFFORT:-}" ]] || [[ -n "${OM_KIMI_EFFORT:-}" ]]; } && \
+                [[ "${KIMO_KIMI_EFFORT:-}${OM_KIMI_EFFORT:-}" != "${KIMO_CONFIG_VALUES[kimi_effort]:-}" ]]; then
+                echo "env:KIMO_KIMI_EFFORT/OM_KIMI_EFFORT"
+            elif [[ -n "${KIMO_CONFIG_VALUES[kimi_effort]:-}" ]]; then
+                echo "${KIMO_CONFIG_SOURCES[kimi_effort]:-config file}"
+            else
+                echo "built-in default"
+            fi
+            ;;
+        kimi_context)
+            if [[ -n "${KIMO_KIMI_CONTEXT:-}" && "${KIMO_KIMI_CONTEXT}" != "${KIMO_CONFIG_VALUES[kimi_context]:-}" ]]; then
+                echo "env:KIMO_KIMI_CONTEXT"
+            elif [[ -n "${KIMO_CONFIG_VALUES[kimi_context]:-}" ]]; then
+                echo "${KIMO_CONFIG_SOURCES[kimi_context]:-config file}"
+            else
+                echo "built-in default"
+            fi
+            ;;
+        no_color)
+            if [[ -n "${KIMO_CONFIG_VALUES[no_color]:-}" ]]; then
+                echo "${KIMO_CONFIG_SOURCES[no_color]:-config file}"
+            elif [[ "${FORCE_NO_COLOR}" == "true" ]]; then
+                echo "env/CLI flag"
+            else
+                echo "built-in default"
+            fi
+            ;;
+        *)
+            if [[ -n "${KIMO_CONFIG_VALUES[$k]:-}" ]]; then
+                echo "${KIMO_CONFIG_SOURCES[$k]:-config file}"
+            else
+                echo "built-in default"
+            fi
+            ;;
+    esac
+}
+
 cmd_config() {
     local subcmd="${1:-list}"
     shift || true
@@ -5717,41 +5809,31 @@ cmd_config() {
             local known_keys=("default_host" "default_model" "remote_url" "local_url" "kimi_effort" "kimi_context" "no_color")
             for k in "${known_keys[@]}"; do
                 local val=""
-                local src="built-in default"
                 case "${k}" in
                     default_host)
                         val="${KIMO_CONFIG_VALUES[default_host]:-auto (local+remote)}"
                         ;;
                     default_model)
                         val="${KIMO_DEFAULT_MODEL:-kalidroid-27b:latest}"
-                        [[ -n "${KIMO_DEFAULT_MODEL:-}" ]] && src="config/env"
                         ;;
                     remote_url)
                         val="${REMOTE_HOST_URL}"
-                        [[ -n "${OLLAMA_REMOTE_URL:-}" ]] && src="env:OLLAMA_REMOTE_URL"
                         ;;
                     local_url)
                         val="${LOCAL_HOST_URL}"
-                        [[ -n "${OLLAMA_LOCAL_URL:-}" ]] && src="env:OLLAMA_LOCAL_URL"
                         ;;
                     kimi_effort)
                         val="${KIMO_KIMI_EFFORT:-${OM_KIMI_EFFORT:-default}}"
-                        [[ -n "${KIMO_KIMI_EFFORT:-}" || -n "${OM_KIMI_EFFORT:-}" ]] && src="config/env"
                         ;;
                     kimi_context)
                         val="${KIMO_KIMI_CONTEXT:-auto (model architecture / runtime)}"
-                        [[ -n "${KIMO_KIMI_CONTEXT:-}" ]] && src="config/env"
                         ;;
                     no_color)
                         val="${FORCE_NO_COLOR:-false}"
                         ;;
                 esac
 
-                if [[ -n "${KIMO_CONFIG_VALUES[$k]:-}" ]]; then
-                    src="config file"
-                fi
-
-                printf "  %-18s %-32s ${C_DIM}%-20s${C_RESET}\n" "${k}" "${val}" "${src}"
+                printf "  %-18s %-32s ${C_DIM}%-20s${C_RESET}\n" "${k}" "${val}" "$(_config_source "${k}")"
             done
             echo ""
             echo "To change a setting:  ${0##*/} config set <key> <value>"
@@ -6166,12 +6248,40 @@ _kimo() {
         fi
     done
 
+    # Cached, bounded model list for completion. Probes only the local daemon
+    # and the localhost tunnel (never a LAN host), 1s budget each; repeats within
+    # 30s are served from ~/.cache/kimo/models without hitting the network. This
+    # replaces `kimo list`, which walked every host's /api/ps + /api/tags
+    # sequentially and stalled each <TAB> for seconds when a host was down.
+    _kimo_models() {
+        local cache="${XDG_CACHE_HOME:-$HOME/.cache}/kimo/models"
+        local ttl=30 now mtime
+        now=$(date +%s 2>/dev/null || echo 0)
+        if [[ -f "${cache}" ]]; then
+            if [[ "$(uname 2>/dev/null)" == "Darwin" ]]; then
+                mtime=$(stat -f %m "${cache}" 2>/dev/null || echo 0)
+            else
+                mtime=$(stat -c %Y "${cache}" 2>/dev/null || echo 0)
+            fi
+            if (( now - mtime < ttl )); then
+                cat "${cache}" 2>/dev/null
+                return 0
+            fi
+        fi
+        mkdir -p "${cache%/*}" 2>/dev/null || true
+        {
+            local local_url="${OLLAMA_LOCAL_URL:-http://127.0.0.1:11434}"
+            local remote_url="${OLLAMA_REMOTE_URL:-http://127.0.0.1:11438}"
+            curl -s --connect-timeout 1 -m 1 "${local_url%/}/api/tags" 2>/dev/null
+            curl -s --connect-timeout 1 -m 1 "${remote_url%/}/api/tags" 2>/dev/null
+        } | jq -r '.models[]?.name' 2>/dev/null | sort -u > "${cache}.$$" 2>/dev/null
+        mv -f "${cache}.$$" "${cache}" 2>/dev/null || true
+        cat "${cache}" 2>/dev/null
+    }
+
     _kimo_complete_models() {
         local models
-        models=$(kimo list 2>/dev/null | awk 'NR>2 && $1 !~ /^(Total|---|Hosts)/ {print $1}')
-        if [[ -z "${models}" ]]; then
-            models=$(curl -s --connect-timeout 1 -m 1 http://127.0.0.1:11434/api/tags 2>/dev/null | jq -r '.models[].name' 2>/dev/null)
-        fi
+        models=$(_kimo_models)
         COMPREPLY=( $(compgen -W "${models}" -- "${cur}") )
     }
 
@@ -6250,9 +6360,9 @@ _kimo() {
             if [[ "${cur}" == -* ]]; then
                 COMPREPLY=( $(compgen -W "${global_opts}" -- "${cur}") )
             else
-                local resident
-                resident=$(kimo ps --json 2>/dev/null | jq -r '.[].name' 2>/dev/null)
-                COMPREPLY=( $(compgen -W "all ${resident}" -- "${cur}") )
+                local models
+                models=$(_kimo_models)
+                COMPREPLY=( $(compgen -W "all ${models}" -- "${cur}") )
             fi
             ;;
         logs|log)
@@ -6317,6 +6427,35 @@ EOFBASH
             cat <<'EOFZSH'
 #compdef kimo
 # zsh completion for kimo
+
+# Cached, bounded model list for completion. Probes only the local daemon and
+# the localhost tunnel (never a LAN host), 1s budget each; repeats within 30s
+# are served from ~/.cache/kimo/models without hitting the network.
+_kimo_models() {
+    local cache="${XDG_CACHE_HOME:-$HOME/.cache}/kimo/models"
+    local ttl=30 now mtime
+    now=$(date +%s 2>/dev/null || echo 0)
+    if [[ -f "${cache}" ]]; then
+        if [[ "$(uname 2>/dev/null)" == "Darwin" ]]; then
+            mtime=$(stat -f %m "${cache}" 2>/dev/null || echo 0)
+        else
+            mtime=$(stat -c %Y "${cache}" 2>/dev/null || echo 0)
+        fi
+        if (( now - mtime < ttl )); then
+            cat "${cache}" 2>/dev/null
+            return 0
+        fi
+    fi
+    mkdir -p "${cache%/*}" 2>/dev/null || true
+    {
+        local local_url="${OLLAMA_LOCAL_URL:-http://127.0.0.1:11434}"
+        local remote_url="${OLLAMA_REMOTE_URL:-http://127.0.0.1:11438}"
+        curl -s --connect-timeout 1 -m 1 "${local_url%/}/api/tags" 2>/dev/null
+        curl -s --connect-timeout 1 -m 1 "${remote_url%/}/api/tags" 2>/dev/null
+    } | jq -r '.models[]?.name' 2>/dev/null | sort -u > "${cache}.$$" 2>/dev/null
+    mv -f "${cache}.$$" "${cache}" 2>/dev/null || true
+    cat "${cache}" 2>/dev/null
+}
 
 _kimo() {
     local -a commands
@@ -6420,7 +6559,7 @@ _kimo() {
                     ;;
                 *)
                     local -a models
-                    models=(${(f)"$(kimo list 2>/dev/null | awk 'NR>2 && $1 !~ /^(Total|---|Hosts)/ {print $1}')"})
+                    models=(${(f)"$(_kimo_models)"})
                     _describe -t models 'models' models
                     ;;
             esac
