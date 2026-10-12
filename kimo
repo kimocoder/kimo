@@ -4642,7 +4642,19 @@ cmd_launch() {
         export OLLAMA_CONTEXT_LENGTH="${opt_launch_ctx}"
     fi
 
-    if [[ -n "${cli_cmd}" ]] && command -v "${cli_cmd}" >/dev/null 2>&1; then
+    # The Cursor CLI ships as 'cursor-agent' (or 'agent'), so treat those as
+    # available too; the cursor branch below resolves the real binary.
+    local cli_available=0
+    if [[ -n "${cli_cmd}" ]]; then
+        if command -v "${cli_cmd}" >/dev/null 2>&1; then
+            cli_available=1
+        elif [[ "${cli_cmd}" == "cursor" ]] \
+            && { command -v cursor-agent >/dev/null 2>&1 || command -v agent >/dev/null 2>&1; }; then
+            cli_available=1
+        fi
+    fi
+
+    if [[ "${cli_available}" -eq 1 ]]; then
         echo "${C_GREEN}[*] Launching external CLI '${cli_cmd}' (Model: ${resolved_model}, Host: ${active_host})...${C_RESET}"
         case "${cli_cmd}" in
             claude)
