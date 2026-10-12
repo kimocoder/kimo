@@ -9,7 +9,7 @@ SHELL   := /bin/bash
 
 SCRIPT  := kimo
 
-.PHONY: all help install uninstall link unlink check lint test-qwen test-claude test-agy test-opencode test-kimi test-codex test-cursor test-grok test-thinking-tools test-gemini test-scan clean install-completion uninstall-completion
+.PHONY: all help install uninstall link unlink check lint test-qwen test-claude test-agy test-opencode test-kimi test-codex test-cursor test-grok test-gh test-thinking-tools test-gemini test-scan clean install-completion uninstall-completion
 
 all: help
 
@@ -33,6 +33,7 @@ help:
 	@echo "  make test-codex            Headless smoke test of the 'codex' launch branch (LIVE=1 adds a live exec turn)"
 	@echo "  make test-cursor           Headless smoke test of the 'cursor' launch branch (LIVE=1 adds a live -p turn)"
 	@echo "  make test-grok             Headless smoke test of the 'grok' launch branch (LIVE=1 adds a live -p turn)"
+	@echo "  make test-gh               Headless smoke test of GitHub CLI ('gh') integration (LIVE=1 adds a live turn)"
 	@echo "  make test-thinking-tools   Checks thinking/tools capability mapping, overrides, and kimi env-channel wiring"
 	@echo "  make test-gemini           Headless smoke test of 'gemini' token model sync into Kimi Code"
 	@echo "  make test-scan             Headless smoke test of network scanning, discovery, and first-run wizard"
@@ -136,6 +137,10 @@ test-cursor:
 test-grok:
 	@echo "[*] Running 'grok' launch smoke tests..."
 	@tests/grok-smoke.sh $(if $(LIVE),--live,)
+
+test-gh:
+	@echo "[*] Running 'gh' GitHub CLI smoke tests..."
+	@tests/gh-smoke.sh $(if $(LIVE),--live,)
 
 test-thinking-tools:
 	@echo "[*] Running thinking/tools capability checks..."
