@@ -9,7 +9,7 @@ SHELL   := /bin/bash
 
 SCRIPT  := kimo
 
-.PHONY: all help install uninstall link unlink check lint test-qwen test-claude test-agy test-opencode test-kimi clean install-completion uninstall-completion
+.PHONY: all help install uninstall link unlink check lint test-qwen test-claude test-agy test-opencode test-kimi test-codex clean install-completion uninstall-completion
 
 all: help
 
@@ -30,6 +30,7 @@ help:
 	@echo "  make test-agy              Headless smoke test of the 'agy' launch branch (LIVE=1 adds a live -p turn)"
 	@echo "  make test-opencode         Headless smoke test of the 'opencode' launch branch (LIVE=1 adds a live run turn)"
 	@echo "  make test-kimi             Headless smoke test of the 'kimi' launch branch (LIVE=1 adds a live -p turn)"
+	@echo "  make test-codex            Headless smoke test of the 'codex' launch branch (LIVE=1 adds a live exec turn)"
 	@echo "  make clean                 Remove temporary and backup files"
 	@echo "  make help                  Display this help message"
 	@echo ""
@@ -118,6 +119,10 @@ test-opencode:
 test-kimi:
 	@echo "[*] Running 'kimi' launch smoke tests..."
 	@tests/kimi-smoke.sh $(if $(LIVE),--live,)
+
+test-codex:
+	@echo "[*] Running 'codex' launch smoke tests..."
+	@tests/codex-smoke.sh $(if $(LIVE),--live,)
 
 clean:
 	@echo "[*] Cleaning temporary and backup files..."
