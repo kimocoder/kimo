@@ -18,6 +18,18 @@ REMOTE_DIRECT_URL="http://${REMOTE_HOST_IP}:${REMOTE_HOST_PORT}"
 REMOTE_TUNNEL_URL="http://127.0.0.1:11438"
 REMOTE_DAEMON_URL="http://${REMOTE_HOST_IP}:11436"
 KIMO_VERSION="1.1.0"
+
+# WebBridge (Kimi's real-browser relay, see 'kimo doctor' web bridge section).
+# Its daemon listens on 127.0.0.1:10086 and is steered over a local /command
+# JSON API - no API key, no Moonshot quota. Resolution order:
+# $KIMO_WEBBRIDGE_URL (full URL incl. path) > env-var port > config > default.
+WEBBRIDGE_PORT="${KIMO_WEBBRIDGE_PORT:-10086}"
+WEBBRIDGE_URL="${KIMO_WEBBRIDGE_URL:-http://127.0.0.1:${WEBBRIDGE_PORT}/command}"
+# Quota-free web tool defaults ('kimo web search' / 'launch kimi -W'),
+# overridable via config file (web_engine, web_max_results).
+WEB_ENGINE="${KIMO_WEB_ENGINE:-duckduckgo}"
+WEB_MAX_RESULTS="${KIMO_WEB_MAX_RESULTS:-10}"
+
 REMOTE_HOST_URL="${OLLAMA_REMOTE_URL:-${REMOTE_TUNNEL_URL}}"
 LOCAL_HOST_URL="${OLLAMA_LOCAL_URL:-http://127.0.0.1:11434}"
 
@@ -68,6 +80,22 @@ load_kimo_config() {
     fi
     if [[ "${KIMO_CONFIG_VALUES[no_color]:-}" == "true" && -z "${FORCE_NO_COLOR:-}" && "${NO_COLOR:-0}" != "1" ]]; then
         FORCE_NO_COLOR=true
+    fi
+    if [[ -n "${KIMO_CONFIG_VALUES[webbridge_url]:-}" && -z "${KIMO_WEBBRIDGE_URL:-}" ]]; then
+        WEBBRIDGE_URL="${KIMO_CONFIG_VALUES[webbridge_url]}"
+    fi
+    if [[ -n "${KIMO_CONFIG_VALUES[webbridge_port]:-}" && -z "${KIMO_WEBBRIDGE_PORT:-}" ]]; then
+        WEBBRIDGE_PORT="${KIMO_CONFIG_VALUES[webbridge_port]}"
+        # Rebuild the URL only if no full custom URL is set
+        if [[ "${WEBBRIDGE_URL}" == "http://127.0.0.1:10086/command" ]]; then
+            WEBBRIDGE_URL="http://127.0.0.1:${WEBBRIDGE_PORT}/command"
+        fi
+    fi
+    if [[ -n "${KIMO_CONFIG_VALUES[web_engine]:-}" ]]; then
+        WEB_ENGINE="${KIMO_CONFIG_VALUES[web_engine]}"
+    fi
+    if [[ -n "${KIMO_CONFIG_VALUES[web_max_results]:-}" ]]; then
+        WEB_MAX_RESULTS="${KIMO_CONFIG_VALUES[web_max_results]}"
     fi
 }
 load_kimo_config
@@ -202,6 +230,13 @@ ${C_YELLOW}Maintenance, Config & Completion:${C_RESET}
   ${C_CYAN}status-report${C_RESET}                Append operational status snapshot to /var/log/ollama-status-report.log
   ${C_CYAN}rotate-token${C_RESET}                 Generate new public API token, rewrite proxy conf & reload Apache
   ${C_CYAN}freetier [opts]${C_RESET}              Sync Kimi config with Model Studio free-tier quotas (bl usage free)
+
+${C_YELLOW}Web & Quota-Free Research:${C_RESET}
+  ${C_CYAN}web search <query>${C_RESET}             Search the web via WebBridge (no API key, no Moonshot quota)
+  ${C_CYAN}web fetch <url>${C_RESET}                   Open <url> in the user's real browser (via WebBridge)
+  ${C_CYAN}web status${C_RESET}                       Probe the WebBridge daemon reachability
+  ${C_CYAN}web url <url>${C_RESET}                    Print a ready-to-paste curl command for browser navigation
+  ${C_CYAN}launch kimi -W${C_RESET}                 Add -W to any 'launch kimi' invocation to auto-inject the WebBridge skill
 
 ${C_YELLOW}Supported CLIs (${0##*/} launch):${C_RESET}
   ${C_BOLD}claude${C_RESET}      Anthropic Claude Code CLI via OpenAI-compatible endpoint bridge
@@ -4087,27 +4122,40 @@ grok_cleanup() {
 # Registration here is additive and idempotent - a provider per Ollama host and
 # an alias per model, exactly like the xai/groq/alibaba entries users keep in
 # that file - so, unlike grok/agy, there is nothing to revert on exit.
+#
+# The whole host catalogue is registered, not just the launched tag: otherwise
+# 'launch kimi' leaves the /model picker with a single entry. The batch is one
+# tomlkit read-modify-write under the config lock (see kimi_register_all_models).
 KIMI_CONFIG="${KIMI_CONFIG:-${KIMI_CODE_HOME:-${HOME:-/root}/.kimi-code}/config.toml}"
 # Serializes concurrent 'launch kimi' upserts so two read-modify-write cycles
 # cannot drop each other's entries.
 KIMI_CONFIG_LOCK="${KIMO_KIMI_CONFIG_LOCK:-${KIMI_CONFIG_LOCK:-${TMPDIR:-/tmp}/kimo-kimi-config.lock}}"
 
-# Upserts providers[pid] and models[alias] through tomlkit so the user's
-# formatting, comments and key order survive (same contract as
+# Upserts providers[pid] and a batch of models[alias] through tomlkit so the
+# user's formatting, comments and key order survive (same contract as
 # _grok_write_config: values travel via argv, never interpolated into the
-# program). Exits 3 when tomlkit is missing, 4 on unparseable TOML.
-# argv: path pid base_url alias model ctx caps efforts default_effort off_effort reasoning_key display_name
-_kimi_write_config() {
+# program). The model spec JSON array rides in argv[4] - NOT stdin, which the
+# heredoc already owns. Exits 3 when tomlkit is missing, 4 on unparseable TOML.
+# argv: path pid base_url specs-json
+# specs-json: [{"alias","model","ctx","caps","efforts","deff","off","rkey","display_name"}, ...]
+_kimi_write_models() {
     python3 - "$@" <<'PY'
 import sys
+import json
 
 try:
     import tomlkit
 except ImportError:
     sys.exit(3)
 
-path, pid, base_url, alias, model = sys.argv[1:6]
-ctx, caps, efforts, default_effort, off_effort, reasoning_key, display_name = sys.argv[6:13]
+path, pid, base_url, specs_raw = sys.argv[1:5]
+
+try:
+    specs = json.loads(specs_raw)
+except Exception:
+    specs = []
+if not isinstance(specs, list):
+    specs = []
 
 try:
     with open(path, "r", encoding="utf-8") as fh:
@@ -4135,30 +4183,82 @@ models = doc.get("models")
 if models is None:
     models = tomlkit.table()
     doc["models"] = models
-if alias not in models:
-    models[alias] = tomlkit.table()
-mdl = models[alias]
-mdl["provider"] = pid
-mdl["model"] = model
-if ctx:
-    mdl["max_context_size"] = int(ctx)
-if caps:
-    mdl["capabilities"] = caps.split(",")
-if efforts:
-    mdl["support_efforts"] = efforts.split(",")
-if default_effort:
-    mdl["default_effort"] = default_effort
-if off_effort:
-    mdl["off_effort"] = off_effort
-if reasoning_key:
-    mdl["reasoning_key"] = reasoning_key
-if display_name:
-    mdl["display_name"] = display_name
+
+
+def _set(table, key, value):
+    if value:
+        table[key] = value
+    elif key in table:
+        del table[key]
+
+
+for spec in specs:
+    alias = spec.get("alias")
+    model = spec.get("model")
+    if not alias or not model:
+        continue
+    if alias not in models:
+        models[alias] = tomlkit.table()
+    mdl = models[alias]
+    mdl["provider"] = pid
+    mdl["model"] = model
+    ctx = spec.get("ctx")
+    if ctx is not None and str(ctx).isdigit():
+        mdl["max_context_size"] = int(ctx)
+    elif "max_context_size" in mdl:
+        del mdl["max_context_size"]
+    _set(mdl, "capabilities", [c for c in (spec.get("caps") or "").split(",") if c])
+    _set(mdl, "support_efforts", [c for c in (spec.get("efforts") or "").split(",") if c])
+    _set(mdl, "default_effort", spec.get("deff"))
+    _set(mdl, "off_effort", spec.get("off"))
+    _set(mdl, "reasoning_key", spec.get("rkey"))
+    _set(mdl, "display_name", spec.get("display_name"))
 
 # Written through the original inode so config.toml keeps its mode and owner.
 with open(path, "w", encoding="utf-8") as fh:
     fh.write(tomlkit.dumps(doc))
 PY
+}
+
+# Probes one Ollama model and prints a compact JSON spec consumed by
+# _kimi_write_models. Override arguments win over the probed values.
+# argv: host_url pid model [ctx caps efforts default_effort off_effort reasoning_key]
+_kimi_model_spec() {
+    local host_url="$1" pid="$2" model="$3"
+    local cov="${4:-}" capov="${5:-}" effov="${6:-}" deffov="${7:-}" offov="${8:-}" rkeyov="${9:-}"
+    local alias="${pid}/${model}"
+    local show="" runtime_ctx="" arch_ctx="" ctx="" caps=""
+
+    show=$(curl -s --connect-timeout 2 -m 5 "${host_url}/api/show" \
+        -d "$(jq -nc --arg m "${model}" '{model: $m}')") || show=""
+    if [[ -n "${show}" ]]; then
+        runtime_ctx=$(printf '%s' "${show}" | jq -r '(.parameters // "") | if test("num_ctx") then (capture("num_ctx\\s+(?<v>[0-9]+)") | .v) else empty end' 2>/dev/null) || runtime_ctx=""
+        arch_ctx=$(printf '%s' "${show}" | jq -r '[.model_info // {} | to_entries[] | select(.key | endswith("context_length")) | .value] | max // empty' 2>/dev/null) || arch_ctx=""
+        caps=$(printf '%s' "${show}" | jq -r '[(.capabilities // [])[] | if . == "thinking" then "thinking" elif . == "tools" then "tool_use" elif . == "vision" then "image_in" else empty end] | join(",")' 2>/dev/null) || caps=""
+    fi
+
+    if [[ -n "${cov}" && "${cov}" =~ ^[0-9]+$ ]]; then
+        ctx="${cov}"
+    elif [[ "${runtime_ctx}" =~ ^[0-9]+$ ]]; then
+        ctx="${runtime_ctx}"
+    elif [[ "${arch_ctx}" =~ ^[0-9]+$ ]]; then
+        ctx="${arch_ctx}"
+    fi
+
+    caps="${capov:-${caps:-tool_use}}"
+    local efforts="" off="" rkey="" deff=""
+    if [[ ",${caps}," == *",thinking,"* ]]; then
+        efforts="${effov:-low,medium,high,xhigh,max}"
+        off="${offov:-none}"
+        rkey="${rkeyov:-reasoning}"
+        deff="${deffov:-high}"
+    fi
+
+    jq -nc \
+        --arg alias "${alias}" --arg model "${model}" --arg ctx "${ctx}" \
+        --arg caps "${caps}" --arg efforts "${efforts}" --arg deff "${deff}" \
+        --arg off "${off}" --arg rkey "${rkey}" --arg dn "${model} (ollama)" \
+        '{alias: $alias, model: $model, ctx: $ctx, caps: $caps, efforts: $efforts, deff: $deff, off: $off, rkey: $rkey, display_name: $dn}'
 }
 
 _kimi_config_error() {
@@ -4176,33 +4276,96 @@ _kimi_config_error() {
     esac
 }
 
-# Upserts the host provider + model alias and prints the alias on success.
+# Upserts the host provider + the target model alias and prints the alias on
+# success. Kept for the opt-out path (KIMO_KIMI_REGISTER_ALL=0), where only the
+# launched tag is registered.
 # argv: host_url model ctx caps efforts default_effort off_effort reasoning_key
 kimi_register_model() {
     local host_url="$1" model="$2" ctx="$3" caps="$4" efforts="$5" default_effort="$6" off_effort="$7" reasoning_key="$8"
-    local slug pid alias rc=0
+    local slug pid alias rc=0 spec
     slug="${host_url#*://}"
     slug="${slug//[^a-zA-Z0-9]/-}"
     pid="ollama-${slug}"
     alias="${pid}/${model}"
+    spec=$(_kimi_model_spec "${host_url}" "${pid}" "${model}" "${ctx}" "${caps}" "${efforts}" "${default_effort}" "${off_effort}" "${reasoning_key}") || spec=""
+    if [[ -z "${spec}" ]]; then
+        return 1
+    fi
     if command -v flock >/dev/null 2>&1; then
         # FD form, not 'flock <file> <cmd>': the command form execs a binary and
-        # _kimi_write_config is a shell function.
+        # _kimi_write_models is a shell function.
         exec 9>"${KIMI_CONFIG_LOCK}"
         flock 9
-        _kimi_write_config "${KIMI_CONFIG}" "${pid}" "${host_url}/v1" \
-            "${alias}" "${model}" "${ctx}" "${caps}" "${efforts}" "${default_effort}" \
-            "${off_effort}" "${reasoning_key}" "${model} (ollama)" || rc=$?
+        _kimi_write_models "${KIMI_CONFIG}" "${pid}" "${host_url}/v1" "[${spec}]" || rc=$?
         exec 9>&-
     else
-        _kimi_write_config "${KIMI_CONFIG}" "${pid}" "${host_url}/v1" \
-            "${alias}" "${model}" "${ctx}" "${caps}" "${efforts}" "${default_effort}" \
-            "${off_effort}" "${reasoning_key}" "${model} (ollama)" || rc=$?
+        _kimi_write_models "${KIMI_CONFIG}" "${pid}" "${host_url}/v1" "[${spec}]" || rc=$?
     fi
     if ((rc != 0)); then
         _kimi_config_error "${rc}"
         return 1
     fi
+    printf '%s' "${alias}"
+}
+
+# Registers the target model AND every model the active host advertises, so the
+# kimi /model picker shows the host's whole catalogue instead of only the
+# launched tag. Idempotent; the whole batch is one atomic tomlkit read-modify-
+# write under the config lock. Prints the target alias on success.
+# argv: host_url target_model [ctx caps efforts default_effort off_effort reasoning_key]
+kimi_register_all_models() {
+    local host_url="$1" target="$2"
+    local tctx="${3:-}" tcaps="${4:-}" tefforts="${5:-}" tdeff="${6:-}" toff="${7:-}" trkey="${8:-}"
+    local slug pid alias
+    slug="${host_url#*://}"
+    slug="${slug//[^a-zA-Z0-9]/-}"
+    pid="ollama-${slug}"
+    alias="${pid}/${target}"
+
+    local names
+    names=$(curl -s --connect-timeout 2 -m 5 "${host_url}/api/tags" | jq -r '.models[]?.name' 2>/dev/null | sort -u) || names=""
+
+    local specs="[]" spec model n=0 target_seen=false
+    while IFS= read -r model; do
+        [[ -z "${model}" ]] && continue
+        if [[ "${model}" == "${target}" ]]; then
+            spec=$(_kimi_model_spec "${host_url}" "${pid}" "${model}" "${tctx}" "${tcaps}" "${tefforts}" "${tdeff}" "${toff}" "${trkey}") || spec=""
+            target_seen=true
+        else
+            spec=$(_kimi_model_spec "${host_url}" "${pid}" "${model}") || spec=""
+        fi
+        if [[ -n "${spec}" ]]; then
+            if specs=$(printf '%s' "${specs}" | jq -c --argjson s "${spec}" '. + [$s]'); then
+                n=$((n + 1))
+            fi
+        fi
+    done <<< "${names}"
+
+    # The launched tag can be missing from /api/tags (rename, or a transient
+    # probe failure) - never leave the session without its requested alias.
+    if ! ${target_seen}; then
+        spec=$(_kimi_model_spec "${host_url}" "${pid}" "${target}" "${tctx}" "${tcaps}" "${tefforts}" "${tdeff}" "${toff}" "${trkey}") || spec=""
+        if [[ -n "${spec}" ]]; then
+            if specs=$(printf '%s' "${specs}" | jq -c --argjson s "${spec}" '. + [$s]'); then
+                n=$((n + 1))
+            fi
+        fi
+    fi
+
+    local rc=0
+    if command -v flock >/dev/null 2>&1; then
+        exec 9>"${KIMI_CONFIG_LOCK}"
+        flock 9
+        _kimi_write_models "${KIMI_CONFIG}" "${pid}" "${host_url}/v1" "${specs}" || rc=$?
+        exec 9>&-
+    else
+        _kimi_write_models "${KIMI_CONFIG}" "${pid}" "${host_url}/v1" "${specs}" || rc=$?
+    fi
+    if ((rc != 0)); then
+        _kimi_config_error "${rc}"
+        return 1
+    fi
+    echo "${C_DIM}[*] kimi: registered ${n} model(s) from ${host_url}${C_RESET}" >&2
     printf '%s' "${alias}"
 }
 
@@ -4237,8 +4400,10 @@ ${C_YELLOW}CLI Integration Mechanics:${C_RESET}
   ${C_BOLD}grok${C_RESET}         Grok Build takes no endpoint flag; its catalog and inference are directed
                 to the resolved host via GROK_MODELS_BASE_URL. A tuned or specified num_ctx
                 (--ctx, tune --ctx) becomes that model's context_window in config.toml, restored on exit.
-  ${C_BOLD}kimi${C_RESET}         Kimi Code registers an additive, idempotent provider and model alias in
-                ~/.kimi-code/config.toml for the resolved host and launches with -m <alias>.
+  ${C_BOLD}kimi${C_RESET}         Kimi Code registers an additive, idempotent provider and the host's whole
+                model catalogue as aliases in ~/.kimi-code/config.toml, then launches with
+                -m <alias> (so the /model picker lists every model, not just the launched tag).
+                Set KIMO_KIMI_REGISTER_ALL=0 to register only the launched model.
                 Context length (--ctx, KIMO_KIMI_CONTEXT, or tuned num_ctx) becomes
                 max_context_size (capped at model architecture maximum). Thinking models declare
                 support_efforts low..max so the in-session /effort picker works (mapped via reasoning_key).
@@ -4258,6 +4423,7 @@ ${C_YELLOW}Environment Overrides:${C_RESET}
   KIMO_KIMI_EFFORTS         Supported thinking efforts list (e.g. low,medium,high,max)
   KIMO_KIMI_CAPABILITIES    Override detected model capabilities (e.g. tool_use,thinking)
   KIMO_KIMI_REASONING_KEY   Wire parameter name for thinking budget (default: reasoning)
+  KIMO_KIMI_REGISTER_ALL    Register every model the host serves (default: 1); set 0 to only the launched tag
   KIMO_AGY_CLAIM_DIR        Claim directory for concurrent Antigravity sessions (/tmp/kimo-agy-claims)
   KIMO_GROK_CLAIM_DIR       Claim directory for concurrent Grok sessions (/tmp/kimo-grok-claims)
   KIMO_KIMI_CONFIG_LOCK     Lockfile for concurrent Kimi config updates (/tmp/kimo-kimi-config.lock)
@@ -4287,6 +4453,7 @@ cmd_launch() {
     local target_model="${DEFAULT_MODELS[$provider]:-}"
     local cli_passthrough_args=()
     local opt_launch_ctx=""
+    local opt_launch_webbridge=false
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -4314,6 +4481,13 @@ cmd_launch() {
                 ;;
             --ctx=*|--context=*)
                 opt_launch_ctx="${1#*=}"
+                shift
+                ;;
+            -W|--webbridge)
+                # Quota-free web tool: inject the custom-web skill into the
+                # kimi launch session so the agent falls back to the WebBridge
+                # real-browser daemon (127.0.0.1:10086) instead of Moonshot.
+                opt_launch_webbridge=true
                 shift
                 ;;
             *)
@@ -4464,9 +4638,11 @@ cmd_launch() {
                 ;;
             kimi)
                 # kimi (Kimi Code CLI). Two routing paths, tried in order:
-                # 1. config.toml alias (preferred): kimi_register_model upserts a
-                #    provider for the resolved host and an alias for the resolved
-                #    tag - additive and idempotent, kept across sessions like the
+                # 1. config.toml alias (preferred): kimi_register_all_models
+                #    upserts a provider for the resolved host plus an alias for
+                #    every model that host advertises (kimi_register_model
+                #    registers only the resolved tag when KIMO_KIMI_REGISTER_ALL=0)
+                #    - additive and idempotent, kept across sessions like the
                 #    user's other providers, so (unlike grok/agy) nothing is
                 #    reverted on exit. Only a config alias can declare
                 #    support_efforts/off_effort, which unlocks the in-session
@@ -4543,8 +4719,31 @@ cmd_launch() {
                 fi
                 export KIMI_DISABLE_TELEMETRY="${KIMI_DISABLE_TELEMETRY:-1}"
                 export KIMI_CODE_NO_AUTO_UPDATE="${KIMI_CODE_NO_AUTO_UPDATE:-1}"
-                kimi_alias=$(kimi_register_model "${active_host}" "${resolved_model}" "${kimi_ctx}" \
-                    "${kimi_caps}" "${kimi_efforts}" "${kimi_deff}" "${kimi_off}" "${kimi_rkey}") || kimi_alias=""
+
+                # -W / --webbridge: point the session at the quota-free real-
+                # browser channel. The skill file lives in ~/.agents/skills/
+                # (picked up by kimi as "Extra" scope); if it exists, announce
+                # it. The daemon is at ${WEBBRIDGE_URL} (default
+                # http://127.0.0.1:10086/command). No API key on the wire.
+                local webbridge_skill="${HOME:-/root}/.agents/skills/custom-web/SKILL.md"
+                if ${opt_launch_webbridge} && [[ -f "${webbridge_skill}" ]]; then
+                    echo "${C_DIM}[*] webbridge skill: ${webbridge_skill} (endpoint ${WEBBRIDGE_URL})${C_RESET}"
+                    echo "${C_DIM}    Agent: on WebSearch 403 → route to WebBridge (curl POST ${WEBBRIDGE_URL})${C_RESET}"
+                elif ${opt_launch_webbridge}; then
+                    echo "${C_YELLOW}[!] webbridge skill not found at ${webbridge_skill} — agent will fall back to FetchURL only${C_RESET}"
+                fi
+
+                kimi_alias=""
+                if [[ "${KIMO_KIMI_REGISTER_ALL:-1}" == "0" ]]; then
+                    # Opt-out: only the launched tag (pre-existing behaviour).
+                    kimi_alias=$(kimi_register_model "${active_host}" "${resolved_model}" "${kimi_ctx}" \
+                        "${kimi_caps}" "${kimi_efforts}" "${kimi_deff}" "${kimi_off}" "${kimi_rkey}") || kimi_alias=""
+                else
+                    # Register the host's whole model catalogue so kimi's /model
+                    # picker is not limited to the single launched tag.
+                    kimi_alias=$(kimi_register_all_models "${active_host}" "${resolved_model}" "${kimi_ctx}" \
+                        "${kimi_caps}" "${kimi_efforts}" "${kimi_deff}" "${kimi_off}" "${kimi_rkey}") || kimi_alias=""
+                fi
                 if [[ -n "${kimi_alias}" ]]; then
                     # Nested-launch guard: a kimi session started by this script
                     # exports KIMI_MODEL_* to all its children. A stale inherited

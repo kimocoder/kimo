@@ -439,7 +439,9 @@ kimo completion zsh > ~/.zsh/completion/_kimo
 # Launch Claude Code on remote model
 kimo --remote launch claude --model nemotron3:33b
 
-# Launch Kimi Code CLI with thinking model support
+# Launch Kimi Code CLI with thinking model support. Registers the target host's
+# whole model catalogue as aliases in ~/.kimi-code/config.toml, so kimi's
+# /model picker lists every model - not just the one launched here.
 kimo --remote launch kimi --model kalidroid-27b:latest
 
 # Launch Grok Build TUI with tuned context
@@ -461,6 +463,7 @@ kimo launch cursor --model kalidroid-27b:latest
 - `OLLAMA_LOCAL_URL`: Override default local URL (defaults to `http://127.0.0.1:11434`).
 - `KIMO_KIMI_EFFORT` (or `OM_KIMI_EFFORT`): Default thinking effort level for Kimi Code CLI (`low`, `medium`, `high`, `xhigh`, `max`).
 - `KIMO_KIMI_CAPABILITIES` (or `OM_KIMI_CAPABILITIES`): Override detected capabilities (`tool_use`, `thinking`, `image_in`).
+- `KIMO_KIMI_REGISTER_ALL`: Register every model the host serves into the kimi config (default `1`). Set `0` to only register the launched model.
 - `KIMO_AGY_CLAIM_DIR`: Session claim directory for concurrent Antigravity sessions.
 - `KIMO_GROK_CLAIM_DIR`: Session claim directory for concurrent Grok sessions.
 - `KIMO_KIMI_CONFIG_LOCK`: File lock path for concurrent Kimi config updates.
