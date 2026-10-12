@@ -9,6 +9,9 @@
 #   * ANTHROPIC_API_KEY is scrubbed to 'ollama' for non-plain-local hosts, and
 #     only forwards a real ANTHROPIC_API_KEY/AUTH_TOKEN to a plain local daemon
 #   * kimo never overrides API_TIMEOUT_MS (claude's own default is 600000 ms)
+#   * preamble defaults: window enforcement off, telemetry/auto-updater/MCP
+#     server flags - and user-set values for them are honoured
+#   * --ctx exports OLLAMA_CONTEXT_LENGTH
 #
 # Live layer (opt-in, --live): if a real 'claude' and a reachable Ollama host
 # are available, run a headless -p turn and require a sane answer. Slow and
@@ -46,6 +49,12 @@ out="${CLAUDE_SMOKE_OUT:?CLAUDE_SMOKE_OUT unset}"
     printf 'CLAUDE_CODE_EFFORT_LEVEL=%s\n' "${CLAUDE_CODE_EFFORT_LEVEL-}"
     printf 'CLAUDE_CODE_MAX_OUTPUT_TOKENS=%s\n' "${CLAUDE_CODE_MAX_OUTPUT_TOKENS-}"
     printf 'CLAUDE_CODE_AUTO_COMPACT_WINDOW=%s\n' "${CLAUDE_CODE_AUTO_COMPACT_WINDOW-}"
+    printf 'CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT=%s\n' "${CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT-}"
+    printf 'CLAUDE_DISABLE_TELEMETRY=%s\n' "${CLAUDE_DISABLE_TELEMETRY-}"
+    printf 'DO_NOT_TRACK=%s\n' "${DO_NOT_TRACK-}"
+    printf 'DISABLE_AUTO_UPDATER=%s\n' "${DISABLE_AUTO_UPDATER-}"
+    printf 'ENABLE_CLAUDEAI_MCP_SERVERS=%s\n' "${ENABLE_CLAUDEAI_MCP_SERVERS-}"
+    printf 'OLLAMA_CONTEXT_LENGTH=%s\n' "${OLLAMA_CONTEXT_LENGTH-<unset>}"
     printf 'API_TIMEOUT_MS=%s\n' "${API_TIMEOUT_MS-<unset>}"
 } > "${out}"
 exit 0
@@ -78,6 +87,13 @@ SENTINEL="sk-ant-REAL-SENTINEL-do-not-leak"
 export ANTHROPIC_API_KEY="${SENTINEL}"
 export ANTHROPIC_AUTH_TOKEN="${SENTINEL}"
 
+# Strip ambient Claude Code configuration (this dev box exports all of it):
+# otherwise the "default" assertions pass on inherited values and never
+# exercise kimo's own defaults. Per-test override checks set their own values.
+unset CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT CLAUDE_CODE_AUTO_COMPACT_WINDOW \
+    CLAUDE_CODE_MAX_OUTPUT_TOKENS CLAUDE_DISABLE_TELEMETRY DO_NOT_TRACK DISABLE_AUTO_UPDATER \
+    ENABLE_CLAUDEAI_MCP_SERVERS CLAUDE_CODE_EFFORT_LEVEL OLLAMA_CONTEXT_LENGTH
+
 echo "[*] mocked: invocation contract"
 run_launch --host "${LOCAL_HOST}"
 if [[ ! -f "${CAPTURE}" ]]; then
@@ -93,6 +109,11 @@ else
     check "CLAUDE_CODE_EFFORT_LEVEL default" "low" "$(env_val "${CAPTURE}" CLAUDE_CODE_EFFORT_LEVEL)"
     check "CLAUDE_CODE_MAX_OUTPUT_TOKENS default" "8192" "$(env_val "${CAPTURE}" CLAUDE_CODE_MAX_OUTPUT_TOKENS)"
     check "CLAUDE_CODE_AUTO_COMPACT_WINDOW default" "100000" "$(env_val "${CAPTURE}" CLAUDE_CODE_AUTO_COMPACT_WINDOW)"
+    check "unknown-model window enforcement disabled" "1" "$(env_val "${CAPTURE}" CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT)"
+    check "telemetry disabled" "1" "$(env_val "${CAPTURE}" CLAUDE_DISABLE_TELEMETRY)"
+    check "DO_NOT_TRACK set" "1" "$(env_val "${CAPTURE}" DO_NOT_TRACK)"
+    check "auto-updater disabled" "1" "$(env_val "${CAPTURE}" DISABLE_AUTO_UPDATER)"
+    check "claude.ai MCP servers off by default" "false" "$(env_val "${CAPTURE}" ENABLE_CLAUDEAI_MCP_SERVERS)"
 fi
 
 echo "[*] mocked: api-key scrub"
@@ -119,6 +140,22 @@ check "kimo does not set API_TIMEOUT_MS (claude default 600000)" "<unset>" "$(en
 
 API_TIMEOUT_MS=90000 run_launch --host "${LOCAL_HOST}"
 check "user API_TIMEOUT_MS passes through untouched" "90000" "$(env_val "${CAPTURE}" API_TIMEOUT_MS)"
+
+echo "[*] mocked: preamble overrides honoured"
+CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT=0 run_launch --host "${LOCAL_HOST}"
+check "user window-enforcement choice honoured" "0" "$(env_val "${CAPTURE}" CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT)"
+
+ENABLE_CLAUDEAI_MCP_SERVERS=true run_launch --host "${LOCAL_HOST}"
+check "user MCP server choice honoured" "true" "$(env_val "${CAPTURE}" ENABLE_CLAUDEAI_MCP_SERVERS)"
+
+echo "[*] mocked: --ctx wiring"
+run_launch --host "${LOCAL_HOST}"
+check "no OLLAMA_CONTEXT_LENGTH without --ctx" "<unset>" "$(env_val "${CAPTURE}" OLLAMA_CONTEXT_LENGTH)"
+
+rm -f "${CAPTURE}"
+PATH="${FAKE_DIR}:${PATH}" "${KIMO}" --host "${LOCAL_HOST}" launch claude --model kalidroid-27b:latest --ctx 32768 \
+    >/dev/null 2>&1 || true
+check "--ctx 32768 exports OLLAMA_CONTEXT_LENGTH" "32768" "$(env_val "${CAPTURE}" OLLAMA_CONTEXT_LENGTH)"
 
 echo
 echo "mocked smoke: ${pass} passed, ${fail} failed"

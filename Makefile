@@ -9,7 +9,7 @@ SHELL   := /bin/bash
 
 SCRIPT  := kimo
 
-.PHONY: all help install uninstall link unlink check lint test-qwen test-claude test-agy test-opencode test-kimi test-codex test-cursor test-grok test-thinking-tools clean install-completion uninstall-completion
+.PHONY: all help install uninstall link unlink check lint test-qwen test-claude test-agy test-opencode test-kimi test-codex test-cursor test-grok test-thinking-tools test-gemini clean install-completion uninstall-completion
 
 all: help
 
@@ -34,6 +34,7 @@ help:
 	@echo "  make test-cursor           Headless smoke test of the 'cursor' launch branch (LIVE=1 adds a live -p turn)"
 	@echo "  make test-grok             Headless smoke test of the 'grok' launch branch (LIVE=1 adds a live -p turn)"
 	@echo "  make test-thinking-tools   Checks thinking/tools capability mapping, overrides, and kimi env-channel wiring"
+	@echo "  make test-gemini           Headless smoke test of 'gemini' token model sync into Kimi Code"
 	@echo "  make clean                 Remove temporary and backup files"
 	@echo "  make help                  Display this help message"
 	@echo ""
@@ -138,6 +139,10 @@ test-grok:
 test-thinking-tools:
 	@echo "[*] Running thinking/tools capability checks..."
 	@tests/thinking-tools-smoke.sh
+
+test-gemini:
+	@echo "[*] Running 'gemini' model sync smoke tests..."
+	@tests/gemini-smoke.sh
 
 clean:
 	@echo "[*] Cleaning temporary and backup files..."

@@ -61,13 +61,14 @@ make check
 | `make check` | Validates bash syntax (`bash -n`) and executes basic CLI sanity tests |
 | `make lint` | Runs `shellcheck` with error filtering on `kimo` |
 | `make test-qwen` | Headless smoke test of the `qwen` launch branch: asserts the argv/env kimo passes (api-key scrubbing, `QWEN_CODE_API_TIMEOUT_MS`). Add `LIVE=1` for an opt-in live `-p` turn against a reachable Ollama host (`KIMO_SMOKE_HOST`/`KIMO_SMOKE_MODEL` override) |
-| `make test-claude` | Headless smoke test of the `claude` launch branch: asserts the env kimo passes (api-key scrubbing, `CLAUDE_CODE_*` defaults, `API_TIMEOUT_MS` passthrough). Add `LIVE=1` for an opt-in live `-p` turn |
+| `make test-claude` | Headless smoke test of the `claude` launch branch: asserts the env kimo passes (api-key scrubbing, `CLAUDE_CODE_*` defaults incl. unknown-model window enforcement and telemetry/MCP flags with user overrides honoured, `--ctx` → `OLLAMA_CONTEXT_LENGTH`, `API_TIMEOUT_MS` passthrough). Add `LIVE=1` for an opt-in live `-p` turn |
 | `make test-agy` | Headless smoke test of the `agy` launch branch: asserts shim liveness/reaping, settings patch + restore, and that `GEMINI_API_KEY` is never scrubbed (it only reaches the loopback shim, whose upstream requests carry no auth). Add `LIVE=1` for an opt-in live `-p` turn |
 | `make test-opencode` | Headless smoke test of the `opencode` launch branch: asserts the argv/env kimo passes (host env, `OPENAI_API_KEY`/`ANTHROPIC_API_KEY` scrub for non-local hosts). opencode routes via its own provider config and reads no base-url env, so the scrub is defence-in-depth. Add `LIVE=1` for an opt-in live `run` turn against an isolated `HOME` with a throwaway provider (`KIMO_SMOKE_HOST`/`KIMO_SMOKE_MODEL` override) |
 | `make test-codex` | Headless smoke test of the `codex` launch branch: asserts the argv/env kimo passes (`--oss`, `--local-provider ollama`, `CODEX_OSS_BASE_URL` host routing, `OPENAI_API_KEY` default). Add `LIVE=1` for an opt-in live `exec` turn against a reachable Ollama host (`KIMO_SMOKE_HOST`/`KIMO_SMOKE_MODEL` override) |
 | `make test-cursor` | Headless smoke test of the `cursor` launch branch: asserts the argv/env kimo passes (`--model`, `CURSOR_MODEL`, `CURSOR_API_ENDPOINT`/`CURSOR_API_BASE_URL`/`CURSOR_LOCAL_AGENT_BASE_URL` host routing, override handling) and the `cursor` → `cursor-agent` binary fallback. Add `LIVE=1` for an opt-in live `-p` turn against a reachable Ollama host (`KIMO_SMOKE_HOST`/`KIMO_SMOKE_MODEL` override) |
 | `make test-grok` | Headless smoke test of the `grok` launch branch: asserts the argv/env kimo passes (`--model`, `GROK_MODELS_BASE_URL` host routing, forced `XAI_API_KEY` scrub for all hosts, exit-code propagation) and the `--ctx` config.toml `context_window` patch/revert lifecycle. Add `LIVE=1` for an opt-in live `-p` turn against a reachable Ollama host (`KIMO_SMOKE_HOST`/`KIMO_SMOKE_MODEL` override) |
 | `make test-thinking-tools` | Checks the thinking/tools capability handling: `_kimi_model_spec` unit checks (capability mapping `thinking`/`tools`/`vision` → `thinking`/`tool_use`/`image_in`, probe-failure fallback to `tool_use`, override precedence, ctx precedence flag > runtime > architecture) plus launch-branch integration (kimi env channel exports thinking vars only for thinking models, scrubs stale inherited effort on non-thinking models, honours `KIMO_KIMI_EFFORT`/`KIMO_KIMI_REASONING_KEY`/`KIMO_KIMI_CAPABILITIES`) |
+| `make test-gemini` | Headless smoke test of `kimo gemini` model sync into Kimi Code: asserts `/v1beta/models` parsing, non-chat filtering, `--stable-only`/`--all` flags, token limits mapping, thinking capability, valid TOML generation, idempotency, and backup creation |
 | `make clean` | Removes temporary and backup files (`*~`, `*.tmp`, `*.bak`) |
 | `make help` | Displays list of available make targets and options |
 
@@ -123,6 +124,7 @@ kimo [options] <command> [arguments...]
 | `update [cli\|all]`  | Check for updates for all installed CLIs, or apply updates | `kimo update` |
 | `completion [sh]`    | Generate shell tab-completion script for Bash or Zsh | `kimo completion bash` |
 | `freetier [opts]`    | Sync Kimi config with Model Studio free-tier quotas (`bl usage free`) | `kimo freetier --verify-prune` |
+| `gemini [opts]`      | Register Gemini API models (with exact token limits) into Kimi Code | `kimo gemini --verify-prune` |
 
 ---
 
@@ -210,6 +212,35 @@ kimo freetier --from-json ~/quota.json --list-only
 ```
 
 The console session (an API key alone cannot see free quotas) is refreshed with `bl auth login --console --console-site international`; `kimo freetier --check-auth` prints the full recipe, including the headless-host callback flow, when it has expired. The API key used for probing/writing is resolved from `--api-key`, `~/.qwen/settings.json`, `DASHSCOPE_API_KEY`, then the `bl` profile. `max_output_size` is capped at 65536 because the DashScope endpoint rejects larger `max_tokens`.
+
+---
+
+## Google Gemini API Model Sync (`gemini`)
+
+`kimo gemini` registers Google Gemini API models directly into Kimi Code (`~/.kimi-code/config.toml`). It queries the `/v1beta/models` endpoint (paginated) for every model visible to your API key, maps each model's genuine architectural token limits (`inputTokenLimit` &rarr; `max_context_size`, `outputTokenLimit` &rarr; `max_output_size`), detects thinking capability, and populates a managed `[providers.gemini]` block with native `google-genai` provider protocol and `[models."gemini/<id>"]` aliases.
+
+Non-chat models (media generation, TTS, live audio streams, embeddings, and autonomous agents) are automatically filtered out unless `--all` is passed. Like other `kimo` config mutations, edits are surgical, validated against `kimi doctor`, and preceded by timestamped backups (`config.toml.before-gemini-*`).
+
+```bash
+# Preview models that would be added (writes nothing)
+kimo gemini --dry-run
+
+# Probe candidate models with a 1-token prompt, prune any failing models, and write config
+kimo gemini --verify --verify-prune
+
+# Register only stable release models (drop preview / experimental tags)
+kimo gemini --stable-only
+
+# Reference GEMINI_API_KEY environment variable instead of hardcoding key into config.toml
+kimo gemini --api-key-env GEMINI_API_KEY
+
+# Set Gemini 2.5 Flash as the default model in Kimi Code
+kimo gemini --set-default gemini/gemini-2.5-flash
+
+# Launch Kimi Code CLI directly with a registered Gemini model
+kimi -m gemini/gemini-2.5-flash
+kimi -m gemini/gemini-2.5-pro
+```
 
 ---
 

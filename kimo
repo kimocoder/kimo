@@ -230,6 +230,7 @@ ${C_YELLOW}Maintenance, Config & Completion:${C_RESET}
   ${C_CYAN}status-report${C_RESET}                Append operational status snapshot to /var/log/ollama-status-report.log
   ${C_CYAN}rotate-token${C_RESET}                 Generate new public API token, rewrite proxy conf & reload Apache
   ${C_CYAN}freetier [opts]${C_RESET}              Sync Kimi config with Model Studio free-tier quotas (bl usage free)
+  ${C_CYAN}gemini [opts]${C_RESET}                Register Gemini API models (real token limits) in Kimi config
 
 ${C_YELLOW}Web & Quota-Free Research:${C_RESET}
   ${C_CYAN}web search <query>${C_RESET}             Search the web via WebBridge (no API key, no Moonshot quota)
@@ -280,6 +281,7 @@ ${C_YELLOW}Examples:${C_RESET}
   ${0##*/} freetier --check-auth                      # Is the Model Studio console session live?
   ${0##*/} freetier --verify --verify-prune           # Probe free-tier models, drop dead, write Kimi config
   ${0##*/} freetier --set-default first               # ...and make the top model the Kimi default
+  ${0##*/} gemini --verify --verify-prune             # Add every usable Gemini model to Kimi (kimi -m gemini/<id>)
 
   ${C_DIM}# Cluster & Multi-Host Management:${C_RESET}
   ${0##*/} check                                      # Health & latency probe for all endpoints
@@ -6544,7 +6546,7 @@ _kimo() {
         cword=$COMP_CWORD
     fi
 
-    local commands="list ls search find ps top warm preload stop unload tune set-ctx param bench eval benchmark info show tag alias rm delete pull download sync run launch install setup update upgrade doctor diagnose diag config cfg completion freetier free-tier kimi-sync quotas version status health hosts scan discover check ping stream logs rotate-token help"
+    local commands="list ls search find ps top warm preload stop unload tune set-ctx param bench eval benchmark info show tag alias rm delete pull download sync run launch install setup update upgrade doctor diagnose diag config cfg completion freetier free-tier kimi-sync quotas gemini gemini-sync kimi-gemini version status health hosts scan discover check ping stream logs rotate-token help"
     local global_opts="--remote --local --host --json --no-color -v --version -h --help"
     local supported_clis="claude grok kimi agy codex qwen cursor opencode cyberstrike openclaw hermes"
     local config_subcmds="get set unset list file help"
@@ -6720,6 +6722,11 @@ _kimo() {
         completion)
             COMPREPLY=( $(compgen -W "bash zsh" -- "${cur}") )
             ;;
+        gemini|gemini-sync|kimi-gemini)
+            if [[ "${cur}" == -* ]]; then
+                COMPREPLY=( $(compgen -W "--dry-run --list-only --output-json --from-json --save-json --verify --verify-prune --verify-timeout --jobs --stable-only --all --include --exclude --min-context --sort --limit --set-default --context-window --max-output --provider --base-url --api-key --api-key-env --config --verbose -h --help" -- "${cur}") )
+            fi
+            ;;
         freetier|free-tier|kimi-sync|quotas)
             if [[ "${cur}" == -* ]]; then
                 COMPREPLY=( $(compgen -W "--check-auth --dry-run --from-json --save-json --min-remaining --min-days-left --qwen-only --include --exclude --sort --limit --verify --verify-prune --verify-timeout --jobs --set-default --context-window --max-output --base-url --api-key --config --list-only --output-json --verbose -h --help" -- "${cur}") )
@@ -6797,6 +6804,7 @@ _kimo() {
         'pull:Pull a model with live progress'
         'sync:Replicate models across cluster hosts'
         'freetier:Sync Kimi config with Model Studio free-tier quotas'
+        'gemini:Register Gemini API models in Kimi config'
         'run:Run an Ollama model directly'
         'launch:Launch external agent CLI'
         'install:Install external LLM CLIs'
@@ -6858,6 +6866,35 @@ _kimo() {
                     local -a shells
                     shells=(bash zsh)
                     _describe -t shells 'shell' shells
+                    ;;
+                gemini|gemini-sync|kimi-gemini)
+                    _arguments \
+                        '--dry-run[Plan and print, write nothing]' \
+                        '--list-only[Print selected ids and exit]' \
+                        '--output-json[Emit JSON rows]' \
+                        '--from-json[Read /v1beta/models payload]:file:_files' \
+                        '--save-json[Dump fetched payload]:file:_files' \
+                        '--verify[Probe each model first]' \
+                        '--verify-prune[Drop models that fail the probe]' \
+                        '--verify-timeout[Per-probe timeout]:seconds:' \
+                        '--jobs[Parallel probe workers]:n:' \
+                        '--stable-only[Drop preview/experimental ids]' \
+                        '--all[Keep non-chat families too]' \
+                        '--include[Keep only models matching regex]:regex:' \
+                        '--exclude[Drop models matching regex]:regex:' \
+                        '--min-context[Minimum inputTokenLimit]:n:' \
+                        '--sort[Selection order]:sort:(name context output)' \
+                        '--limit[Cap selection]:n:' \
+                        '--set-default[Rewrite default_model]:value:(first none)' \
+                        '--context-window[Override max_context_size]:n:' \
+                        '--max-output[Override max_output_size]:n:' \
+                        '--provider[Provider id / alias prefix]:name:' \
+                        '--base-url[Gemini API base URL]:url:' \
+                        '--api-key[API key]:key:' \
+                        '--api-key-env[Write api_key_env instead of the key]:var:' \
+                        '--config[Target config.toml]:file:_files' \
+                        '--verbose[Verbose progress]' \
+                        '(-h --help)'{-h,--help}'[Show help]' && return 0
                     ;;
                 freetier|free-tier|kimi-sync|quotas)
                     _arguments \
@@ -7451,6 +7488,562 @@ cmd_freetier() {
 }
 
 # -----------------------------------------------------------------------------
+# Command: gemini  (Google Gemini API token models -> Kimi Code)
+# List every model the Gemini API key can see (GET /v1beta/models, paginated)
+# and rewrite the managed [providers.gemini] / [models."gemini/..."] block of
+# the Kimi Code config.toml. Kimi drives them natively through its
+# 'google-genai' provider type, using each model's real token limits
+# (inputTokenLimit -> max_context_size, outputTokenLimit -> max_output_size)
+# and the API's thinking flag. Every other provider/model is preserved and
+# default_model is untouched unless --set-default is given.
+# -----------------------------------------------------------------------------
+KIMI_GM_BASE_URL_DEFAULT="https://generativelanguage.googleapis.com"
+KIMI_GM_MARKER="kimo-gemini-sync managed block"
+KIMI_GM_DOTENV="${HOME:-/root}/.gemini/.env"
+# Families /models lists with generateContent that Kimi cannot drive as a
+# coding agent (media generation, speech, live/bidi, embeddings, agents).
+KIMI_GM_NONCHAT_RE='embed|aqa|imagen|veo|lyria|tts|image|banana|native-audio|live|transcribe|robotics|computer-use|deep-research|learnlm'
+KIMI_GM_PREVIEW_RE='preview|exp(erimental)?([-_]|$)'
+
+# _gemini_curl_key KEY CURL_ARGS... - run curl with the key sent as the
+# x-goog-api-key header via a stdin config, so it never shows up in argv/ps.
+_gemini_curl_key() {
+    local key="$1"
+    shift
+    printf 'header = "x-goog-api-key: %s"\n' "${key}" | curl -K - "$@"
+}
+export -f _gemini_curl_key
+
+# Key order: --api-key, --api-key-env VAR, GEMINI_API_KEY, GOOGLE_API_KEY,
+# GOOGLE_GENERATIVE_AI_API_KEY, then ~/.gemini/.env (gemini-cli's file). The
+# literal "ollama" is skipped: that is the placeholder kimo's agy launch exports.
+_gemini_resolve_key() {
+    if [[ -n "${KIMI_GM_API_KEY}" ]]; then
+        printf '%s' "${KIMI_GM_API_KEY}"
+        return 0
+    fi
+    local k="" var
+    if [[ -n "${KIMI_GM_API_KEY_ENV}" ]]; then
+        k="${!KIMI_GM_API_KEY_ENV:-}"
+        if [[ -z "${k}" ]]; then
+            echo "${C_RED}Error: --api-key-env ${KIMI_GM_API_KEY_ENV} is not set in this shell.${C_RESET}" >&2
+            return 1
+        fi
+        printf '%s' "${k}"
+        return 0
+    fi
+    for var in GEMINI_API_KEY GOOGLE_API_KEY GOOGLE_GENERATIVE_AI_API_KEY; do
+        if [[ -n "${!var:-}" && "${!var}" != "ollama" ]]; then
+            k="${!var}"
+            break
+        fi
+    done
+    if [[ -z "${k}" && -f "${KIMI_GM_DOTENV}" ]]; then
+        k=$(sed -n -E "s/^[[:space:]]*(export[[:space:]]+)?(GEMINI_API_KEY|GOOGLE_API_KEY)[[:space:]]*=[[:space:]]*[\"']?([^\"'[:space:]]+).*/\\3/p" \
+            "${KIMI_GM_DOTENV}" 2>/dev/null | head -1) || k=""
+    fi
+    if [[ -z "${k}" ]]; then
+        echo "${C_RED}Error: no Gemini API key found (pass --api-key, set GEMINI_API_KEY/GOOGLE_API_KEY, or add it to ${KIMI_GM_DOTENV}).${C_RESET}" >&2
+        echo "${C_RED}  Create one at https://aistudio.google.com/apikey${C_RESET}" >&2
+        return 1
+    fi
+    printf '%s' "${k}"
+}
+
+# _gemini_fetch_models KEY -> raw .models[] array (all pages) on stdout
+_gemini_fetch_models() {
+    local key="$1" token="" all="[]" body code msg pages=0
+    local -a page_arg
+    body=$(mktemp) || return 1
+    while :; do
+        page_arg=()
+        if [[ -n "${token}" ]]; then page_arg=(--data-urlencode "pageToken=${token}"); fi
+        code=$(_gemini_curl_key "${key}" -sS -G -m "${KIMI_GM_TIMEOUT}" -o "${body}" -w '%{http_code}' \
+            "${KIMI_GM_BASE_URL}/v1beta/models" --data-urlencode "pageSize=1000" "${page_arg[@]}" \
+            2>/dev/null) || code="000"
+        if [[ "${code}" != "200" ]]; then
+            msg=$(jq -r '.error | "\(.status // "") \(.message // "")"' "${body}" 2>/dev/null | head -c 300) || msg=""
+            [[ -n "${msg// /}" ]] || msg=$(head -c 200 "${body}" 2>/dev/null | tr '\n' ' ')
+            rm -f "${body}"
+            echo "${C_RED}Error: GET ${KIMI_GM_BASE_URL}/v1beta/models -> HTTP ${code} ${msg}${C_RESET}" >&2
+            return 1
+        fi
+        all=$(jq -c --argjson acc "${all}" '$acc + (.models // [])' "${body}") || { rm -f "${body}"; return 1; }
+        token=$(jq -r '.nextPageToken // empty' "${body}")
+        pages=$((pages + 1))
+        if [[ -z "${token}" || "${pages}" -ge 50 ]]; then break; fi
+    done
+    rm -f "${body}"
+    printf '%s\n' "${all}"
+}
+
+# Raw API models (array, or {models:[...]}) -> normalized rows on stdout.
+_gemini_normalize_rows() {
+    jq -e '
+      (if type == "array" then . elif (.models? | type) == "array" then .models
+       else error("no models array") end)
+      | [ .[] | select(type == "object") | {
+            model: ((.name // .model // "") | tostring | sub("^models/"; "")),
+            display_name: (.displayName // .display_name // ""),
+            input_tokens: ((.inputTokenLimit // .input_tokens // 0) | tonumber? // 0),
+            output_tokens: ((.outputTokenLimit // .output_tokens // 0) | tonumber? // 0),
+            methods: (.supportedGenerationMethods // .methods // []),
+            thinking: ((.thinking // false) == true)
+          } | select(.model != "") ]
+    '
+}
+
+_gemini_load_rows() {
+    local key="$1" raw
+    if [[ -n "${KIMI_GM_FROM_JSON}" ]]; then
+        if [[ ! -f "${KIMI_GM_FROM_JSON}" ]]; then
+            echo "${C_RED}Error: --from-json file not found: ${KIMI_GM_FROM_JSON}${C_RESET}" >&2
+            return 1
+        fi
+        raw=$(cat "${KIMI_GM_FROM_JSON}")
+    else
+        raw=$(_gemini_fetch_models "${key}") || return 1
+    fi
+    if [[ -n "${KIMI_GM_SAVE_JSON}" ]]; then
+        printf '%s\n' "${raw}" | jq '.' > "${KIMI_GM_SAVE_JSON}"
+        echo "${C_DIM}saved raw models -> ${KIMI_GM_SAVE_JSON}${C_RESET}" >&2
+    fi
+    if ! printf '%s' "${raw}" | _gemini_normalize_rows 2>/dev/null; then
+        echo "${C_RED}Error: unexpected Gemini models payload${KIMI_GM_FROM_JSON:+ in ${KIMI_GM_FROM_JSON}}${C_RESET}" >&2
+        return 1
+    fi
+}
+
+_gemini_filter_rows() {
+    jq --argjson all "${KIMI_GM_ALL}" --argjson stable "${KIMI_GM_STABLE_ONLY}" \
+       --argjson min_ctx "${KIMI_GM_MIN_CONTEXT}" --argjson limit "${KIMI_GM_LIMIT}" --arg sort "${KIMI_GM_SORT}" \
+       --arg nonchat_re "${KIMI_GM_NONCHAT_RE}" --arg preview_re "${KIMI_GM_PREVIEW_RE}" \
+       --arg include_re "${KIMI_GM_INCLUDE_RE}" --arg exclude_re "${KIMI_GM_EXCLUDE_RE}" '
+    [ .[]
+        | select((.methods | index("generateContent")) != null)
+        | select(($all == 1) or (.model | test($nonchat_re; "i") | not))
+        | select(($stable == 0) or (.model | test($preview_re; "i") | not))
+        | select(.input_tokens >= $min_ctx)
+        | select(($include_re == "") or (.model | test($include_re; "i")))
+        | select(($exclude_re == "") or (.model | test($exclude_re; "i") | not))
+    ]
+    | unique_by(.model)
+    | (if $sort == "context" then sort_by(-.input_tokens, .model)
+       elif $sort == "output" then sort_by(-.output_tokens, .model)
+       else sort_by(.model | ascii_downcase) end)
+    | if $limit > 0 then .[:$limit] else . end
+    '
+}
+
+# 200 = answers; 429 = valid model, just throttled -> ok. Network failures
+# (000) are retried; HTTP answers are final.
+_gemini_probe_one() {
+    local model="$1" base="$2" tout="$3" outdir="$4" key body code attempt detail="" safe
+    key=$(cat "${outdir}/.key")
+    safe="${model//\//_}"
+    body=$(mktemp) || return 1
+    for attempt in 1 2 3; do
+        code=$(_gemini_curl_key "${key}" -sS -m "${tout}" -o "${body}" -w '%{http_code}' \
+            -X POST "${base}/v1beta/models/${model}:generateContent" \
+            -H 'Content-Type: application/json' \
+            -d '{"contents":[{"role":"user","parts":[{"text":"ping"}]}],"generationConfig":{"maxOutputTokens":16}}' \
+            2>/dev/null) || code="000"
+        [[ "${code}" != "000" ]] && break
+        sleep "${attempt}"
+    done
+    if [[ "${code}" != "200" ]]; then
+        detail=$(jq -r '.error | (.status // "") + " " + (.message // "")' "${body}" 2>/dev/null | head -c 160)
+        [[ -n "${detail}" ]] || detail=$(head -c 120 "${body}" 2>/dev/null | tr '\n' ' ')
+    fi
+    if [[ "${code}" == "200" || "${code}" == "429" ]]; then
+        printf '%s\tok\tHTTP %s\n' "${model}" "${code}" > "${outdir}/${safe}.probe"
+    else
+        printf '%s\tfail\tHTTP %s %s\n' "${model}" "${code}" "${detail}" > "${outdir}/${safe}.probe"
+    fi
+    rm -f "${body}"
+}
+export -f _gemini_probe_one
+
+# args: KEY MODELS_FILE -> "model\tok|fail\tdetail" lines
+_gemini_run_verify() {
+    local key="$1" models_file="$2" outdir m
+    outdir=$(mktemp -d) || return 1
+    ( umask 077; printf '%s' "${key}" > "${outdir}/.key" )
+    xargs -P "${KIMI_GM_VERIFY_JOBS}" -I{} bash -c '_gemini_probe_one "$1" "$2" "$3" "$4"' _ {} \
+        "${KIMI_GM_BASE_URL}" "${KIMI_GM_VERIFY_TIMEOUT}" "${outdir}" < "${models_file}" >/dev/null 2>&1 || true
+    while IFS= read -r m; do
+        if [[ -f "${outdir}/${m//\//_}.probe" ]]; then
+            cat "${outdir}/${m//\//_}.probe"
+        else
+            printf '%s\tfail\tprobe missing\n' "${m}"
+        fi
+    done < "${models_file}"
+    rm -rf "${outdir}"
+}
+
+# rows JSON on stdin; $1 = key (ignored when KIMI_GM_API_KEY_ENV is set).
+# Strings go through tojson: a JSON string literal is a valid TOML basic string.
+_gemini_emit_block() {
+    jq -r --arg provider "${KIMI_GM_PROVIDER}" --arg prefix "${KIMI_GM_ALIAS_PREFIX}" \
+       --arg base "${KIMI_GM_BASE_URL}" --arg key "$1" --arg key_env "${KIMI_GM_API_KEY_ENV}" \
+       --arg marker "${KIMI_GM_MARKER}" \
+       --argjson ctx "${KIMI_GM_CONTEXT_WINDOW}" --argjson maxout "${KIMI_GM_MAX_OUTPUT}" '
+    def caps:
+      [ "tool_use" ]
+      + (if (.model | test("^gemini"; "i")) then [ "image_in", "video_in" ]
+         elif (.model | test("^gemma-?[3-9]"; "i")) and (.model | test("-1b"; "i") | not) then [ "image_in" ]
+         else [] end)
+      + (if .thinking then [ "thinking" ] else [] end);
+    "# >>> " + $marker + " (regenerated by kimo gemini; do not hand-edit) >>>",
+    "[providers." + $provider + "]",
+    "type = \"google-genai\"",
+    "base_url = " + ($base | tojson),
+    (if $key_env != "" then "api_key_env = " + ($key_env | tojson) else "api_key = " + ($key | tojson) end),
+    "",
+    ( .[] |
+      "[models." + (($prefix + .model) | tojson) + "]",
+      "provider = " + ($provider | tojson),
+      "model = " + (.model | tojson),
+      "max_context_size = " + ((if $ctx > 0 then $ctx elif .input_tokens > 0 then .input_tokens else 131072 end) | tostring),
+      "max_output_size = " + ((if $maxout > 0 then $maxout elif .output_tokens > 0 then .output_tokens else 8192 end) | tostring),
+      "capabilities = [ " + (caps | map(tojson) | join(", ")) + " ]",
+      "display_name = " + (((if .display_name != "" then .display_name else .model end) + " (Gemini)") | tojson),
+      ""
+    ),
+    "# <<< " + $marker + " <<<"
+  '
+}
+
+# Remove the managed provider + its model aliases (and our marker comments)
+# from a config.toml on stdin. Matching is literal (index), not regex, so a
+# sibling like [providers.gemini-paid] or [models."gemini-x/..."] survives.
+# Trailing blank lines are dropped so repeated syncs do not grow the file.
+_gemini_strip_managed() {
+    awk -v provider="${KIMI_GM_PROVIDER}" -v prefix="${KIMI_GM_ALIAS_PREFIX}" -v marker="${KIMI_GM_MARKER}" '
+      index($0, marker) { next }
+      /^[[:space:]]*\[/ {
+        h = $0; sub(/^[[:space:]]+/, "", h)
+        skip = (index(h, "[providers." provider "]") == 1 ||
+                index(h, "[providers." provider ".") == 1 ||
+                index(h, "[providers.\"" provider "\"]") == 1 ||
+                index(h, "[providers.\"" provider "\".") == 1 ||
+                index(h, "[models.\"" prefix) == 1)
+      }
+      skip { next }
+      /^[[:space:]]*$/ { blanks++; next }
+      { while (blanks > 0) { print ""; blanks-- } print }
+    '
+}
+
+# Set the top-level default_model (keys before the first table header only;
+# provider tables have their own default_model key that must stay intact).
+_gemini_set_default_model() {
+    local file="$1" alias="$2" tmp
+    tmp=$(mktemp) || return 1
+    awk -v alias="${alias}" '
+      BEGIN { line = "default_model = \"" alias "\"" }
+      !done && /^[[:space:]]*\[/ { if (!found) print line; done = 1 }
+      !done && /^[[:space:]]*default_model[[:space:]]*=/ { print line; found = 1; next }
+      { print }
+      END { if (!done && !found) print line }
+    ' "${file}" > "${tmp}" && cat "${tmp}" > "${file}"
+    rm -f "${tmp}"
+}
+
+# rows JSON (selected) on stdin
+_gemini_write_config() {
+    local rows key="" n default_alias="" candidate rc=0
+    rows=$(cat)
+    n=$(printf '%s' "${rows}" | jq length)
+    case "${KIMI_GM_SET_DEFAULT}" in
+        ""|none) default_alias="" ;;
+        first) default_alias="${KIMI_GM_ALIAS_PREFIX}$(printf '%s' "${rows}" | jq -r '.[0].model // ""')" ;;
+        *) default_alias="${KIMI_GM_SET_DEFAULT}" ;;
+    esac
+    if [[ -n "${default_alias}" && ! "${default_alias}" =~ ^[A-Za-z0-9._/:@+-]+$ ]]; then
+        echo "${C_RED}Error: invalid --set-default alias: ${default_alias}${C_RESET}" >&2
+        return 1
+    fi
+
+    if [[ "${KIMI_GM_DRY_RUN}" -eq 1 ]]; then
+        echo "${C_DIM}[dry-run] would replace the [providers.${KIMI_GM_PROVIDER}] group with ${n} models in ${KIMI_GM_CONFIG}${C_RESET}" >&2
+        if [[ -n "${default_alias}" ]]; then
+            echo "${C_DIM}[dry-run] default_model -> ${default_alias}${C_RESET}" >&2
+        fi
+        printf '%s' "${rows}" | jq -r --arg p "${KIMI_GM_ALIAS_PREFIX}" '.[] | "\($p)\(.model)\tctx=\(.input_tokens)\tout=\(.output_tokens)\(if .thinking then "\tthinking" else "" end)"'
+        return 0
+    fi
+
+    if [[ -z "${KIMI_GM_API_KEY_ENV}" ]]; then
+        key=$(_gemini_resolve_key) || return 1
+    fi
+
+    mkdir -p "$(dirname "${KIMI_GM_CONFIG}")"
+    if command -v flock >/dev/null 2>&1; then
+        exec 8>"${KIMI_CONFIG_LOCK}"
+        flock 8
+    fi
+
+    candidate=$(mktemp) || return 1
+    if [[ -f "${KIMI_GM_CONFIG}" ]]; then
+        _gemini_strip_managed < "${KIMI_GM_CONFIG}" > "${candidate}"
+        printf '\n' >> "${candidate}"
+    else
+        printf '# %s\n\n' "${KIMI_GM_CONFIG}" > "${candidate}"
+    fi
+    printf '%s' "${rows}" | _gemini_emit_block "${key}" >> "${candidate}"
+    if [[ -n "${default_alias}" ]]; then
+        _gemini_set_default_model "${candidate}" "${default_alias}"
+    fi
+
+    # Validate: kimi's own parser+schema when available, else a TOML parse check.
+    if command -v kimi >/dev/null 2>&1; then
+        if ! kimi doctor config "${candidate}" >/dev/null 2>&1; then
+            kimi doctor config "${candidate}" >&2 || true
+            echo "${C_RED}Error: kimi doctor rejected the candidate; ${KIMI_GM_CONFIG} untouched.${C_RESET}" >&2
+            rc=1
+        fi
+    elif command -v python3 >/dev/null 2>&1; then
+        if ! python3 -c 'import sys,tomllib; tomllib.load(open(sys.argv[1],"rb"))' "${candidate}"; then
+            echo "${C_RED}Error: TOML parse failed; ${KIMI_GM_CONFIG} untouched.${C_RESET}" >&2
+            rc=1
+        fi
+    else
+        echo "${C_YELLOW}[!] warning: no kimi/python3 validator found; writing unvalidated${C_RESET}" >&2
+    fi
+    if [[ "${rc}" -ne 0 ]]; then
+        rm -f "${candidate}"
+        return "${rc}"
+    fi
+
+    if [[ -f "${KIMI_GM_CONFIG}" ]]; then
+        local backup
+        backup="${KIMI_GM_CONFIG}.before-gemini-$(date -u +%Y%m%dT%H%M%S%z)"
+        cp -p "${KIMI_GM_CONFIG}" "${backup}"
+        chmod 600 "${backup}"
+        echo "${C_DIM}backup: ${backup}${C_RESET}" >&2
+    fi
+    chmod 600 "${candidate}"
+    mv "${candidate}" "${KIMI_GM_CONFIG}"
+    echo "${C_GREEN}[+] wrote ${KIMI_GM_CONFIG}: ${n} Gemini models under [providers.${KIMI_GM_PROVIDER}]${default_alias:+ default_model=${default_alias}}${C_RESET}" >&2
+    echo "${C_DIM}    use one with: kimi -m ${KIMI_GM_ALIAS_PREFIX}$(printf '%s' "${rows}" | jq -r '.[0].model')${C_RESET}" >&2
+}
+
+_gemini_usage() {
+    cat <<EOF
+${C_BOLD}kimo gemini${C_RESET} - register Google Gemini API models (with their token limits) in Kimi Code
+
+${C_YELLOW}Source:${C_RESET} GET ${KIMI_GM_BASE_URL_DEFAULT}/v1beta/models  (every page the key can see)
+  Key: --api-key, --api-key-env VAR, GEMINI_API_KEY, GOOGLE_API_KEY,
+       GOOGLE_GENERATIVE_AI_API_KEY, then ${KIMI_GM_DOTENV}
+
+${C_YELLOW}Writes${C_RESET} (surgical edit, timestamped backup first, everything else preserved):
+  [providers.gemini] (type = "google-genai") + one [models."gemini/<id>"] per
+  chat-capable model, with max_context_size = inputTokenLimit and
+  max_output_size = outputTokenLimit from the API, and capabilities
+  tool_use/image_in/video_in (+ thinking when the API flags it).
+  Media-generation, TTS, live/bidi, embedding and agent-only models are
+  skipped unless --all. default_model is untouched unless --set-default.
+
+${C_YELLOW}Options:${C_RESET}
+  --dry-run               Plan and print selected models; write nothing
+  --list-only             Print selected model ids and exit
+  --output-json           With --list-only, emit JSON rows instead of ids
+  --from-json FILE        Skip live fetch; read a /v1beta/models payload from FILE
+  --save-json FILE        Also dump the fetched raw payload to FILE
+  --verify                Probe each selected model with a tiny generateContent first
+  --verify-prune          Also drop models that fail the probe (implies --verify)
+  --verify-timeout N      Per-probe timeout in seconds (default 30)
+  --jobs N                Parallel probe workers (default 6)
+  --stable-only           Drop preview/experimental model ids
+  --all                   Keep non-chat families too (still requires generateContent)
+  --include RE            Keep only models matching RE
+  --exclude RE            Drop models matching RE
+  --min-context N         Require inputTokenLimit >= N (default 0)
+  --sort name|context|output   Selection order (default name)
+  --limit N               Cap selection to N models
+  --set-default first|none|ALIAS   Optionally rewrite default_model
+  --context-window N      Override max_context_size for every model (default: API value)
+  --max-output N          Override max_output_size for every model (default: API value)
+  --provider NAME         Provider id / alias prefix (default gemini -> "gemini/<id>")
+  --base-url URL          Gemini API base URL (default ${KIMI_GM_BASE_URL_DEFAULT})
+  --api-key KEY           API key to fetch with and embed in config.toml
+  --api-key-env VAR       Write api_key_env = "VAR" instead of embedding the key
+  --config FILE           Target config.toml (default: ${KIMI_CONFIG})
+  --verbose               Per-model details on stderr
+  -h, --help              Show this help
+
+${C_YELLOW}Examples:${C_RESET}
+  ${0##*/} gemini --dry-run
+  ${0##*/} gemini --verify --verify-prune
+  ${0##*/} gemini --stable-only --set-default gemini/gemini-2.5-pro
+  ${0##*/} gemini --api-key-env GEMINI_API_KEY      # keep the secret out of config.toml
+  kimi -m gemini/gemini-2.5-flash
+EOF
+    return 0
+}
+
+cmd_gemini() {
+    KIMI_GM_CONFIG="${KIMI_CONFIG}"
+    KIMI_GM_BASE_URL="${KIMO_GEMINI_BASE_URL:-${KIMI_GM_BASE_URL_DEFAULT}}"
+    KIMI_GM_PROVIDER="gemini"
+    KIMI_GM_API_KEY=""
+    KIMI_GM_API_KEY_ENV=""
+    KIMI_GM_FROM_JSON=""
+    KIMI_GM_SAVE_JSON=""
+    KIMI_GM_ALL=0
+    KIMI_GM_STABLE_ONLY=0
+    KIMI_GM_INCLUDE_RE=""
+    KIMI_GM_EXCLUDE_RE=""
+    KIMI_GM_MIN_CONTEXT=0
+    KIMI_GM_SORT="name"
+    KIMI_GM_LIMIT=0
+    KIMI_GM_VERIFY=0
+    KIMI_GM_VERIFY_PRUNE=0
+    KIMI_GM_VERIFY_TIMEOUT=30
+    KIMI_GM_VERIFY_JOBS=6
+    KIMI_GM_TIMEOUT="${KIMO_GEMINI_TIMEOUT:-30}"
+    KIMI_GM_SET_DEFAULT=""
+    KIMI_GM_CONTEXT_WINDOW="${KIMO_KIMI_GEMINI_CONTEXT:-0}"
+    KIMI_GM_MAX_OUTPUT="${KIMO_KIMI_GEMINI_MAX_OUTPUT:-0}"
+    KIMI_GM_DRY_RUN=0
+    KIMI_GM_LIST_ONLY=0
+    KIMI_GM_OUTPUT_JSON=0
+    KIMI_GM_VERBOSE=0
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --config|--base-url|--api-key|--api-key-env|--from-json|--save-json|--include|--exclude|--min-context|--sort|--limit|--verify-timeout|--jobs|--set-default|--context-window|--max-output|--provider)
+                if [[ $# -lt 2 ]]; then
+                    echo "${C_RED}Error: $1 requires a value.${C_RESET}" >&2
+                    return 1
+                fi
+                ;;
+        esac
+        case "$1" in
+            --config) KIMI_GM_CONFIG="$2"; shift 2 ;;
+            --base-url) KIMI_GM_BASE_URL="$2"; shift 2 ;;
+            --api-key) KIMI_GM_API_KEY="$2"; shift 2 ;;
+            --api-key-env) KIMI_GM_API_KEY_ENV="$2"; shift 2 ;;
+            --from-json) KIMI_GM_FROM_JSON="$2"; shift 2 ;;
+            --save-json) KIMI_GM_SAVE_JSON="$2"; shift 2 ;;
+            --all) KIMI_GM_ALL=1; shift ;;
+            --stable-only) KIMI_GM_STABLE_ONLY=1; shift ;;
+            --include) KIMI_GM_INCLUDE_RE="$2"; shift 2 ;;
+            --exclude) KIMI_GM_EXCLUDE_RE="$2"; shift 2 ;;
+            --min-context) KIMI_GM_MIN_CONTEXT="$2"; shift 2 ;;
+            --sort) KIMI_GM_SORT="$2"; shift 2 ;;
+            --limit) KIMI_GM_LIMIT="$2"; shift 2 ;;
+            --verify) KIMI_GM_VERIFY=1; shift ;;
+            --verify-prune) KIMI_GM_VERIFY=1; KIMI_GM_VERIFY_PRUNE=1; shift ;;
+            --verify-timeout) KIMI_GM_VERIFY_TIMEOUT="$2"; shift 2 ;;
+            --jobs) KIMI_GM_VERIFY_JOBS="$2"; shift 2 ;;
+            --set-default) KIMI_GM_SET_DEFAULT="$2"; shift 2 ;;
+            --context-window) KIMI_GM_CONTEXT_WINDOW="$2"; shift 2 ;;
+            --max-output) KIMI_GM_MAX_OUTPUT="$2"; shift 2 ;;
+            --provider) KIMI_GM_PROVIDER="$2"; shift 2 ;;
+            --dry-run) KIMI_GM_DRY_RUN=1; shift ;;
+            --list-only) KIMI_GM_LIST_ONLY=1; shift ;;
+            --output-json) KIMI_GM_OUTPUT_JSON=1; shift ;;
+            --verbose) KIMI_GM_VERBOSE=1; shift ;;
+            -h|--help) _gemini_usage; return 0 ;;
+            *) echo "${C_RED}Error: unknown flag: $1 (try --help)${C_RESET}" >&2; return 1 ;;
+        esac
+    done
+
+    if ! command -v jq >/dev/null 2>&1 || ! command -v curl >/dev/null 2>&1 || ! command -v awk >/dev/null 2>&1; then
+        echo "${C_RED}Error: kimo gemini requires jq, curl and awk.${C_RESET}" >&2
+        return 1
+    fi
+    local num_opt
+    for num_opt in KIMI_GM_MIN_CONTEXT KIMI_GM_LIMIT KIMI_GM_VERIFY_TIMEOUT KIMI_GM_VERIFY_JOBS KIMI_GM_CONTEXT_WINDOW KIMI_GM_MAX_OUTPUT KIMI_GM_TIMEOUT; do
+        if [[ ! "${!num_opt}" =~ ^[0-9]+$ ]]; then
+            echo "${C_RED}Error: ${num_opt#KIMI_GM_} must be a non-negative integer (got '${!num_opt}').${C_RESET}" >&2
+            return 1
+        fi
+    done
+    if [[ ! "${KIMI_GM_PROVIDER}" =~ ^[A-Za-z0-9_-]+$ ]]; then
+        echo "${C_RED}Error: --provider must match [A-Za-z0-9_-]+ (got '${KIMI_GM_PROVIDER}').${C_RESET}" >&2
+        return 1
+    fi
+    if [[ -n "${KIMI_GM_API_KEY_ENV}" && ! "${KIMI_GM_API_KEY_ENV}" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+        echo "${C_RED}Error: --api-key-env must be an environment variable name.${C_RESET}" >&2
+        return 1
+    fi
+    case "${KIMI_GM_SORT}" in
+        name|context|output) ;;
+        *) echo "${C_RED}Error: --sort must be name, context or output.${C_RESET}" >&2; return 1 ;;
+    esac
+    KIMI_GM_ALIAS_PREFIX="${KIMI_GM_PROVIDER}/"
+    KIMI_GM_BASE_URL="${KIMI_GM_BASE_URL%/}"
+    # Accept a base URL pasted with the API version on it.
+    KIMI_GM_BASE_URL="${KIMI_GM_BASE_URL%/v1beta}"
+    KIMI_GM_BASE_URL="${KIMI_GM_BASE_URL%/v1}"
+
+    # A key is needed to fetch and/or probe; --from-json without --verify can
+    # plan/list keyless, and the writer resolves its own key later.
+    local key=""
+    if [[ -z "${KIMI_GM_FROM_JSON}" || "${KIMI_GM_VERIFY}" -eq 1 ]]; then
+        key=$(_gemini_resolve_key) || return 1
+    fi
+
+    local rows selected n total models_file results ok_ids
+    if [[ -z "${KIMI_GM_FROM_JSON}" ]]; then
+        echo "${C_DIM}fetching models from ${KIMI_GM_BASE_URL}/v1beta/models ...${C_RESET}" >&2
+    fi
+    rows=$(_gemini_load_rows "${key}") || return 1
+    total=$(printf '%s' "${rows}" | jq length)
+    selected=$(printf '%s' "${rows}" | _gemini_filter_rows) || return 1
+    n=$(printf '%s' "${selected}" | jq length)
+    if [[ "${n}" -lt 1 ]]; then
+        echo "${C_RED}Error: no chat-capable Gemini models left after filtering (${total} listed).${C_RESET}" >&2
+        return 1
+    fi
+    echo "${C_DIM}selected ${n} of ${total} Gemini models${C_RESET}" >&2
+
+    if [[ "${KIMI_GM_VERBOSE}" -eq 1 ]]; then
+        printf '%s' "${selected}" | jq -r '.[] | "  \(.model)\tctx=\(.input_tokens)\tout=\(.output_tokens)\tthinking=\(.thinking)"' >&2
+    fi
+
+    if [[ "${KIMI_GM_VERIFY}" -eq 1 ]]; then
+        models_file=$(mktemp) || return 1
+        printf '%s' "${selected}" | jq -r '.[].model' > "${models_file}"
+        echo "${C_DIM}probing ${n} models at ${KIMI_GM_BASE_URL} ...${C_RESET}" >&2
+        results=$(_gemini_run_verify "${key}" "${models_file}")
+        rm -f "${models_file}"
+        ok_ids=$(printf '%s\n' "${results}" | awk -F'\t' '$2=="ok"{print $1}')
+        printf '%s\n' "${results}" | awk -F'\t' '{printf "  %-44s %-4s %s\n", $1, $2, $3}' >&2
+        if [[ "${KIMI_GM_VERIFY_PRUNE}" -eq 1 ]]; then
+            selected=$(printf '%s' "${selected}" | jq --arg ok "${ok_ids}" '
+              ($ok | split("\n") | map(select(. != ""))) as $ids
+              | [ .[] | select(.model as $m | $ids | index($m) != null) ]')
+            n=$(printf '%s' "${selected}" | jq length)
+            if [[ "${n}" -lt 1 ]]; then
+                echo "${C_RED}Error: every probed model failed; nothing written.${C_RESET}" >&2
+                return 1
+            fi
+            echo "${C_DIM}after verify-prune: ${n} models${C_RESET}" >&2
+        fi
+    fi
+
+    if [[ "${KIMI_GM_LIST_ONLY}" -eq 1 ]]; then
+        if [[ "${KIMI_GM_OUTPUT_JSON}" -eq 1 || "${OPT_JSON}" == "true" ]]; then
+            printf '%s\n' "${selected}" | jq '.'
+        else
+            printf '%s' "${selected}" | jq -r '.[].model'
+        fi
+        return 0
+    fi
+
+    # Reuse the key already resolved for the fetch, so the writer embeds the
+    # same one (it resolves on its own for keyless --from-json runs).
+    if [[ -n "${key}" && -z "${KIMI_GM_API_KEY}" && -z "${KIMI_GM_API_KEY_ENV}" ]]; then
+        KIMI_GM_API_KEY="${key}"
+    fi
+    printf '%s' "${selected}" | _gemini_write_config
+}
+
+# -----------------------------------------------------------------------------
 # Main Dispatcher
 # -----------------------------------------------------------------------------
 # With several --host values, read-only/aggregate commands query every host;
@@ -7458,7 +8051,7 @@ cmd_freetier() {
 # first --host).
 if [[ "${HOST_MODE}" == "multi" ]]; then
     case "${COMMAND}" in
-        check|ping|hosts|scan|discover|ps|top|list|ls|search|find|stop|unload|info|show|status|health|status-report|report|logs|log|rotate-token|rotate|install|setup|update|upgrade|doctor|diagnose|diag|config|cfg|completion|sync|freetier|free-tier|kimi-sync|quotas|version|help|-h|--help) ;;
+        check|ping|hosts|scan|discover|ps|top|list|ls|search|find|stop|unload|info|show|status|health|status-report|report|logs|log|rotate-token|rotate|install|setup|update|upgrade|doctor|diagnose|diag|config|cfg|completion|sync|freetier|free-tier|kimi-sync|quotas|gemini|gemini-sync|kimi-gemini|version|help|-h|--help) ;;
         *)
             _model="${ARGS[0]:-}"
             if [[ "${COMMAND}" == "launch" ]]; then
@@ -7572,6 +8165,9 @@ case "${COMMAND}" in
         ;;
     freetier|free-tier|kimi-sync|quotas)
         cmd_freetier "${ARGS[@]}"
+        ;;
+    gemini|gemini-sync|kimi-gemini)
+        cmd_gemini "${ARGS[@]}"
         ;;
     version)
         echo "kimo v${KIMO_VERSION}"
