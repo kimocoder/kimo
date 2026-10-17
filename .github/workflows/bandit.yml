@@ -29,18 +29,19 @@ jobs:
 
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Bandit Scan
         uses: shundor/python-bandit-scan@ab1d87dfccc5a0ffab88be3aaac6ffe35c10d6cd
         with: # optional arguments
-          # exit with 0, even with results found
-          exit_zero: true # optional, default is DEFAULT
+          # Fail the job on findings (medium severity and up, see 'level').
+          exit_zero: false
           # Github token of the repository (automatically created by Github)
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} # Needed to get PR information.
-          # File or directory to run bandit on
-          # path: # optional, default is .
-          # Report only issues of a given severity level or higher. Can be LOW, MEDIUM or HIGH. Default is UNDEFINED (everything)
-          # level: # optional, default is UNDEFINED
+          # The shipped Python: lib/. tests/ only talks to loopback fixtures.
+          path: lib
+          # Report only issues of a given severity level or higher. Low-severity
+          # hits are informational (e.g. B105 on "token" field names).
+          level: MEDIUM
           # Report only issues of a given confidence level or higher. Can be LOW, MEDIUM or HIGH. Default is UNDEFINED (everything)
           # confidence: # optional, default is UNDEFINED
           # comma-separated list of paths (glob patterns supported) to exclude from scan (note that these are in addition to the excluded paths provided in the config file) (default: .svn,CVS,.bzr,.hg,.git,__pycache__,.tox,.eggs,*.egg)

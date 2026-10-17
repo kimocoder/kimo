@@ -19,27 +19,13 @@
 # Usage: tests/gemini-smoke.sh
 
 set -euo pipefail
+# shellcheck source=lib/harness.sh
+source "$(dirname "${BASH_SOURCE[0]}")/lib/harness.sh"
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 KIMO="${ROOT_DIR}/kimo"
 
 TMPDIR_A="$(mktemp -d)"
-cleanup() { rm -rf "${TMPDIR_A}"; }
-trap cleanup EXIT
-
-pass=0
-fail=0
-
-check() {
-    local label="$1" expected="$2" actual="$3"
-    if [[ "${actual}" == "${expected}" ]]; then
-        echo "  PASS ${label} (${actual})"
-        pass=$((pass + 1))
-    else
-        echo "  FAIL ${label}: expected '${expected}', got '${actual}'"
-        fail=$((fail + 1))
-    fi
-}
 
 # Synthetic fixture containing varied models
 FIXTURE="${TMPDIR_A}/fixture.json"

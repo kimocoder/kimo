@@ -1,0 +1,9 @@
+# Python bytecode (lib/ helpers and tests run in place)
+__pycache__/
+*.py[co]
+
+# Editor and scratch files (also removed by 'make clean')
+*~
+*.tmp
+*.bak
+*.swp

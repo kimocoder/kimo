@@ -22,6 +22,8 @@
 # Usage: tests/gh-smoke.sh [--live]
 
 set -euo pipefail
+# shellcheck source=lib/harness.sh
+source "$(dirname "${BASH_SOURCE[0]}")/lib/harness.sh"
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 KIMO="${ROOT_DIR}/kimo"
@@ -29,34 +31,6 @@ LIVE=0
 [[ "${1:-}" == "--live" ]] && LIVE=1
 
 TMPDIR_GH="$(mktemp -d)"
-cleanup() { rm -rf "${TMPDIR_GH}"; }
-trap cleanup EXIT
-
-pass=0
-fail=0
-
-ok()   { printf '  \033[32mPASS\033[0m %s\n' "$1"; pass=$((pass + 1)); }
-bad()  { printf '  \033[31mFAIL\033[0m %s\n' "$1"; fail=$((fail + 1)); }
-
-check() { # <description> <expected> <actual>
-    if [[ "$2" == "$3" ]]; then ok "$1 ($3)"; else bad "$1: expected '$2', got '$3'"; fi
-}
-
-check_contains() { # <description> <needle> <haystack>
-    if [[ "$3" == *"$2"* ]]; then
-        ok "$1"
-    else
-        bad "$1: output did not contain '$2'"
-    fi
-}
-
-check_match() { # <description> <regex> <actual>
-    if [[ "$3" =~ $2 ]]; then
-        ok "$1"
-    else
-        bad "$1: output did not match '$2'"
-    fi
-}
 
 echo "=== Kimo GitHub CLI ('gh') Smoke Tests ==="
 
@@ -112,9 +86,11 @@ INSTALL_EXISTS_OUT="$(HOME="${FAKE_HOME}" PATH="${FAKE_HOME}/.local/bin:${PATH}"
 check_contains "install reports already installed when present at dest" "GitHub CLI is already installed" "${INSTALL_EXISTS_OUT}"
 
 # B) When gh is at an external path, refusing to shadow without --allow-system-path
-SHADOW_OUT="$("${KIMO}" install --force gh 2>&1 || true)"
+EMPTY_HOME="${TMPDIR_GH}/empty_home"
+mkdir -p "${EMPTY_HOME}"
+SHADOW_OUT="$(HOME="${EMPTY_HOME}" PATH="${FAKE_BIN_DIR}:/usr/bin:/bin" "${KIMO}" install --force gh 2>&1 || true)"
 SHADOW_RC=0
-"${KIMO}" install --force gh >/dev/null 2>&1 || SHADOW_RC=$?
+HOME="${EMPTY_HOME}" PATH="${FAKE_BIN_DIR}:/usr/bin:/bin" "${KIMO}" install --force gh >/dev/null 2>&1 || SHADOW_RC=$?
 
 check "install --force gh refuses shadowing external binary" "1" "${SHADOW_RC}"
 check_contains "refusing to replace or shadow message" "Error: refusing to replace or shadow GitHub CLI at" "${SHADOW_OUT}"
@@ -147,6 +123,8 @@ echo "mocked smoke: ${pass} passed, ${fail} failed"
 if [[ "${LIVE}" -eq 1 ]]; then
     echo
     echo "[*] live: real GitHub CLI turn"
+    # Live tier: real HOME, PATH, network and credentials (opt-in, not hermetic).
+    harness_use_real_env
     REAL_GH="$(type -P gh 2>/dev/null || true)"
     if [[ -z "${REAL_GH}" ]]; then
         echo "  SKIP: real gh CLI not found on PATH"

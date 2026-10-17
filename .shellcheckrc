@@ -1,0 +1,3 @@
+# Let `shellcheck -x` follow `source "$(dirname ...)/lib/harness.sh"` in tests/.
+source-path=SCRIPTDIR
+external-sources=true

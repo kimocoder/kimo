@@ -12,45 +12,12 @@
 # Usage: tests/check-smoke.sh
 
 set -euo pipefail
+# shellcheck source=lib/harness.sh
+source "$(dirname "${BASH_SOURCE[0]}")/lib/harness.sh"
+export KIMO_NO_AUTOSCAN=1
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 KIMO="${ROOT_DIR}/kimo"
-
-pass=0
-fail=0
-
-check() {
-    local label="$1" expected="$2" actual="$3"
-    if [[ "${actual}" == "${expected}" ]]; then
-        echo "  PASS ${label} (${actual})"
-        pass=$((pass + 1))
-    else
-        echo "  FAIL ${label}: expected '${expected}', got '${actual}'"
-        fail=$((fail + 1))
-    fi
-}
-
-check_match() {
-    local label="$1" regex="$2" actual="$3"
-    if [[ "${actual}" =~ ${regex} ]]; then
-        echo "  PASS ${label}"
-        pass=$((pass + 1))
-    else
-        echo "  FAIL ${label}: '${actual}' did not match '${regex}'"
-        fail=$((fail + 1))
-    fi
-}
-
-check_not_contains() {
-    local label="$1" needle="$2" actual="$3"
-    if [[ "${actual}" != *"${needle}"* ]]; then
-        echo "  PASS ${label}"
-        pass=$((pass + 1))
-    else
-        echo "  FAIL ${label}: '${actual}' unexpectedly contains '${needle}'"
-        fail=$((fail + 1))
-    fi
-}
 
 echo "=== Kimo Check & Ping Smoke Tests ==="
 

@@ -4,8 +4,9 @@
 # Mocked layer (always): a fake 'qwen' on PATH records the argv/env that kimo
 # passes, so we can assert the invocation contract without launching the TUI:
 #   * --openai-base-url <host>/v1, --auth-type openai, --model present
-#   * --openai-api-key is scrubbed to 'ollama' for non-plain-local hosts, and
-#     only forwards a real OPENAI_API_KEY to a plain local loopback daemon
+#   * the key travels only in OPENAI_API_KEY, never argv (readable via ps); it
+#     is scrubbed to 'ollama' for non-plain-local hosts and only forwards a
+#     real OPENAI_API_KEY to a plain local loopback daemon
 #   * QWEN_CODE_API_TIMEOUT_MS is exported (unless the user set one)
 #
 # Live layer (opt-in, --live): if a real 'qwen' and a reachable Ollama host are
@@ -15,6 +16,8 @@
 # Usage: tests/qwen-smoke.sh [--live]
 
 set -euo pipefail
+# shellcheck source=lib/harness.sh
+source "$(dirname "${BASH_SOURCE[0]}")/lib/harness.sh"
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 KIMO="${ROOT_DIR}/kimo"
@@ -22,8 +25,6 @@ LIVE=0
 [[ "${1:-}" == "--live" ]] && LIVE=1
 
 TMPDIR_Q="$(mktemp -d)"
-cleanup() { rm -rf "${TMPDIR_Q}"; }
-trap cleanup EXIT
 
 FAKE_DIR="${TMPDIR_Q}/bin"
 mkdir -p "${FAKE_DIR}"
@@ -44,18 +45,6 @@ out="${QWEN_SMOKE_OUT:?QWEN_SMOKE_OUT unset}"
 exit 0
 FAKE
 chmod +x "${FAKE_DIR}/qwen"
-
-pass=0 fail=0
-ok()   { printf '  \033[32mPASS\033[0m %s\n' "$1"; pass=$((pass + 1)); }
-bad()  { printf '  \033[31mFAIL\033[0m %s\n' "$1"; fail=$((fail + 1)); }
-check() { # <description> <expected> <actual>
-    if [[ "$2" == "$3" ]]; then ok "$1 ($3)"; else bad "$1: expected '$2', got '$3'"; fi
-}
-
-# Extract the value following a flag from the captured argv, or the env value.
-flag_val() { awk -v f="$2" '$0==f{getline; print; exit}' "$1"; }
-has_flag() { awk -v f="$2" '$0==f{found=1} END{exit !found}' "$1"; }
-env_val()  { sed -n "s/^$2=//p" "$1" | head -n1; }
 
 # Run kimo's qwen launcher against a fake CLI and capture what it passed.
 # Host ports are deliberately unassigned (9) so no real Ollama is contacted and
@@ -90,18 +79,18 @@ fi
 
 echo "[*] mocked: api-key scrub"
 run_launch --host "${LOCAL_HOST}"
-check "plain local host forwards the real key" "${SENTINEL}" "$(flag_val "${CAPTURE}" --openai-api-key)"
 check "plain local host env keeps the real key" "${SENTINEL}" "$(env_val "${CAPTURE}" OPENAI_API_KEY)"
+check "the key is never passed as --openai-api-key" "no" "$(has_flag "${CAPTURE}" --openai-api-key && echo yes || echo no)"
+check "the real key appears nowhere in argv" "0" "$(sed -n '/^ARGV$/,/^ENV$/p' "${CAPTURE}" | grep -c -- "${SENTINEL}" || true)"
 
 ( export OLLAMA_REMOTE_URL="${REMOTE_HOST}"; run_launch --remote )
-check "remote host scrubs --openai-api-key to ollama" "ollama" "$(flag_val "${CAPTURE}" --openai-api-key)"
 check "remote host scrubs env OPENAI_API_KEY to ollama" "ollama" "$(env_val "${CAPTURE}" OPENAI_API_KEY)"
 
 run_launch --host "${REMOTE_HOST}"
-check "LAN host scrubs --openai-api-key to ollama" "ollama" "$(flag_val "${CAPTURE}" --openai-api-key)"
+check "LAN host scrubs env OPENAI_API_KEY to ollama" "ollama" "$(env_val "${CAPTURE}" OPENAI_API_KEY)"
 
 run_launch --host "${TUNNEL_HOST}"
-check "ssh -L tunnel host scrubs --openai-api-key to ollama" "ollama" "$(flag_val "${CAPTURE}" --openai-api-key)"
+check "ssh -L tunnel host scrubs env OPENAI_API_KEY to ollama" "ollama" "$(env_val "${CAPTURE}" OPENAI_API_KEY)"
 
 echo "[*] mocked: request timeout default"
 run_launch --host "${LOCAL_HOST}"
@@ -109,6 +98,21 @@ check "QWEN_CODE_API_TIMEOUT_MS default" "600000" "$(env_val "${CAPTURE}" QWEN_C
 
 QWEN_CODE_API_TIMEOUT_MS=123456 run_launch --host "${LOCAL_HOST}"
 check "existing QWEN_CODE_API_TIMEOUT_MS is honoured" "123456" "$(env_val "${CAPTURE}" QWEN_CODE_API_TIMEOUT_MS)"
+
+echo "[*] mocked: -m short model flag handling (no duplicate model args)"
+run_launch_args() {
+    rm -f "${CAPTURE}"
+    PATH="${FAKE_DIR}:${PATH}" "${KIMO}" "$@" >/dev/null 2>&1 || true
+}
+run_launch_args --host "${LOCAL_HOST}" launch qwen -m kalidroid-27b:latest
+check "-m sets --model on target CLI" "kalidroid-27b:latest" "$(flag_val "${CAPTURE}" --model)"
+MODEL_COUNT="$(grep -c '^--model$' "${CAPTURE}" || true)"
+check "--model appears exactly once" "1" "${MODEL_COUNT}"
+HAS_LEAKED_M="$(grep -c '^-m$' "${CAPTURE}" || true)"
+check "-m does not leak into passthrough args" "0" "${HAS_LEAKED_M}"
+
+run_launch_args --host "${LOCAL_HOST}" launch qwen -m=custom-model:latest
+check "-m=value sets --model on target CLI" "custom-model:latest" "$(flag_val "${CAPTURE}" --model)"
 
 echo
 echo "mocked smoke: ${pass} passed, ${fail} failed"
@@ -119,6 +123,8 @@ echo "mocked smoke: ${pass} passed, ${fail} failed"
 if [[ "${LIVE}" -eq 1 ]]; then
     echo
     echo "[*] live: headless -p turn"
+    # Live tier: real HOME, PATH, network and credentials (opt-in, not hermetic).
+    harness_use_real_env
     real_qwen="$(PATH="${PATH}" command -v qwen || true)"
     host="${KIMO_SMOKE_HOST:-http://127.0.0.1:11434}"
     model="${KIMO_SMOKE_MODEL:-kalidroid-27b:latest}"

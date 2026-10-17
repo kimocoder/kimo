@@ -12,38 +12,13 @@
 # Usage: tests/scan-smoke.sh
 
 set -euo pipefail
+# shellcheck source=lib/harness.sh
+source "$(dirname "${BASH_SOURCE[0]}")/lib/harness.sh"
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 KIMO="${ROOT_DIR}/kimo"
 
 TMPDIR_A="$(mktemp -d)"
-cleanup() { rm -rf "${TMPDIR_A}"; }
-trap cleanup EXIT
-
-pass=0
-fail=0
-
-check() {
-    local label="$1" expected="$2" actual="$3"
-    if [[ "${actual}" == "${expected}" ]]; then
-        echo "  PASS ${label} (${actual})"
-        pass=$((pass + 1))
-    else
-        echo "  FAIL ${label}: expected '${expected}', got '${actual}'"
-        fail=$((fail + 1))
-    fi
-}
-
-check_match() {
-    local label="$1" regex="$2" actual="$3"
-    if [[ "${actual}" =~ ${regex} ]]; then
-        echo "  PASS ${label}"
-        pass=$((pass + 1))
-    else
-        echo "  FAIL ${label}: '${actual}' did not match '${regex}'"
-        fail=$((fail + 1))
-    fi
-}
 
 echo "=== Kimo Scan & Init Discovery Smoke Tests ==="
 
@@ -59,7 +34,8 @@ check_match "init help mentions discovery wizard" "(discovery wizard)" "${INIT_H
 
 # 2. JSON structured scan
 echo "[2] Structured JSON scan output"
-SCAN_JSON="$("${KIMO}" scan 127.0.0.1 -p 11434 --json)"
+harness_fake_ollama
+SCAN_JSON="$("${KIMO}" scan 127.0.0.1 -p "${FAKE_OLLAMA_PORT}" --json)"
 JSON_VALID=$(python3 -c '
 import json, sys
 data = json.loads(sys.argv[1])
@@ -70,6 +46,7 @@ assert "models" in data[0]
 print("valid")
 ' "${SCAN_JSON}" 2>/dev/null || echo "invalid")
 check "JSON payload is valid and structured" "valid" "${JSON_VALID}"
+check_contains "scan found the fixture daemon's model" "fixture-model:latest" "${SCAN_JSON}"
 
 # 3. --set-remote configuration update
 echo "[3] Config persistence via --set-remote"
@@ -83,15 +60,15 @@ check "--set-remote persists to config" "http://192.168.1.200:11434" "${SAVED_RE
 echo "[4] Interactive candidate menu selection"
 CFG_INTERACTIVE="${TMPDIR_A}/kimo_config_interactive"
 touch "${CFG_INTERACTIVE}"
-echo "1" | KIMO_CONFIG_FILE="${CFG_INTERACTIVE}" "${KIMO}" scan 127.0.0.1 -p 11434 -i >/dev/null
+echo "1" | KIMO_CONFIG_FILE="${CFG_INTERACTIVE}" "${KIMO}" scan 127.0.0.1 -p "${FAKE_OLLAMA_PORT}" -i >/dev/null
 INTERACTIVE_SAVED=$(grep -E "^remote_url=" "${CFG_INTERACTIVE}" 2>/dev/null | cut -d= -f2- || true)
-check "interactive selection 1 sets remote_url" "http://127.0.0.1:11434" "${INTERACTIVE_SAVED}"
+check "interactive selection 1 sets remote_url" "${FAKE_OLLAMA_URL}" "${INTERACTIVE_SAVED}"
 
 # 5. Interactive cancel
 echo "[5] Interactive menu cancellation"
 CFG_CANCEL="${TMPDIR_A}/kimo_config_cancel"
 echo "remote_url=http://orig.local:11434" > "${CFG_CANCEL}"
-echo "q" | KIMO_CONFIG_FILE="${CFG_CANCEL}" "${KIMO}" scan 127.0.0.1 -p 11434 -i >/dev/null
+echo "q" | KIMO_CONFIG_FILE="${CFG_CANCEL}" "${KIMO}" scan 127.0.0.1 -p "${FAKE_OLLAMA_PORT}" -i >/dev/null
 CANCEL_VAL=$(grep -E "^remote_url=" "${CFG_CANCEL}" 2>/dev/null | cut -d= -f2- || true)
 check "interactive 'q' leaves remote_url unchanged" "http://orig.local:11434" "${CANCEL_VAL}"
 
@@ -108,9 +85,10 @@ import pty, os, subprocess
 master, slave = pty.openpty()
 env = dict(os.environ, 
     KIMO_CONFIG_FILE="'"${TMPDIR_A}/empty_cfg"'",
+    KIMO_NO_AUTOSCAN="0",
     REMOTE_HOST_IP="192.0.2.1",
     OLLAMA_REMOTE_URL="http://192.0.2.1:11434",
-    OLLAMA_LOCAL_URL="http://127.0.0.1:11434"
+    OLLAMA_LOCAL_URL="http://127.0.0.1:1"
 )
 with open("'"${TMPDIR_A}/empty_cfg"'", "w") as f:
     f.write("# empty\n")

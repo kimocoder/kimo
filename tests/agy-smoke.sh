@@ -22,6 +22,8 @@
 # Usage: tests/agy-smoke.sh [--live]
 
 set -euo pipefail
+# shellcheck source=lib/harness.sh
+source "$(dirname "${BASH_SOURCE[0]}")/lib/harness.sh"
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 KIMO="${ROOT_DIR}/kimo"
@@ -29,8 +31,6 @@ LIVE=0
 [[ "${1:-}" == "--live" ]] && LIVE=1
 
 TMPDIR_A="$(mktemp -d)"
-cleanup() { rm -rf "${TMPDIR_A}"; }
-trap cleanup EXIT
 
 FAKE_DIR="${TMPDIR_A}/bin"
 mkdir -p "${FAKE_DIR}"
@@ -62,16 +62,6 @@ code=""
 exit 0
 FAKE
 chmod +x "${FAKE_DIR}/agy"
-
-pass=0 fail=0
-ok()   { printf '  \033[32mPASS\033[0m %s\n' "$1"; pass=$((pass + 1)); }
-bad()  { printf '  \033[31mFAIL\033[0m %s\n' "$1"; fail=$((fail + 1)); }
-check() { # <description> <expected> <actual>
-    if [[ "$2" == "$3" ]]; then ok "$1 ($3)"; else bad "$1: expected '$2', got '$3'"; fi
-}
-has_flag() { awk -v f="$2" '$0==f{found=1} END{exit !found}' "$1"; }
-flag_val() { awk -v f="$2" '$0==f{getline; print; exit}' "$1"; }
-env_val()  { sed -n "s/^$2=//p" "$1" | head -n1; }
 
 # Unreachable upstream (port 9) so no real Ollama is contacted; the shim only
 # connects upstream when a request is actually proxied.
@@ -140,6 +130,8 @@ echo "mocked smoke: ${pass} passed, ${fail} failed"
 if [[ "${LIVE}" -eq 1 ]]; then
     echo
     echo "[*] live: headless -p turn through kimo"
+    # Live tier: real HOME, PATH, network and credentials (opt-in, not hermetic).
+    harness_use_real_env
     if ! command -v agy >/dev/null 2>&1; then
         echo "  SKIP agy CLI not found"
     else

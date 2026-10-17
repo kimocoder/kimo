@@ -20,6 +20,8 @@
 # Usage: tests/claude-smoke.sh [--live]
 
 set -euo pipefail
+# shellcheck source=lib/harness.sh
+source "$(dirname "${BASH_SOURCE[0]}")/lib/harness.sh"
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 KIMO="${ROOT_DIR}/kimo"
@@ -27,8 +29,6 @@ LIVE=0
 [[ "${1:-}" == "--live" ]] && LIVE=1
 
 TMPDIR_C="$(mktemp -d)"
-cleanup() { rm -rf "${TMPDIR_C}"; }
-trap cleanup EXIT
 
 FAKE_DIR="${TMPDIR_C}/bin"
 mkdir -p "${FAKE_DIR}"
@@ -60,17 +60,6 @@ out="${CLAUDE_SMOKE_OUT:?CLAUDE_SMOKE_OUT unset}"
 exit 0
 FAKE
 chmod +x "${FAKE_DIR}/claude"
-
-pass=0 fail=0
-ok()   { printf '  \033[32mPASS\033[0m %s\n' "$1"; pass=$((pass + 1)); }
-bad()  { printf '  \033[31mFAIL\033[0m %s\n' "$1"; fail=$((fail + 1)); }
-check() { # <description> <expected> <actual>
-    if [[ "$2" == "$3" ]]; then ok "$1 ($3)"; else bad "$1: expected '$2', got '$3'"; fi
-}
-
-flag_val() { awk -v f="$2" '$0==f{getline; print; exit}' "$1"; }
-has_flag() { awk -v f="$2" '$0==f{found=1} END{exit !found}' "$1"; }
-env_val()  { sed -n "s/^$2=//p" "$1" | head -n1; }
 
 # Host ports are deliberately unassigned (9) so no real Ollama is contacted and
 # no live model gets unloaded as a launch side effect.
@@ -166,6 +155,8 @@ echo "mocked smoke: ${pass} passed, ${fail} failed"
 if [[ "${LIVE}" -eq 1 ]]; then
     echo
     echo "[*] live: headless -p turn"
+    # Live tier: real HOME, PATH, network and credentials (opt-in, not hermetic).
+    harness_use_real_env
     real_claude="$(PATH="${PATH}" command -v claude || true)"
     host="${KIMO_SMOKE_HOST:-http://127.0.0.1:11434}"
     model="${KIMO_SMOKE_MODEL:-kalidroid-27b:latest}"

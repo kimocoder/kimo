@@ -21,6 +21,8 @@
 # Usage: tests/opencode-smoke.sh [--live]
 
 set -euo pipefail
+# shellcheck source=lib/harness.sh
+source "$(dirname "${BASH_SOURCE[0]}")/lib/harness.sh"
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 KIMO="${ROOT_DIR}/kimo"
@@ -28,13 +30,10 @@ LIVE=0
 [[ "${1:-}" == "--live" ]] && LIVE=1
 
 TMPDIR_A="$(mktemp -d)"
-cleanup() { rm -rf "${TMPDIR_A}"; }
-trap cleanup EXIT
 
 FAKE_DIR="${TMPDIR_A}/bin"
 mkdir -p "${FAKE_DIR}"
 CAPTURE="${TMPDIR_A}/call.txt"
-ORIG_PATH="${PATH}"
 export OPENCODE_SMOKE_OUT="${CAPTURE}"
 
 cat > "${FAKE_DIR}/opencode" <<'FAKE'
@@ -58,16 +57,6 @@ FAKE
 chmod +x "${FAKE_DIR}/opencode"
 # Fake stays on PATH for the whole mocked tier; restored before the live tier.
 export PATH="${FAKE_DIR}:${PATH}"
-
-pass=0 fail=0
-ok()   { printf '  \033[32mPASS\033[0m %s\n' "$1"; pass=$((pass + 1)); }
-bad()  { printf '  \033[31mFAIL\033[0m %s\n' "$1"; fail=$((fail + 1)); }
-check() { # <description> <expected> <actual>
-    if [[ "$2" == "$3" ]]; then ok "$1 ($3)"; else bad "$1: expected '$2', got '$3'"; fi
-}
-has_flag() { awk -v f="$2" '$0==f{found=1} END{exit !found}' "$1"; }
-flag_val() { awk -v f="$2" '$0==f{getline; print; exit}' "$1"; }
-env_val()  { sed -n "s/^$2=//p" "$1" | head -n1; }
 
 # Unreachable upstream (port 9) so no real Ollama is contacted.
 UPSTREAM="http://192.168.1.131:9"
@@ -127,8 +116,8 @@ echo "mocked smoke: ${pass} passed, ${fail} failed"
 if [[ "${LIVE}" -eq 1 ]]; then
     echo
     echo "[*] live: headless run turn through kimo"
-    # Drop the fake so kimo execs the real opencode.
-    PATH="${ORIG_PATH}"
+    # Live tier: real HOME, PATH, network and credentials (opt-in, not hermetic).
+    harness_use_real_env
     if ! command -v opencode >/dev/null 2>&1; then
         echo "  SKIP opencode CLI not found"
     else

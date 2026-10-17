@@ -27,6 +27,7 @@
   - **Google Antigravity CLI** (`agy`)
   - **Cyberstrike AI Pentesting CLI** (`cyberstrike`)
   - **Hermes / OpenClaw**
+- **Hosted Cloud Provider**: `launch --provider abliteration` routes `claude` and `kimi` at the [abliteration.ai](https://docs.abliteration.ai) Anthropic-/OpenAI-compatible API instead of a self-hosted Ollama daemon — no host probing, no model eviction, and the API key stays in the environment only.
 
 ---
 
@@ -74,6 +75,20 @@ make check
 | `make test-grok` | Headless smoke test of the `grok` launch branch: asserts the argv/env kimo passes (`--model`, `GROK_MODELS_BASE_URL` host routing, forced `XAI_API_KEY` scrub for all hosts, exit-code propagation) and the `--ctx` config.toml `context_window` patch/revert lifecycle. Add `LIVE=1` for an opt-in live `-p` turn against a reachable Ollama host (`KIMO_SMOKE_HOST`/`KIMO_SMOKE_MODEL` override) |
 | `make test-thinking-tools` | Checks the thinking/tools capability handling: `_kimi_model_spec` unit checks (capability mapping `thinking`/`tools`/`vision` → `thinking`/`tool_use`/`image_in`, probe-failure fallback to `tool_use`, override precedence, ctx precedence flag > runtime > architecture) plus launch-branch integration (kimi env channel exports thinking vars only for thinking models, scrubs stale inherited effort on non-thinking models, honours `KIMO_KIMI_EFFORT`/`KIMO_KIMI_REASONING_KEY`/`KIMO_KIMI_CAPABILITIES`) |
 | `make test-gemini` | Headless smoke test of `kimo gemini` model sync into Kimi Code: asserts `/v1beta/models` parsing, non-chat filtering, `--stable-only`/`--all` flags, token limits mapping, thinking capability, valid TOML generation, idempotency, and backup creation |
+| `make test-abliteration` | Headless smoke test of the abliteration.ai cloud provider (`launch --provider abliteration`): base-URL routing for both API surfaces, the forwarded key never reaching argv or console, Claude's `[1m]` context suffix and tier overrides, kimi's zero-footprint env channel, per-model capabilities/effort ceilings, provider precedence (flag > env > config), and the absence of any Ollama probing |
+| `make test-quota` | Headless smoke test of unified quota & usage dashboard (`kimo quota`) |
+| `make test-tunnel` | Headless smoke test of remote Ollama SSH tunnel management (`kimo tunnel`) |
+| `make test-config-validate` | Headless smoke test of persistent configuration validation (`kimo config validate`) |
+| `make test-rotate-token` | Headless smoke test of public API token rotation (`kimo rotate-token`) |
+| `make test-jq-guard` | Headless smoke test of jq prerequisite guarding across CLI commands |
+| `make test-pull-json` | Headless smoke test of streaming JSON output on model pulls (`kimo pull --json`) |
+| `make test-backup-prune` | Headless smoke test of automatic backup rotation and pruning |
+| `make test-web-url-esc` | Headless smoke test of WebBridge URL escaping and payload generation |
+| `make test-gh-guard` | Headless smoke test of GitHub CLI (`gh`) management-only guard |
+| `make test-launch-contract` | Launch contract for every CLI: credential scrub for non-local hosts, child-flag passthrough and `--`, opt-in `--evict` |
+| `make test-sync` | Blob-level `sync` between two fake daemons (upload, create, weight verification, `--force`), plus the digest-verified registry fallback |
+| `make test-shim` | Gemini shim contract: `model:tag` paths, JSON-array/SSE streaming, mid-stream errors, tools, images, `countTokens`, request validation |
+| `make test-install-packages` | Installers request only official npm/PyPI packages and never fall back to look-alike names |
 | `make clean` | Removes temporary and backup files (`*~`, `*.tmp`, `*.bak`) |
 | `make help` | Displays list of available make targets and options |
 
@@ -122,7 +137,7 @@ kimo [options] <command> [arguments...]
 | `bench [model]` | Benchmark TTFT, generation throughput (tok/s), and memory | `kimo bench kalidroid-27b -n 30` |
 | `sync <model>` | Replicate and synchronize models across cluster hosts | `kimo sync kalidroid-27b --to local` |
 | `tag <src> <dst>` | Create model tag/alias on target host | `kimo tag model:33b model:latest` |
-| `rm <model>` | Delete a model from target Ollama server | `kimo rm old-model` |
+| `rm <model>... [-y]` | Delete one or more models (exact names; all are checked before any is deleted; asks first, `--yes` to skip) | `kimo rm old-a old-b` |
 | `stream <model>` | Pin model for durable availability via keepalive daemon | `kimo stream model --status` |
 | `run <model> [args]`| Run model directly with auto-routing to remote GPU | `kimo run kalidroid-27b` |
 | `launch <cli> [opts]`| Launch external CLI with automatic Ollama routing | `kimo launch grok --model 27b` |
@@ -131,8 +146,56 @@ kimo [options] <command> [arguments...]
 | `completion [sh]`    | Generate shell tab-completion script for Bash or Zsh | `kimo completion bash` |
 | `freetier [opts]`    | Sync Kimi config with Model Studio free-tier quotas (`bl usage free`) | `kimo freetier --verify-prune` |
 | `gemini [opts]`      | Register Gemini API models (with exact token limits) into Kimi Code | `kimo gemini --verify-prune` |
+| `quota [cli] [opts]` | Check provider usage and every supported CLI account | `kimo quota codex --json` |
 
 ---
+
+## Quota and Usage (`quota`)
+
+`kimo quota` shows the existing Ollama, Gemini, Bailian, OpenRouter, and WebBridge checks alongside every supported CLI. `quotas` and `quote` are aliases. Python 3.11 or newer supports all adapters, including Kimi's TOML configuration; only the standard library is used.
+
+```bash
+kimo quota                         # Providers and all CLI accounts
+kimo quota --cli all                # Installed CLI accounts with readable quotas only
+kimo quota --cli all --show-all     # Also list CLIs that are missing or report no quota
+kimo quota codex                    # One CLI
+kimo quotas grok                    # Grok subscription credits and billing balances
+kimo quotas kimi                    # Kimi Code windows and extra-usage wallet
+kimo quotas kimi --no-refresh       # Use cached credentials without OAuth refresh
+kimo quota claude --json            # Structured account windows and reset times
+kimo quota claude --no-refresh      # Read Claude usage without rotating OAuth credentials
+kimo quota --provider openrouter    # Existing provider filter
+kimo quota --offline --json         # Installation checks without network or CLI execution
+kimo quota --timeout 10             # Timeout budget per source (default 5s, maximum 60s)
+kimo --host localhost:11434 quota --provider ollama
+```
+
+| CLI | Available quota check | Requirements and limits |
+| --- | --- | --- |
+| `codex` | Native `account/rateLimits/read` through app-server | Existing ChatGPT login; API-key accounts may not expose subscription windows. [Protocol](https://developers.openai.com/codex/app-server/) |
+| `claude` | 5-hour, weekly/model-specific windows, reset times, plan, and extra-usage spending | Cached `.claude/.credentials.json`, `CLAUDE_CONFIG_DIR` / `CLAUDE_SECURESTORAGE_CONFIG_DIR`, or `CLAUDE_CODE_OAUTH_TOKEN`. Expiring cached logins refresh safely; usage requires the `user:profile` OAuth scope. API-key budgets are separate, and the private usage endpoint may change. [Authentication](https://code.claude.com/docs/en/authentication) |
+| `kimi` | 5-hour, 7-day, monthly total/code windows, reset times, and extra-usage wallet/spending | Uses the configured global/mainland/custom API and scoped OAuth credentials, or `KIMI_CODE_API_KEY`. Refreshes expiring OAuth tokens safely. Only windows supplied by the account are shown; Moonshot API budgets are separate. [Official client](https://github.com/MoonshotAI/kimi-code) |
+| `openclaw` | Native `status --usage --json` provider windows | Existing provider authentication. [Usage tracking](https://docs.openclaw.ai/concepts/usage-tracking) |
+| `agy` | Google Code Assist per-model quota buckets | Cached Antigravity OAuth token; discovers the existing quota project or uses `GOOGLE_CLOUD_PROJECT` / `GOOGLE_CLOUD_PROJECT_ID`. These are Code Assist buckets, not a complete Antigravity subscription budget. |
+| `cursor` | Team on-demand spend against enforced spending limits | Optional `CURSOR_ADMIN_API_KEY`; personal-plan usage remains in the dashboard. [Admin API](https://cursor.com/docs/account/teams/admin-api) |
+| `qwen` | Bailian free-tier balances or configured OpenRouter budget | Qwen settings or provider environment; Bailian requires `bl` console login. Qwen OAuth daily remaining quota has no supported headless readout. |
+| `opencode` | Selected provider's OpenRouter budget or configured Ollama status | Reads local JSON/JSONC config and environment references; remote organization and managed overrides are not evaluated. |
+| `hermes` | Configured OpenRouter budget, Ollama status, or local session usage | Provider environment / `.hermes/.env`; optionally set `HERMES_USAGE_FILE` to an existing `--usage-file` report. Local estimates are labelled separately. |
+| `grok` | Native subscription credits, billing period, on-demand cap/spend, prepaid balance, plan, and billing history | Existing `grok login`; probes `_x.ai/billing` via `grok agent stdio`. Uses the native client's authentication/refresh. Older clients without billing support can fall back to a configured OpenRouter/Ollama backend. [Official billing protocol](https://github.com/xai-org/grok-build/blob/main/crates/codegen/xai-grok-shell/src/extensions/billing.rs) |
+| `cyberstrike` | Configured OpenRouter budget or Ollama status | Provider environment; otherwise guidance for checking the configured provider. |
+| `gh` | Native GitHub API rate-limit resources | Existing `gh` authentication; these limits do not represent Copilot premium requests. |
+
+Every CLI remains visible even when it is missing, offline, unauthenticated, or cannot expose quota. Unsupported account checks return `unavailable` with instructions, rather than an invented balance. Ollama is marked `not_metered`; Gemini model token limits are labelled as context limits, with account quota unavailable. `--model` filters model-specific data while retaining account-wide windows.
+
+JSON preserves the top-level `timestamp` and `providers` fields and adds `clis`. CLI entries include `installed`, `status`, `source`, `scope`, and `windows`; each window carries remaining/used amounts, percentages, units, and reset times when the source supplies them. Unknown values are `null`; exhausted balances remain zero. Account failures are isolated so other checks still complete, and dashboard exit status indicates command validity rather than whether every account was reachable.
+
+Grok's JSON also includes `plan`, `billing`, and `history`; legacy monetary credit limits are supported when percentage usage is absent. Kimi adds `auth` (credential kind, refresh status, and region), `endpoint`, and `extra_usage`. Wallet fixed-point amounts are converted to currency; a disabled monthly spending cap does not imply a remaining allowance. Modern Kimi windows take precedence over duplicate legacy limits.
+
+Claude includes `plan`, `rate_limit_tier`, `auth`, and `extra_usage`, preferring modern scoped `limits` over duplicate legacy windows. Extra-usage minor currency units are converted for display; disabled or unlimited spending limits do not invent a remaining allowance. Explicit `CLAUDE_CODE_OAUTH_TOKEN` values stay selected and are never replaced by another cached account.
+
+Checks use existing authentication and never run a model turn. Expiring Claude/Kimi OAuth tokens, or a token rejected with HTTP 401, can be refreshed once and atomically saved with private permissions under the native client's refresh lock. Claude refresh also uses the native secure-storage write lock and preserves unrelated MCP credentials. `--no-refresh` disables these cached-token refreshes; native Grok/Codex commands use their own authentication handling. Account configuration is not edited. Credentials stay out of command arguments and output, and redirects are refused for direct API requests. `--offline` also skips credential-file reads. `KIMO_QUOTA_HOME` redirects adapter account-file discovery for isolated checks; `KIMI_CODE_HOME`, `KIMI_CONFIG`, `KIMI_CODE_BASE_URL`, `KIMI_CODE_OAUTH_HOST` / `KIMI_OAUTH_HOST`, and `GROK_HOME` follow their clients' account settings. Endpoint overrides select a matching Kimi credential slot rather than sending another region's token. `KIMO_QUOTA_HELPER` overrides the helper path for custom asset installations. `make install` installs the helper alongside the Gemini shim, and development symlinks locate it in the source checkout.
+
+Run `make test-quota` for isolated dispatcher, account-adapter, and native protocol regression tests. Fixtures use temporary credentials and do not contact provider accounts.
 
 ## Health & Environment Diagnostics (`doctor`)
 
@@ -213,13 +276,17 @@ kimo config path
 | `default_model` | Fallback model name for agent CLI launches | `kalidroid-27b:latest` |
 | `remote_url` | Endpoint URL for the remote Ollama GPU host | `http://127.0.0.1:11438` |
 | `local_url` | Endpoint URL for the local Ollama daemon | `http://127.0.0.1:11434` |
+| `remote_host` | Remote host name or IP (no scheme/port) used for direct LAN probes | derived from `remote_url` or the SSH tunnel |
 | `kimi_effort` | Default thinking effort for Kimi (`low`, `medium`, `high`, `xhigh`, `max`) | `default` |
 | `kimi_context` | Default context window length in tokens for Kimi Code CLI | `auto` (model architecture/runtime) |
-| `no_color` | Disable ANSI terminal color codes (`true`/`false`) | `false` |
+| `no_color` | Disable ANSI terminal color codes (`true`/`false`, `yes`/`no`, `1`/`0`); any non-empty `NO_COLOR` env var also disables color | `false` |
 | `webbridge_url` | Endpoint URL for the Kimi WebBridge browser relay | `http://127.0.0.1:10086/command` |
 | `webbridge_port` | Listening port for the Kimi WebBridge daemon | `10086` |
 | `web_engine` | Search engine used for web research (`duckduckgo`, `bing`, `google`) | `duckduckgo` |
-| `web_max_results` | Maximum link count extracted by web research helper snippets | `10` |
+| `web_max_results` | Maximum link count extracted by web research helper snippets (1-999) | `10` |
+| `cloud_provider` | Inference backend for `launch`: `ollama` (self-hosted) or `abliteration` (hosted API) | `ollama` |
+
+Precedence is environment variable > config file > built-in default. `config set` and `config validate` apply the same per-key rules as the loader (values may not contain newlines or other control characters); an invalid value in the file is ignored with a warning instead of being applied.
 
 ---
 
@@ -425,7 +492,8 @@ kimo sync llama3:latest --force
 Features:
 - Automatic presence and digest comparison (`/api/tags`) before initiating transfer.
 - Smart directional resolution: auto-detects which host has the model and replicates to the other.
-- Integrated streaming pull progress on the destination host.
+- **True copies from a source on this machine**: Ollama's API can receive blobs but cannot serve them, so kimo reads the source model from a local model store (the manifest whose sha256 matches the digest the source daemon reports), uploads its weight/adapter/projector blobs to the destination (`POST /api/blobs`), recreates the model with its template, system prompt and parameters (`/api/create`), and verifies that the destination model references the same weights. Re-running reports identical weights instead of re-copying. Stores searched: `$KIMO_OLLAMA_MODELS` (colon-separated; exclusive when set), `$OLLAMA_MODELS`, `~/.ollama/models`, `/usr/share/ollama/.ollama/models`, `/var/lib/ollama/.ollama/models`.
+- **Remote sources fall back to a registry pull on the destination**, which only succeeds if the resulting digest matches the source. A model that exists only on the remote host, or a registry build that differs from it, fails with an explanation instead of a false success. For an exact copy in that direction, run `kimo sync` on the source host.
 - Conflict detection with actionable `--force` guidance when digests differ.
 
 ---
@@ -569,19 +637,69 @@ kimo launch cyberstrike --model kalidroid-27b:latest
 
 # Launch Cursor CLI routed to Ollama models
 kimo launch cursor --model kalidroid-27b:latest
+
+# Pass flags straight to the CLI: after 'launch <cli>', -v/--version,
+# -h/--help and --json belong to the CLI; everything after '--' is passed
+# verbatim, even flags kimo itself knows (-m, --ctx, --evict)
+kimo launch claude --model kalidroid-27b:latest -p "hi" -v
+kimo launch qwen -- --version
+
+# Free VRAM first by unloading the other models on the target host
+kimo --remote launch claude --model nemotron3:33b --evict
 ```
+
+Every launch applies the same credential rule: real `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN` / `CURSOR_API_KEY` values reach only a plain local daemon, and any remote, LAN or tunnel host gets the `ollama` placeholder.
+
+Other models already loaded on the target host are **not** unloaded unless you ask, because they may belong to other users or sessions sharing the GPU. On a terminal, kimo asks first (default: no). Non-interactive runs leave them loaded unless you pass `--evict` or set `KIMO_LAUNCH_EVICT=always`. Use `--no-evict` or `KIMO_LAUNCH_EVICT=never` to skip the question.
+
+### Cloud Provider: abliteration.ai
+
+`--provider abliteration` routes a launch at the hosted [abliteration.ai](https://docs.abliteration.ai) API instead of a self-hosted Ollama daemon. It is currently wired for **`claude`** and **`kimi`**; every other CLI stays on Ollama routing and errors out if you ask it to use the provider.
+
+```bash
+export ABLITERATION_API_KEY="ak_..."          # from https://abliteration.ai/console
+
+kimo launch kimi --provider abliteration                          # default: abliterated-model-large-v2
+kimo launch claude --provider abliteration --model base           # the image-capable model
+kimo launch claude --provider abliteration --dry-run              # inspect routing; the key stays masked
+
+kimo config set cloud_provider abliteration                       # make it the default backend
+kimo launch kimi                                                  # ...and launch with no flag at all
+kimo launch claude --provider ollama                              # per-launch override back to Ollama
+```
+
+| Model | Context | Input | Notes |
+|---|---|---|---|
+| `abliterated-model-large-v2` | 1,000,000 | text only | default; reasoning up to `max` |
+| `abliterated-model-large` | 1,000,000 | text only | previous large; reasoning up to `max` |
+| `abliterated-model` | 262,144 | text + images | the only model that accepts images; reasoning up to `xhigh` |
+
+The short aliases `large-v2`, `large` and `base` resolve to those ids, and a Claude-style context suffix (`abliterated-model-large-v2[1m]`) is accepted and stripped. The two large models answer an image request with a `400`, so send screenshots and diagrams to `base`.
+
+What changes versus Ollama routing:
+
+- **No daemon interaction.** There is no host probing, no `/api/tags` resolution, no `/api/show` capability detection, no VRAM eviction and no `tune` registry — the model table above supplies the context window and capabilities instead.
+- **The credential rule is inverted, deliberately.** `api.abliteration.ai` is the provider you selected, so the real key is forwarded rather than scrubbed. The scrub still applies to every Ollama host. The key is read from the environment only (`ABLITERATION_API_KEY`, or `ABLIT_KEY` as abliteration.ai's own opencode docs spell it): kimo never writes it to a config file and never passes it in argv, and `--dry-run` masks it.
+- **`claude`** gets `ANTHROPIC_BASE_URL` plus bearer auth via `ANTHROPIC_AUTH_TOKEN`, with `ANTHROPIC_API_KEY` left unset so exactly one credential rides the request and Claude Code does not prompt about a "custom API key". The model id carries the `[1m]` suffix where the window is 1M — Claude Code assumes 200K for an unrecognized third-party id otherwise, and strips the suffix before the request. `CLAUDE_CODE_MAX_CONTEXT_TOKENS` and the `ANTHROPIC_DEFAULT_{OPUS,SONNET,HAIKU}_MODEL` tiers all point at the same model, so background and summarization calls cannot fall back to real Anthropic ids this key cannot serve.
+- **`kimi`** uses the zero-footprint `KIMI_MODEL_*` env channel rather than the config-alias path used for Ollama, because an alias would have to store a third-party API key in plaintext in `~/.kimi-code/config.toml`. Nothing is written to kimi's config. Capabilities come from the model table (`image_in` only for `base`), the reasoning key is `reasoning_content` (the field abliteration.ai returns on `/v1/chat/completions`), and a thinking effort above the model's ceiling is capped with a warning.
+
+`--ctx` still works and is capped at the selected model's window. `--dry-run` reports the provider, the resolved window and capabilities alongside the usual argv and masked env.
 
 ### Environment Overrides
 
+- `ABLITERATION_API_KEY` (or `ABLIT_KEY`): abliteration.ai `ak_...` API key. Environment only — never persisted by kimo.
+- `KIMO_CLOUD_PROVIDER`: Default `launch` backend (`ollama` or `abliteration`); overrides the `cloud_provider` config key. `--provider` beats both.
+- `KIMO_ABLITERATION_BASE_URL`: Override the API origin (default `https://api.abliteration.ai`).
 - `OLLAMA_REMOTE_URL`: Override default remote URL (defaults to `http://127.0.0.1:11438`).
 - `OLLAMA_LOCAL_URL`: Override default local URL (defaults to `http://127.0.0.1:11434`).
 - `KIMO_KIMI_EFFORT` (or `OM_KIMI_EFFORT`): Default thinking effort level for Kimi Code CLI (`low`, `medium`, `high`, `xhigh`, `max`).
 - `KIMO_KIMI_CAPABILITIES` (or `OM_KIMI_CAPABILITIES`): Override detected capabilities (`tool_use`, `thinking`, `image_in`).
 - `KIMO_KIMI_REGISTER_ALL`: Register every model the host serves into the kimi config (default `1`). Set `0` to only register the launched model.
 - `QWEN_CODE_API_TIMEOUT_MS`: Per-request timeout for `launch qwen`. Defaults to `600000` when unset; set your own value to override.
-- `KIMO_AGY_CLAIM_DIR`: Session claim directory for concurrent Antigravity sessions.
-- `KIMO_GROK_CLAIM_DIR`: Session claim directory for concurrent Grok sessions.
-- `KIMO_KIMI_CONFIG_LOCK`: File lock path for concurrent Kimi config updates.
+- `KIMO_RUNTIME_DIR`: Private per-user directory for session claims and config locks. Defaults to `$XDG_RUNTIME_DIR/kimo`, else `${TMPDIR:-/tmp}/kimo-<uid>`; kimo refuses a directory that is a symlink or owned by another user.
+- `KIMO_AGY_CLAIM_DIR`: Session claim directory for concurrent Antigravity sessions (default `$KIMO_RUNTIME_DIR/agy-claims`).
+- `KIMO_GROK_CLAIM_DIR`: Session claim directory for concurrent Grok sessions (default `$KIMO_RUNTIME_DIR/grok-claims`).
+- `KIMO_KIMI_CONFIG_LOCK`: File lock path for concurrent Kimi config updates (default `$KIMO_RUNTIME_DIR/kimi-config.lock`).
 
 ---
 

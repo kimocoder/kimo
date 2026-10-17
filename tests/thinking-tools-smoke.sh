@@ -22,20 +22,13 @@
 # Usage: tests/thinking-tools-smoke.sh
 
 set -euo pipefail
+# shellcheck source=lib/harness.sh
+source "$(dirname "${BASH_SOURCE[0]}")/lib/harness.sh"
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 KIMO="${ROOT_DIR}/kimo"
 
 TMPDIR_T="$(mktemp -d)"
-cleanup() { rm -rf "${TMPDIR_T}"; }
-trap cleanup EXIT
-
-pass=0 fail=0
-ok()   { printf '  \033[32mPASS\033[0m %s\n' "$1"; pass=$((pass + 1)); }
-bad()  { printf '  \033[31mFAIL\033[0m %s\n' "$1"; fail=$((fail + 1)); }
-check() { # <description> <expected> <actual>
-    if [[ "$2" == "$3" ]]; then ok "$1 ($3)"; else bad "$1: expected '$2', got '$3'"; fi
-}
 
 # ---------------------------------------------------------------------------
 # Part A: _kimi_model_spec unit checks
@@ -143,8 +136,6 @@ out="${TT_SMOKE_OUT:?TT_SMOKE_OUT unset}"
 exit 0
 FAKE
 chmod +x "${FAKE_DIR}/kimi"
-
-env_val() { sed -n "s/^$2=//p" "$1" | head -n1; }
 
 # Same isolation as the cursor/grok suites: kimo prepends per-CLI bin dirs
 # (e.g. ~/.kimi-code/bin) and /usr/local/bin to PATH itself, so a real kimi
