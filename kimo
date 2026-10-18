@@ -5528,7 +5528,11 @@ ${C_YELLOW}CLI Integration Mechanics:${C_RESET}
                 -m <alias> (so the /model picker lists every model, not just the launched tag).
                 Set KIMO_KIMI_REGISTER_ALL=0 to register only the launched model.
                 Context length (--ctx, KIMO_KIMI_CONTEXT, or tuned num_ctx) becomes
-                max_context_size (capped at model architecture maximum). Thinking models declare
+                max_context_size, capped at the architecture maximum and then at the
+                model's num_ctx (the window the runner actually allocates). Ollama
+                does not set an output token cap. A Kimi window above num_ctx fills
+                the runner and comes back as finish_reason=length, which Kimi reports
+                as "Model hit max_tokens" before any tool call. Thinking models declare
                 support_efforts low..max so the in-session /effort picker works (mapped via reasoning_key).
   ${C_BOLD}claude${C_RESET}       Directs Claude Code to the target host via ANTHROPIC_BASE_URL. A real
                 ANTHROPIC_API_KEY/AUTH_TOKEN is forwarded only to a plain local daemon;
@@ -6147,6 +6151,13 @@ cmd_launch() {
                 # 3. Model tuning registry (tune --ctx)
                 # 4. Model runtime Modelfile parameter (num_ctx)
                 # 5. Model architecture maximum (context_length)
+                # Then cap at the architecture maximum, and at the baked num_ctx.
+                # The OpenAI endpoint cannot carry num_ctx, so a baked PARAMETER
+                # num_ctx is the window every request gets. Telling Kimi a larger
+                # max_context_size skips compaction; the runner then stops the
+                # turn with finish_reason=length ("Model hit max_tokens") once
+                # the prompt fills that window, before a tool call is emitted.
+                # There is no separate output-token cap (num_predict stays -1).
                 local requested_ctx="${opt_launch_ctx:-${KIMO_KIMI_CONTEXT:-${KIMO_CONTEXT:-}}}"
                 if [[ -z "${requested_ctx}" && -n "${tp:-}" ]]; then
                     requested_ctx=$(echo "${tp}" | jq -r '.num_ctx? // empty') || requested_ctx=""
@@ -6162,6 +6173,14 @@ cmd_launch() {
                     kimi_ctx="${kimi_runtime_ctx}"
                 elif [[ "${kimi_arch_ctx}" =~ ^[0-9]+$ ]]; then
                     kimi_ctx="${kimi_arch_ctx}"
+                fi
+
+                # The runner window wins over a larger request. Raising num_ctx
+                # on the daemon is a model rewrite; the served parameter is the
+                # window this launch can actually use.
+                if [[ -n "${kimi_ctx}" && "${kimi_runtime_ctx}" =~ ^[0-9]+$ ]] && ((kimi_ctx > kimi_runtime_ctx)); then
+                    echo "${C_YELLOW}[!] Kimi context set to ${kimi_runtime_ctx} (${resolved_model} num_ctx). Requested ${kimi_ctx} is above the runner window, which stops the turn with \"Model hit max_tokens\" before a tool call.${C_RESET}" >&2
+                    kimi_ctx="${kimi_runtime_ctx}"
                 fi
 
                 if [[ -n "${kimi_ctx}" ]]; then

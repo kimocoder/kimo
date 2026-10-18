@@ -18,6 +18,11 @@
 #     are exported by the caller (kimi would fail the request outright)
 #   * KIMO_KIMI_EFFORT / KIMO_KIMI_REASONING_KEY / KIMO_KIMI_CAPABILITIES
 #     overrides are honoured
+#   * a requested context above the model's baked num_ctx is capped to that
+#     num_ctx (the window Ollama actually allocates). A larger Kimi window
+#     fills the runner and comes back as finish_reason=length, which Kimi
+#     reports as "Model hit max_tokens" before any tool call. A request
+#     below num_ctx is kept.
 #
 # Usage: tests/thinking-tools-smoke.sh
 
@@ -132,6 +137,7 @@ out="${TT_SMOKE_OUT:?TT_SMOKE_OUT unset}"
     printf 'KIMI_MODEL_THINKING_EFFORT=%s\n' "${KIMI_MODEL_THINKING_EFFORT-__UNSET__}"
     printf 'KIMI_MODEL_BASE_URL=%s\n' "${KIMI_MODEL_BASE_URL-__UNSET__}"
     printf 'KIMI_MODEL_API_KEY=%s\n' "${KIMI_MODEL_API_KEY-__UNSET__}"
+    printf 'KIMI_MODEL_MAX_CONTEXT_SIZE=%s\n' "${KIMI_MODEL_MAX_CONTEXT_SIZE-__UNSET__}"
 } > "${out}"
 exit 0
 FAKE
@@ -149,6 +155,7 @@ mkdir -p "${FAKE_HOME}"
 BROKEN_CONFIG="${TMPDIR_T}/config.toml"
 printf '[broken\n' > "${BROKEN_CONFIG}"
 
+LAUNCH_ERR="${TMPDIR_T}/launch.err"
 run_launch() { # <model> [extra env as K=V...]
     rm -f "${CAPTURE}"
     local model="$1"; shift
@@ -156,7 +163,7 @@ run_launch() { # <model> [extra env as K=V...]
         KIMI_CONFIG="${BROKEN_CONFIG}" KIMO_KIMI_CONFIG_LOCK="${TMPDIR_T}/kimi.lock" \
         "$@" \
         "${KIMO}" --host http://127.0.0.1:9 launch kimi --model "${model}" \
-        >/dev/null 2>&1 || true
+        >"${LAUNCH_ERR}" 2>&1 || true
 }
 
 run_launch thinker:latest
@@ -188,6 +195,25 @@ check "KIMO_KIMI_REASONING_KEY override" "reasoning_content" "$(env_val "${CAPTU
 run_launch plain:latest KIMO_KIMI_CAPABILITIES=thinking,tool_use
 check "KIMO_KIMI_CAPABILITIES override beats probe" "thinking,tool_use" "$(env_val "${CAPTURE}" KIMI_MODEL_CAPABILITIES)"
 check "cap override enables thinking effort" "high" "$(env_val "${CAPTURE}" KIMI_MODEL_THINKING_EFFORT)"
+
+echo "[*] launch: Kimi context follows the runner num_ctx"
+# thinker probe: runtime num_ctx 8192, architecture 131072. A request above
+# the runner window must not be advertised to Kimi.
+run_launch thinker:latest KIMO_KIMI_CONTEXT=262144
+check "requested context above num_ctx is capped to num_ctx" "8192" "$(env_val "${CAPTURE}" KIMI_MODEL_MAX_CONTEXT_SIZE)"
+if grep -q 'Kimi context set to 8192' "${LAUNCH_ERR}"; then
+    ok "cap warning names the runner window"
+else
+    bad "cap warning missing: $(tail -c 300 "${LAUNCH_ERR}")"
+fi
+
+# Below the runner window the request is the window Kimi should use.
+run_launch thinker:latest KIMO_KIMI_CONTEXT=4096
+check "requested context below num_ctx is kept" "4096" "$(env_val "${CAPTURE}" KIMI_MODEL_MAX_CONTEXT_SIZE)"
+
+# No request: the baked num_ctx is the window.
+run_launch thinker:latest
+check "unset request uses runtime num_ctx" "8192" "$(env_val "${CAPTURE}" KIMI_MODEL_MAX_CONTEXT_SIZE)"
 
 echo
 echo "thinking/tools checks: ${pass} passed, ${fail} failed"
