@@ -2477,7 +2477,8 @@ cmd_status() {
     local as_json="${OPT_JSON}"
 
     local tunnel_state
-    tunnel_state=$(systemctl is-active ollama-remote-tunnel.service 2>/dev/null || echo "unknown")
+    tunnel_state=$(systemctl is-active ollama-remote-tunnel.service 2>/dev/null) || true
+    tunnel_state="${tunnel_state:-unknown}"
     local tunnel_enter
     tunnel_enter=$(systemctl show ollama-remote-tunnel.service -p ActiveEnterTimestamp --value 2>/dev/null || true)
 
@@ -8275,10 +8276,15 @@ print(json.dumps(out))'
     echo "${C_YELLOW}[4/5] Remote GPU Server & SSH Tunnel (${REMOTE_HOST_URL}):${C_RESET}"
     if command -v systemctl >/dev/null 2>&1; then
         local tunnel_state
-        tunnel_state=$(systemctl is-active ollama-remote-tunnel.service 2>/dev/null || echo "unknown")
+        tunnel_state=$(systemctl is-active ollama-remote-tunnel.service 2>/dev/null) || true
+        tunnel_state="${tunnel_state:-unknown}"
         if [[ "${tunnel_state}" == "active" ]]; then
             echo "  ${C_GREEN}[✓] SSH Tunnel${C_RESET}    : ollama-remote-tunnel.service is ACTIVE"
             passed=$((passed + 1))
+        elif ! systemctl cat ollama-remote-tunnel.service >/dev/null 2>&1; then
+            echo "  ${C_YELLOW}[!] SSH Tunnel${C_RESET}    : ollama-remote-tunnel.service is not installed"
+            warnings=$((warnings + 1))
+            recs+=("Install SSH tunnel: kimo tunnel setup <user@host>")
         else
             echo "  ${C_YELLOW}[!] SSH Tunnel${C_RESET}    : ollama-remote-tunnel.service is ${tunnel_state}"
             warnings=$((warnings + 1))
