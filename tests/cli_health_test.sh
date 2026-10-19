@@ -90,14 +90,17 @@ check_not_contains "healthy install: no health warning" "does not run" "${out}"
 
 # 4) npm's blocked-install-scripts warning is surfaced with a command, but a
 #    CLI that still runs is not failed for it.
+# --update keeps this portable: on boxes with a system-wide qwen (e.g.
+# /usr/bin/qwen) a plain 'install qwen' takes the already-installed early
+# return and never reaches the npm path the blocked-scripts warning lives on.
 reset_installs
-NPM_BLOCKED=1 run_kimo install qwen
+NPM_BLOCKED=1 run_kimo install qwen --update
 check "blocked scripts: install still succeeds" "0" "${rc}"
 check_contains "blocked scripts: names the package" "npm skipped install scripts for: @qwen-code/audio-capture" "${out}"
 check_contains "blocked scripts: prints allow command" \
     "npm install -g --allow-scripts=@qwen-code/audio-capture @qwen-code/qwen-code" "${out}"
 reset_installs
-run_kimo install qwen
+run_kimo install qwen --update
 check_not_contains "no blocked scripts: no warning" "npm skipped install scripts" "${out}"
 
 rm -rf "${STUBS}"

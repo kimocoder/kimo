@@ -13,7 +13,7 @@ export KIMO_NO_AUTOSCAN := 1
 
 SCRIPT  := kimo
 
-.PHONY: all help install uninstall link unlink check lint test test-check test-web test-qwen test-claude test-agy test-opencode test-kimi test-codex test-cursor test-grok test-gh test-thinking-tools test-gemini test-scan test-quota test-tunnel test-config-validate test-rotate-token test-jq-guard test-pull-json test-backup-prune test-web-url-esc test-gh-guard test-model-args test-launch-contract test-sync test-shim test-install-packages test-config-rules test-hardening test-extra clean install-completion uninstall-completion update update-% test-host-url test-web-bridge test-option-values test-update-lookup test-codex-update test-qwen-update test-cli-health
+.PHONY: all help install uninstall link unlink check lint test test-check test-web test-qwen test-claude test-agy test-opencode test-kimi test-codex test-codex-auth test-dashscope test-cursor test-grok test-gh test-thinking-tools test-gemini test-scan test-quota test-tunnel test-config-validate test-rotate-token test-jq-guard test-pull-json test-backup-prune test-web-url-esc test-gh-guard test-model-args test-launch-contract test-sync test-shim test-install-packages test-config-rules test-hardening test-extra clean install-completion uninstall-completion update update-% test-host-url test-web-bridge test-option-values test-update-lookup test-codex-update test-qwen-update test-cli-health
 
 all: help
 
@@ -40,6 +40,8 @@ help:
 	@echo "  make test-kimi             Headless smoke test of the 'kimi' launch branch (LIVE=1 adds a live -p turn)"
 	@echo "  make test-abliteration     Headless smoke test of the abliteration.ai cloud provider ('launch --provider abliteration')"
 	@echo "  make test-codex            Headless smoke test of the 'codex' launch branch (LIVE=1 adds a live exec turn)"
+	@echo "  make test-codex-auth       Codex native forwarding, authentication and Kimi model sync"
+	@echo "  make test-dashscope        Headless smoke test of the DashScope cloud provider ('launch --provider dashscope')"
 	@echo "  make test-cursor           Headless smoke test of the 'cursor' launch branch (LIVE=1 adds a live -p turn)"
 	@echo "  make test-grok             Headless smoke test of the 'grok' launch branch (LIVE=1 adds a live -p turn)"
 	@echo "  make test-gh               Headless smoke test of GitHub CLI ('gh') integration (LIVE=1 adds a live turn)"
@@ -86,12 +88,14 @@ install:
 	fi
 	@install -d -m 755 $(DESTDIR)$(SHAREDIR)
 	@install -m 644 lib/kimo-quota.py $(DESTDIR)$(SHAREDIR)/kimo-quota.py
+	@install -m 644 lib/kimo-codex.py $(DESTDIR)$(SHAREDIR)/kimo-codex.py
 
 uninstall: uninstall-completion
 	@echo "[*] Removing $(SCRIPT) from $(DESTDIR)$(BINDIR)..."
 	@rm -f $(DESTDIR)$(BINDIR)/$(SCRIPT)
 	@rm -f $(DESTDIR)$(SHAREDIR)/ollama-gemini-shim.py
 	@rm -f $(DESTDIR)$(SHAREDIR)/kimo-quota.py
+	@rm -f $(DESTDIR)$(SHAREDIR)/kimo-codex.py
 	@rmdir $(DESTDIR)$(SHAREDIR) 2>/dev/null || true
 	@echo "[✓] $(SCRIPT) and assets removed from $(DESTDIR)$(PREFIX)"
 
@@ -162,13 +166,17 @@ lint:
 	@ruff check --no-cache lib tests
 	@echo "[✓] Lint check passed."
 
-test: test-check test-web test-scan test-gh test-thinking-tools test-gemini test-qwen test-claude test-agy test-opencode test-kimi test-abliteration test-codex test-cursor test-grok test-quota test-tunnel test-config-validate test-rotate-token test-jq-guard test-pull-json test-backup-prune test-web-url-esc test-gh-guard test-model-args test-launch-contract test-sync test-shim test-install-packages test-config-rules test-hardening test-host-url test-web-bridge test-option-values test-update-lookup test-codex-update test-qwen-update test-cli-health
+test: test-check test-web test-scan test-gh test-thinking-tools test-gemini test-qwen test-claude test-agy test-opencode test-kimi test-abliteration test-codex test-codex-auth test-dashscope test-cursor test-grok test-quota test-tunnel test-config-validate test-rotate-token test-jq-guard test-pull-json test-backup-prune test-web-url-esc test-gh-guard test-model-args test-launch-contract test-sync test-shim test-install-packages test-config-rules test-hardening test-host-url test-web-bridge test-option-values test-update-lookup test-codex-update test-qwen-update test-cli-health
 	@echo ""
 	@echo "[✓] All test suites completed successfully."
 
 test-abliteration:
 	@echo "[*] Running abliteration.ai cloud-provider smoke tests..."
 	@tests/abliteration-smoke.sh
+
+test-dashscope:
+	@echo "[*] Running DashScope cloud-provider smoke tests..."
+	@tests/dashscope-smoke.sh
 
 test-check:
 	@echo "[*] Running check and ping connectivity smoke tests..."
@@ -201,6 +209,10 @@ test-kimi:
 test-codex:
 	@echo "[*] Running 'codex' launch smoke tests..."
 	@tests/codex-smoke.sh $(if $(LIVE),--live,)
+
+test-codex-auth:
+	@echo "[*] Running 'codex' authentication and launch integration tests..."
+	@tests/codex_auth_test.sh
 
 test-cursor:
 	@echo "[*] Running 'cursor' launch smoke tests..."

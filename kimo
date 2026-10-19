@@ -145,8 +145,8 @@ _kimo_config_check() {
             ;;
         cloud_provider)
             case "${val}" in
-                ""|none|ollama|abliteration) ;;
-                *) echo "expected 'ollama' (self-hosted default) or 'abliteration' (got '${val}')"; return 1 ;;
+                ""|none|ollama|abliteration|codex|openai|dashscope) ;;
+                *) echo "expected 'ollama', 'abliteration', 'codex'/'openai', or 'dashscope' (got '${val}')"; return 1 ;;
             esac
             ;;
         web_max_results)
@@ -320,6 +320,50 @@ ABLITERATION_VISION_MODEL="abliterated-model"
 # CLIs whose launch branch knows how to reach abliteration.ai.
 ABLITERATION_CLIS="claude kimi"
 
+# OpenAI's two inference surfaces, both selected with 'launch --provider'.
+# 'codex' is the ChatGPT plan endpoint and authenticates with an OAuth bearer
+# token; 'openai' is the metered platform API and takes an sk- key. They are
+# kept apart because the credentials are not interchangeable: the ChatGPT
+# backend answers a platform key with 401 "API keys are not supported".
+CODEX_BACKEND_URL="${KIMO_CODEX_BACKEND_URL:-https://chatgpt.com/backend-api/codex}"
+OPENAI_BACKEND_URL="${KIMO_OPENAI_BACKEND_URL:-https://api.openai.com}"
+# CLIs whose launch branch knows how to reach either OpenAI backend.
+OPENAI_CLIS="codex kimi"
+
+# Alibaba Model Studio's international OpenAI-compatible surface, selected
+# with 'launch --provider dashscope' and billed pay-as-you-go. The credential
+# is a DashScope sk- key from the environment, never written to disk.
+DASHSCOPE_BACKEND_URL="${KIMO_DASHSCOPE_BASE_URL:-https://dashscope-intl.aliyuncs.com/compatible-mode/v1}"
+DASHSCOPE_DEFAULT_MODEL="qwen3.8-max"
+# qwen3.8-max's context window as the user's own model registrations declare
+# it; --ctx and KIMO_DASHSCOPE_CTX override.
+DASHSCOPE_DEFAULT_CTX="${KIMO_DASHSCOPE_CTX:-1000000}"
+# CLIs whose launch branch knows how to reach DashScope.
+DASHSCOPE_CLIS="kimi"
+
+# Backend names 'launch --provider' accepts, in the order they are offered by
+# completion and listed in errors. 'none' and '' are synonyms for ollama.
+KIMO_LAUNCH_PROVIDERS="ollama abliteration codex openai dashscope"
+
+# True when <name> is a hosted inference API rather than a self-hosted Ollama
+# daemon: no host probing, no /api/tags resolution, no VRAM eviction, no tune
+# registry, and the selected provider's own credential is forwarded instead of
+# being scrubbed (scrubbing it would make every request 401).
+hosted_provider() {
+    case "${1:-}" in
+        abliteration|codex|openai|dashscope) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# True when <name> is one of OpenAI's own backends (as opposed to abliteration).
+openai_backend() {
+    case "${1:-}" in
+        codex|openai) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 # grok, kimi, opencode, cyberstrike, cursor, etc. install into user directories that reach PATH only
 # through ~/.bashrc, which a non-interactive caller (cron, systemd, Apache, sh -c)
 # never sources. Ensure all CLI binary directories are present in PATH.
@@ -422,6 +466,7 @@ ${C_YELLOW}Maintenance, Config & Completion:${C_RESET}
   ${C_CYAN}rotate-token${C_RESET}                 Generate new public API token, rewrite proxy conf & reload Apache
   ${C_CYAN}freetier [opts]${C_RESET}              Sync Kimi config with Model Studio free-tier quotas (bl usage free)
   ${C_CYAN}gemini [opts]${C_RESET}                Register Gemini API models (real token limits) in Kimi config
+  ${C_CYAN}codex [opts]${C_RESET}                 Inspect/renew Codex auth tokens & sync ChatGPT/OpenAI models in Kimi config
   ${C_CYAN}quota, quotas, quote${C_RESET}         Quota & usage dashboard for providers and every supported CLI
 
 ${C_YELLOW}Web & Quota-Free Research:${C_RESET}
@@ -474,6 +519,8 @@ ${C_YELLOW}Examples:${C_RESET}
   ${0##*/} freetier --verify --verify-prune           # Probe free-tier models, drop dead, write Kimi config
   ${0##*/} freetier --set-default first               # ...and make the top model the Kimi default
   ${0##*/} gemini --verify --verify-prune             # Add every usable Gemini model to Kimi (kimi -m gemini/<id>)
+  ${0##*/} codex                                      # Inspect Codex OAuth session, expiration & accounts
+  ${0##*/} codex --sync                               # Sync [providers.codex] and models into Kimi config
 
   ${C_DIM}# Cluster & Multi-Host Management:${C_RESET}
   ${0##*/} check                                      # Health & latency probe for all endpoints
@@ -502,6 +549,12 @@ POSITIONAL_ARGS=()
 OPT_PASSTHROUGH=false
 
 while [[ $# -gt 0 ]]; do
+    # The direct Codex command owns every subsequent option, including its
+    # native --remote transport flag. kimo globals go before 'codex'.
+    if [[ "${POSITIONAL_ARGS[0]:-}" == codex ]]; then
+        POSITIONAL_ARGS+=("$@")
+        break
+    fi
     # After '--' nothing is a kimo option: the rest is passed through verbatim.
     if ${OPT_PASSTHROUGH}; then
         POSITIONAL_ARGS+=("$1")
@@ -690,7 +743,33 @@ remote_known_down() {
 # down (resolution probes the network; see resolve_remote_url).
 command_needs_remote() {
     case "$1" in
-        version|help|-h|--help|completion|config|cfg|quota|quotas|quote|web|gemini|gemini-sync|kimi-gemini|freetier|free-tier|kimi-sync|install|setup|update|upgrade|rotate-token|rotate|logs|log|scan|discover|init) return 1 ;;
+        launch)
+            local backend="${KIMO_CLOUD_PROVIDER:-${KIMO_CONFIG_VALUES[cloud_provider]:-}}"
+            local cli="${ARGS[0]:-}" explicit=false model i
+            [[ -n "${cli}" ]] || return 1
+            model="${KIMO_DEFAULT_MODEL:-${DEFAULT_MODELS[$cli]:-}}"
+            for ((i=1; i<${#ARGS[@]}; i++)); do
+                case "${ARGS[i]}" in
+                    --) break ;;
+                    --provider) backend="${ARGS[i+1]:-}"; ((i+=1)) ;;
+                    --provider=*) backend="${ARGS[i]#*=}" ;;
+                    -m|--model) model="${ARGS[i+1]:-}"; explicit=true; ((i+=1)) ;;
+                    -m=*|--model=*) model="${ARGS[i]#*=}"; explicit=true ;;
+                esac
+            done
+            case "${backend}" in
+                codex|openai|abliteration|dashscope) return 1 ;;
+                "")
+                    [[ "${model}" == codex/* || "${model}" == codex ]] && return 1
+                    if [[ "${cli}" == codex || "${cli}" == kimi ]] && ! ${explicit} \
+                        && [[ -n "${CODEX_API_KEY:-}${CODEX_AUTH_TOKEN:-}" ]]; then
+                        return 1
+                    fi
+                    [[ "${cli}" == codex && -n "${CODEX_ACCESS_TOKEN:-}" ]] && ! ${explicit} && return 1
+                    ;;
+            esac
+            return 0 ;;
+        version|help|-h|--help|completion|config|cfg|quota|quotas|quote|web|gemini|gemini-sync|kimi-gemini|codex|codex-sync|kimi-codex|freetier|free-tier|kimi-sync|install|setup|update|upgrade|rotate-token|rotate|logs|log|scan|discover|init) return 1 ;;
         *) return 0 ;;
     esac
 }
@@ -5208,6 +5287,182 @@ KIMI_CONFIG="${KIMI_CONFIG:-${KIMI_CODE_HOME:-${HOME:-/root}/.kimi-code}/config.
 # Serializes concurrent 'launch kimi' upserts so two read-modify-write cycles
 # cannot drop each other's entries.
 KIMI_CONFIG_LOCK="${KIMO_KIMI_CONFIG_LOCK:-${KIMI_CONFIG_LOCK:-${KIMO_RUNTIME_DIR}/kimi-config.lock}}"
+CODEX_HOME="${CODEX_HOME:-${HOME:-/root}/.codex}"
+
+# -----------------------------------------------------------------------------
+# Codex authentication & token resolution for Kimi Code and Codex CLI.
+# Resolves CODEX_AUTH_TOKEN and/or OPENAI_API_KEY from the environment or
+# ~/.codex/auth.json.
+#
+# Context:
+# Kimi Code's [providers.codex] routes to https://chatgpt.com/backend-api/codex,
+# which expects a ChatGPT OAuth JWT bearer token via CODEX_AUTH_TOKEN (not an
+# OpenAI Platform sk-proj-* API key, which returns 401 "API keys are not supported").
+# If the caller sets CODEX_API_KEY as an sk-* key, we export OPENAI_API_KEY so
+# OpenAI models work, and fall back to the cached access_token from ~/.codex/auth.json
+# for CODEX_AUTH_TOKEN. If CODEX_API_KEY is itself a JWT (eyJ...), it is aliased.
+# -----------------------------------------------------------------------------
+_resolve_codex_auth() {
+    local auth_file="${CODEX_HOME}/auth.json"
+    local file_token=""
+
+    if [[ -f "${auth_file}" ]] && command -v jq >/dev/null 2>&1; then
+        file_token=$(jq -r '.tokens.access_token | select(type == "string")' "${auth_file}" 2>/dev/null || true)
+    fi
+
+    # 1. If CODEX_AUTH_TOKEN is already explicitly set and non-empty, keep it.
+    # 2. If CODEX_API_KEY is set:
+    if [[ -n "${CODEX_API_KEY:-}" ]]; then
+        if [[ "${CODEX_API_KEY}" == eyJ* ]]; then
+            # JWT OAuth bearer token passed via CODEX_API_KEY -> alias to CODEX_AUTH_TOKEN
+            export CODEX_AUTH_TOKEN="${CODEX_AUTH_TOKEN:-${CODEX_API_KEY}}"
+        else
+            # OpenAI Platform API key (sk-...)
+            # Export for OpenAI-compatible endpoints:
+            export OPENAI_API_KEY="${CODEX_API_KEY}"
+            # For CODEX_AUTH_TOKEN: prefer the cached ChatGPT OAuth token from auth.json
+            # if present, because chatgpt.com/backend-api/codex rejects API keys.
+            if [[ -z "${CODEX_AUTH_TOKEN:-}" ]]; then
+                if [[ -n "${file_token}" ]]; then
+                    export CODEX_AUTH_TOKEN="${file_token}"
+                fi
+            fi
+        fi
+    fi
+
+    # 3. If CODEX_AUTH_TOKEN is still unset, auto-extract from auth.json
+    if [[ -z "${CODEX_AUTH_TOKEN:-}" && -n "${file_token}" ]]; then
+        export CODEX_AUTH_TOKEN="${file_token}"
+    fi
+
+    # 4. If OPENAI_API_KEY is unset but auth.json has an OPENAI_API_KEY, use it
+    if [[ -z "${OPENAI_API_KEY:-}" && -f "${auth_file}" ]] && command -v jq >/dev/null 2>&1; then
+        local file_api_key
+        file_api_key=$(jq -r '.OPENAI_API_KEY | select(type == "string")' "${auth_file}" 2>/dev/null || true)
+        [[ -n "${file_api_key}" ]] && export OPENAI_API_KEY="${file_api_key}"
+    fi
+    return 0
+}
+
+# The OpenAI platform API key for '--provider openai'. Env only, like every
+# other hosted credential: kimi's [providers.openai] names OPENAI_API_KEY, so
+# the key is never written to a config file and never travels in argv.
+# auth.json may carry one alongside the ChatGPT login ('codex login --api-key').
+_codex_platform_key() {
+    local k="${OPENAI_API_KEY:-${CODEX_API_KEY:-}}"
+    local auth_file="${CODEX_HOME}/auth.json"
+    if [[ -z "${k}" && -f "${auth_file}" ]] && command -v jq >/dev/null 2>&1; then
+        k=$(jq -r '.OPENAI_API_KEY | select(type == "string")' "${auth_file}" 2>/dev/null || true)
+    fi
+    # 'ollama' is kimo's own placeholder for a self-hosted daemon; sending it to
+    # api.openai.com would only produce a 401 that looks like a broken key.
+    [[ -n "${k}" && "${k}" != "ollama" ]] || return 1
+    printf '%s\n' "${k}"
+}
+
+# True when a ChatGPT OAuth login exists - usable right now, or renewable from
+# auth.json's refresh_token - which is what makes '--provider codex' viable.
+# Offline: this only reports whether a refresh is possible, it never performs
+# one (that is _ensure_codex_token's job).
+_codex_oauth_available() {
+    local state source refreshable
+    read -r state source refreshable < <(_codex_helper token-state 2>/dev/null) || return 1
+    [[ "${state}" == valid || "${state}" == expired || "${refreshable}" == yes ]]
+}
+
+# A ChatGPT OAuth access token lives for hours, and kimi reads CODEX_AUTH_TOKEN
+# from the environment, so a stale cached token would 401 partway through a
+# session. Renew it here the way the codex CLI does. The credential is never
+# captured or printed: the helper rewrites auth.json and _resolve_codex_auth
+# re-reads it from there.
+#
+# KIMO_CODEX_NO_REFRESH=1 keeps kimo offline; the launch then needs an already
+# valid token in the environment or in auth.json.
+_ensure_codex_token() {
+    local state source refreshable refresh_attempted=false
+    _resolve_codex_auth
+    read -r state source refreshable < <(_codex_helper token-state) || return 1
+    if [[ "${state}" != valid && "${refreshable}" == yes && "${KIMO_CODEX_NO_REFRESH:-0}" != 1 ]]; then
+        refresh_attempted=true
+        echo "${C_DIM}[*] ChatGPT OAuth token is ${state}; renewing it from ${CODEX_HOME}/auth.json...${C_RESET}" >&2
+        # The helper reports its own reason on stderr; the summary below decides
+        # whether the launch can continue.
+        _codex_helper refresh || true
+    fi
+    # token-state validated one specific token, so make the environment carry
+    # exactly that one. A stale CODEX_AUTH_TOKEN - an expired one the caller
+    # exported, or one a previous resolve lifted from auth.json before it was
+    # renewed - would otherwise shadow the good token and 401 mid-session.
+    if [[ "${state}" != valid || "${source}" == file ]]; then
+        unset CODEX_AUTH_TOKEN
+        _resolve_codex_auth
+        read -r state source refreshable < <(_codex_helper token-state) || return 1
+    fi
+    if [[ "${state}" == valid ]]; then
+        _codex_helper check-token || return 1
+        return 0
+    fi
+    echo "${C_RED}Error: no usable ChatGPT OAuth token (${state}).${C_RESET}" >&2
+    case "${state}" in
+        apikey)
+            echo "${C_DIM}    An OpenAI platform key (sk-...) cannot authenticate ${CODEX_BACKEND_URL}.${C_RESET}" >&2
+            echo "${C_DIM}    Use '${0##*/} launch <cli> --provider openai' for that key, or sign in with '${0##*/} codex login'.${C_RESET}" >&2
+            ;;
+        expired)
+            if ${refresh_attempted}; then
+                echo "${C_DIM}    The cached token has expired and the renewal above failed. Inspect the session with '${0##*/} codex'.${C_RESET}" >&2
+            else
+                echo "${C_DIM}    The cached token has expired and auth.json holds no refresh_token. Sign in again: '${0##*/} codex login'.${C_RESET}" >&2
+            fi
+            ;;
+        *)
+            echo "${C_DIM}    Sign in with '${0##*/} codex login' (writes ${CODEX_HOME}/auth.json), or export CODEX_AUTH_TOKEN.${C_RESET}" >&2
+            echo "${C_DIM}    With only a platform key, use '--provider openai' instead.${C_RESET}" >&2
+            ;;
+    esac
+    return 1
+}
+
+# The model id exactly as OpenAI's wire API expects it: kimo's alias namespace
+# (codex/, openai/) is routing metadata and must not reach the request.
+_codex_wire_model() {
+    local want="${1#codex/}"
+    printf '%s\n' "${want#openai/}"
+}
+
+# Codex picks its credential from auth.json's auth_mode, NOT from the
+# environment: with a ChatGPT login stored it keeps billing the plan even though
+# OPENAI_API_KEY is exported (verified against codex-cli 0.163.0). Say so rather
+# than let '--provider openai' look like it switched the billing account.
+# kimi is unaffected: its [providers.openai] names OPENAI_API_KEY explicitly.
+_codex_warn_chatgpt_login() {
+    local stored_mode=""
+    stored_mode=$(_codex_helper auth-mode 2>/dev/null) || stored_mode=""
+    [[ "${stored_mode}" == chatgpt ]] || return 0
+    echo "${C_YELLOW}[!] Warning: ${CODEX_HOME}/auth.json holds a ChatGPT login, and Codex prefers it over \$OPENAI_API_KEY.${C_RESET}" >&2
+    echo "${C_DIM}    This session bills your ChatGPT plan, not the platform key. To change that: '${0##*/} codex login --with-api-key' (stores the key) or '${0##*/} codex logout'.${C_RESET}" >&2
+    return 0
+}
+
+# Resolve the kimi model alias for a hosted OpenAI backend. An explicit model
+# keeps its name (namespaced with the backend), a preset Ollama tag or the CLI
+# name falls back to that backend's default alias from the Codex catalog.
+# argv: <codex|openai> <target-model> <true|false: was --model explicit>
+_codex_kimi_model() {
+    local backend="$1" want="$2" explicit="$3" slug
+    # The model may arrive namespaced for the other OpenAI backend
+    # ('--provider openai --model codex/gpt-x'); the alias namespace has to
+    # match the backend being launched, so re-prefix from the bare slug.
+    slug="${want#codex/}"
+    slug="${slug#openai/}"
+    if [[ "${want}" == "${backend}/"* ]]; then
+        printf '%s\n' "${want}"
+    elif ! ${explicit} || [[ -z "${want}" || "${want}" == kimi || "${want}" == codex || "${want}" == openai ]]; then
+        _codex_helper default-model "${backend}"
+    else
+        printf '%s\n' "${backend}/${slug}"
+    fi
+}
 
 # Upserts providers[pid] and a batch of models[alias] through tomlkit so the
 # user's formatting, comments and key order survive (same contract as
@@ -5460,7 +5715,7 @@ kimi_register_all_models() {
 
 launch_usage() {
     cat <<EOF
-${C_BOLD}kimo launch${C_RESET} – Launch external LLM agent CLIs routed to Ollama models
+${C_BOLD}kimo launch${C_RESET} – Launch external LLM agent CLIs on Ollama or a hosted backend
 
 ${C_YELLOW}Usage:${C_RESET}
   ${0##*/} [global-options] launch <cli> [-m|--model <model>] [--ctx <tokens>] [cli-arguments...] [-- cli-arguments...]
@@ -5469,8 +5724,11 @@ ${C_YELLOW}Launch Options:${C_RESET}
   -m, --model <model>       Target model name (default: \$KIMO_DEFAULT_MODEL / config
                             default_model, else the preset per CLI)
   -c, --ctx, --context <N>  Override context window length in tokens (for kimi, grok, etc.)
-  --provider <name>         Inference backend: 'ollama' (default, self-hosted) or
-                            'abliteration' (hosted api.abliteration.ai). Also read from
+                            Codex keeps -c for its native key=value config overrides.
+  --provider <name>         Inference backend: 'ollama' (default), 'abliteration',
+                            'codex' (ChatGPT plan via OAuth), 'openai' (metered
+                            platform API via an sk- key) or 'dashscope' (Alibaba
+                            Model Studio via an sk- key). Read from
                             \$KIMO_CLOUD_PROVIDER or 'kimo config set cloud_provider'.
   -W, --webbridge           Inject WebBridge skill into session (for kimi)
   --evict / --no-evict      Unload / keep other models loaded on the target host
@@ -5515,6 +5773,44 @@ ${C_YELLOW}Cloud Provider: abliteration.ai (--provider abliteration):${C_RESET}
   forwarded to api.abliteration.ai rather than scrubbed, because that endpoint is
   the provider you selected (the scrub still applies to every Ollama host).
 
+${C_YELLOW}Cloud Provider: OpenAI (--provider codex | --provider openai):${C_RESET}
+  Two different OpenAI surfaces, and their credentials are NOT interchangeable:
+
+  ${C_CYAN}codex${C_RESET}   ${CODEX_BACKEND_URL}
+          Your ChatGPT plan (Plus/Pro/Team), authenticated with an OAuth bearer
+          token. Sign in once with '${0##*/} codex login'; the token is cached in
+          ${CODEX_HOME}/auth.json and renewed automatically from its refresh_token
+          whenever it has expired, so a launch never dies mid-session on a 401.
+          A platform sk- key is refused here by the endpoint itself.
+  ${C_CYAN}openai${C_RESET}  ${OPENAI_BACKEND_URL}
+          The metered platform API, authenticated with an sk- key from
+          \$OPENAI_API_KEY (or \$CODEX_API_KEY, or the one 'codex login --api-key'
+          stored in auth.json). Billed per token, and it works without a ChatGPT
+          login.
+
+  Wired for ${C_BOLD}${OPENAI_CLIS}${C_RESET}; every other CLI stays on Ollama routing. Both backends
+  register a kimi provider entry plus <backend>/<slug> model aliases in
+  config.toml, naming the credential's environment variable (api_key_env) rather
+  than storing it - no secret is ever written to disk, and --dry-run masks them.
+  The model catalog comes from ${CODEX_HOME}/models_cache.json (populated the
+  first time the Codex CLI runs); an explicit --model needs no catalog.
+
+  Neither backend probes hosts, resolves Ollama tags, evicts models or applies
+  tune settings - there is no VRAM to manage. Set \$KIMO_CODEX_NO_REFRESH=1 to
+  forbid the OAuth renewal (kimo then needs an already valid token).
+
+${C_YELLOW}Cloud Provider: DashScope (--provider dashscope):${C_RESET}
+  ${DASHSCOPE_BACKEND_URL}
+  Alibaba Model Studio's international OpenAI-compatible surface, billed
+  pay-as-you-go and authenticated with an sk- key from \$DASHSCOPE_API_KEY
+  (MODELSTUDIO_API_KEY is accepted too). Wired for ${C_BOLD}${DASHSCOPE_CLIS}${C_RESET}; every other
+  CLI stays on Ollama routing. kimi rides its zero-footprint KIMI_MODEL_* env
+  channel, so nothing is written to kimi's config and the key never reaches
+  argv or disk. Without -m the default model is ${DASHSCOPE_DEFAULT_MODEL}
+  (context ${DASHSCOPE_DEFAULT_CTX} tokens; --ctx or \$KIMO_DASHSCOPE_CTX override).
+  Like every hosted backend it skips host probing, Ollama tag resolution,
+  eviction and tune settings.
+
 ${C_YELLOW}CLI Integration Mechanics:${C_RESET}
   ${C_BOLD}agy${C_RESET}          Google Antigravity CLI speaks only the Gemini wire protocol. A per-session
                 shim is spawned on a free localhost port and modelProvider is patched
@@ -5558,9 +5854,20 @@ ${C_YELLOW}CLI Integration Mechanics:${C_RESET}
 
 ${C_YELLOW}Environment Overrides:${C_RESET}
   ABLITERATION_API_KEY      abliteration.ai ak_... key (ABLIT_KEY also accepted); env only
-  KIMO_CLOUD_PROVIDER       Default backend for launch: ollama | abliteration
+  CODEX_AUTH_TOKEN          ChatGPT OAuth bearer token for the codex backend (auto-resolved from ~/.codex/auth.json)
+  CODEX_API_KEY             Codex / OpenAI API key or bearer token (auto-maps to CODEX_AUTH_TOKEN / OPENAI_API_KEY)
+  OPENAI_API_KEY            OpenAI platform sk- key; the credential for '--provider openai'
+  KIMO_CLOUD_PROVIDER       Default backend for launch: ollama | abliteration | codex | openai
                             (or 'kimo config set cloud_provider abliteration')
   KIMO_ABLITERATION_BASE_URL  Override the API origin (default: https://api.abliteration.ai)
+  KIMO_CODEX_BACKEND_URL    Override the ChatGPT Codex endpoint (default: https://chatgpt.com/backend-api/codex)
+  KIMO_OPENAI_BACKEND_URL   Override the platform origin (default: https://api.openai.com)
+  KIMO_CODEX_NO_REFRESH     Set 1 to never renew an expired ChatGPT OAuth token (default: renew)
+  KIMO_CODEX_TOKEN_URL      Override the OAuth token endpoint used for that renewal
+  KIMO_CODEX_REFRESH_TIMEOUT  Seconds to wait for the renewal request (default: 30)
+  DASHSCOPE_API_KEY           DashScope sk- key; the credential for '--provider dashscope'
+  KIMO_DASHSCOPE_BASE_URL     Override the DashScope compatible-mode origin
+  KIMO_DASHSCOPE_CTX          Override the DashScope default context window in tokens
   KIMO_KIMI_CONTEXT         Override Kimi model max context size in tokens (or 'kimo config set kimi_context <N>')
   KIMO_CONTEXT              Global context window override in tokens for external CLIs
   KIMO_KIMI_EFFORT          Default thinking effort (low, medium, high, xhigh, max)
@@ -5590,6 +5897,22 @@ ${C_YELLOW}Examples:${C_RESET}
   ${0##*/} launch kimi --provider abliteration --model base        ${C_DIM}# the image-capable model${C_RESET}
   ${0##*/} launch claude --provider abliteration --dry-run   ${C_DIM}# inspect routing, key masked${C_RESET}
   ${0##*/} config set cloud_provider abliteration            ${C_DIM}# make it the default backend${C_RESET}
+
+  ${C_DIM}# OpenAI / Codex: auto-resolves the token from ~/.codex/auth.json or CODEX_API_KEY${C_RESET}
+  ${0##*/} codex login                                        ${C_DIM}# sign in to your ChatGPT plan (once)${C_RESET}
+  ${0##*/} launch kimi --provider codex                       ${C_DIM}# ChatGPT plan; renews an expired token${C_RESET}
+  ${0##*/} launch kimi --model codex/gpt-6.1-sol
+  ${0##*/} launch codex --provider codex
+  ${0##*/} codex                                             ${C_DIM}# token/account status, renewal state${C_RESET}
+
+  ${C_DIM}# OpenAI platform API (metered): export OPENAI_API_KEY=sk-... first${C_RESET}
+  ${0##*/} launch kimi --provider openai
+  ${0##*/} launch kimi --provider openai --model gpt-5.1-codex
+  ${0##*/} launch codex --provider openai --dry-run   ${C_DIM}# inspect routing, key masked${C_RESET}
+
+  ${C_DIM}# DashScope (Alibaba Model Studio): export DASHSCOPE_API_KEY=sk-... first${C_RESET}
+  ${0##*/} launch kimi --provider dashscope
+  ${0##*/} launch kimi --provider dashscope --model qwen3-coder-plus
 EOF
 }
 
@@ -5637,7 +5960,7 @@ cmd_launch() {
             --provider)
                 shift
                 if [[ -z "${1:-}" ]]; then
-                    echo "${C_RED}Error: --provider requires a name argument (ollama, abliteration).${C_RESET}" >&2
+                    echo "${C_RED}Error: --provider requires a name argument (${KIMO_LAUNCH_PROVIDERS// /, }).${C_RESET}" >&2
                     exit 1
                 fi
                 opt_launch_provider="$1"
@@ -5645,6 +5968,10 @@ cmd_launch() {
                 ;;
             --provider=*)
                 opt_launch_provider="${1#*=}"
+                if [[ -z "${opt_launch_provider}" ]]; then
+                    echo "${C_RED}Error: --provider requires a name argument (${KIMO_LAUNCH_PROVIDERS// /, }).${C_RESET}" >&2
+                    return 1
+                fi
                 shift
                 ;;
             --evict)
@@ -5671,10 +5998,22 @@ cmd_launch() {
                 ;;
             -m=*|--model=*)
                 target_model="${1#*=}"
+                [[ -n "${target_model}" ]] || { echo "Error: --model requires a model name." >&2; return 1; }
                 opt_model_explicit=true
                 shift
                 ;;
             -c|--ctx|--context)
+                # Codex uses -c for native TOML overrides. --ctx/--context
+                # remain kimo options; other CLIs retain the -c shorthand.
+                if [[ "$1" == -c && "${provider}" == codex ]]; then
+                    if [[ $# -lt 2 || -z "$2" ]]; then
+                        echo "Error: -c requires a Codex key=value override." >&2
+                        return 1
+                    fi
+                    cli_passthrough_args+=("$1" "$2")
+                    shift 2
+                    continue
+                fi
                 shift
                 if [[ -z "${1:-}" ]]; then
                     echo "${C_RED}Error: --ctx requires a token count argument.${C_RESET}" >&2
@@ -5701,7 +6040,7 @@ cmd_launch() {
         esac
     done
 
-    if [[ -n "${opt_launch_ctx}" && ! "${opt_launch_ctx}" =~ ^[0-9]+$ ]]; then
+    if [[ -n "${opt_launch_ctx}" && ! "${opt_launch_ctx}" =~ ^[1-9][0-9]*$ ]]; then
         echo "${C_RED}Error: --ctx must be a positive integer in tokens (got '${opt_launch_ctx}').${C_RESET}" >&2
         exit 1
     fi
@@ -5715,22 +6054,127 @@ cmd_launch() {
     # Ollama routing below, which stays the default and the only path that
     # probes hosts, resolves tags and evicts models.
     local cloud_provider="${opt_launch_provider:-${KIMO_CLOUD_PROVIDER:-${KIMO_CONFIG_VALUES[cloud_provider]:-}}}"
+    local provider_selected="${cloud_provider}"
     case "${cloud_provider}" in
         ""|none|ollama) cloud_provider="" ;;
-        abliteration) ;;
+        abliteration|codex|openai|dashscope) ;;
         *)
-            echo "${C_RED}Error: unknown --provider '${cloud_provider}' (expected 'ollama' or 'abliteration').${C_RESET}" >&2
+            echo "${C_RED}Error: unknown --provider '${cloud_provider}' (expected one of: ${KIMO_LAUNCH_PROVIDERS}).${C_RESET}" >&2
             exit 1
             ;;
     esac
+
+    # Auto-detect an OpenAI backend from the requested model or from the
+    # credentials in the environment. A codex/... alias or a ChatGPT OAuth login
+    # means the plan endpoint; a lone platform key means api.openai.com, which is
+    # the only surface that accepts it.
+    if [[ -z "${provider_selected}" ]]; then
+        case "${target_model}" in
+            codex/*|codex) cloud_provider="codex" ;;
+            openai/*|openai) cloud_provider="openai" ;;
+        esac
+    fi
+    if [[ -z "${cloud_provider}" && -z "${provider_selected}" && "${opt_model_explicit}" != true ]] \
+        && { [[ -n "${CODEX_API_KEY:-}" || -n "${CODEX_AUTH_TOKEN:-}" || -n "${OPENAI_API_KEY:-}" ]]; }; then
+        case "${provider}" in
+            kimi|codex)
+                if _codex_oauth_available; then
+                    cloud_provider="codex"
+                elif _codex_platform_key >/dev/null 2>&1; then
+                    cloud_provider="openai"
+                fi
+                ;;
+        esac
+    fi
+    if [[ -z "${provider_selected}" && "${provider}" == codex && -n "${CODEX_ACCESS_TOKEN:-}" ]] && ! ${opt_model_explicit}; then
+        cloud_provider="codex"
+    fi
 
     local active_host=""
     local resolved_model="${target_model}"
     # Set for abliteration: the canonical model id, its context window, the API
     # key, and the OpenAI-surface base URL. Ollama routing leaves them empty.
     local ablit_key="" ablit_ctx="" ablit_openai_url="" ablit_caps="" ablit_efforts=""
+    local dashscope_key=""
 
-    if [[ "${cloud_provider}" == "abliteration" ]]; then
+    if openai_backend "${cloud_provider}"; then
+        if [[ " ${OPENAI_CLIS} " != *" ${provider} "* ]]; then
+            echo "${C_RED}Error: '--provider ${cloud_provider}' supports ${OPENAI_CLIS}; '${provider}' has no OpenAI launch branch yet.${C_RESET}" >&2
+            echo "${C_DIM}    Those CLIs are wired for a self-hosted Ollama host. Drop --provider to route '${provider}' to Ollama.${C_RESET}" >&2
+            return 1
+        fi
+        if [[ "${cloud_provider}" == openai ]]; then
+            # Metered platform API: an sk- key, and no codex/ namespace on the
+            # wire - kimi's openai/<slug> alias supplies the routing.
+            active_host="${OPENAI_BACKEND_URL}"
+            local openai_key=""
+            if ! openai_key=$(_codex_platform_key); then
+                echo "${C_RED}Error: '--provider openai' needs an OpenAI platform API key, and none was found.${C_RESET}" >&2
+                echo "${C_DIM}    Export OPENAI_API_KEY=sk-... (CODEX_API_KEY is accepted too), or use '--provider codex' with a ChatGPT login.${C_RESET}" >&2
+                echo "${C_DIM}    The key stays in the environment: kimi's [providers.openai] references OPENAI_API_KEY by name.${C_RESET}" >&2
+                return 1
+            fi
+            export OPENAI_API_KEY="${openai_key}"
+            if [[ "${provider}" == kimi ]]; then
+                resolved_model=$(_codex_kimi_model openai "${target_model}" "${opt_model_explicit}") || return 1
+            else
+                _codex_warn_chatgpt_login
+                if ! ${opt_model_explicit} && [[ "${target_model}" != openai/* ]]; then
+                    # Let the Codex CLI resolve its own model and profile.
+                    resolved_model=""
+                else
+                    resolved_model=$(_codex_wire_model "${target_model}")
+                fi
+            fi
+        else
+            active_host="${CODEX_BACKEND_URL}"
+            if [[ "${provider}" == kimi ]]; then
+                _ensure_codex_token || return 1
+                resolved_model=$(_codex_kimi_model codex "${target_model}" "${opt_model_explicit}") || return 1
+            else
+                if ! ${opt_model_explicit} && [[ "${target_model}" != codex/* ]]; then
+                    # Let Codex resolve its own model/profile and stored login.
+                    resolved_model=""
+                else
+                    resolved_model=$(_codex_wire_model "${target_model}")
+                fi
+            fi
+        fi
+    elif [[ "${cloud_provider}" == "dashscope" ]]; then
+        if [[ " ${DASHSCOPE_CLIS} " != *" ${provider} "* ]]; then
+            echo "${C_RED}Error: '--provider dashscope' supports ${DASHSCOPE_CLIS}; '${provider}' has no DashScope launch branch yet.${C_RESET}" >&2
+            echo "${C_DIM}    Those CLIs are wired for a self-hosted Ollama host. Drop --provider to route '${provider}' to Ollama.${C_RESET}" >&2
+            return 1
+        fi
+        # A token-plan-class key (sk-sp-...) is bound to the subscription
+        # surface and 401s on the pay-as-you-go intl endpoint, so it never
+        # selects it: the next variable in line gets the chance instead.
+        local dashscope_var="" dashscope_skipped=""
+        for dashscope_var in DASHSCOPE_API_KEY MODELSTUDIO_API_KEY; do
+            [[ -n "${!dashscope_var:-}" ]] || continue
+            if [[ "${!dashscope_var}" == sk-sp-* ]]; then
+                dashscope_skipped="${dashscope_var}"
+                continue
+            fi
+            dashscope_key="${!dashscope_var}"
+            break
+        done
+        if [[ -z "${dashscope_key}" || "${dashscope_key}" == "ollama" ]]; then
+            echo "${C_RED}Error: '--provider dashscope' needs a DashScope API key, and none was found.${C_RESET}" >&2
+            echo "${C_DIM}    Export DASHSCOPE_API_KEY=sk-... (MODELSTUDIO_API_KEY is accepted too).${C_RESET}" >&2
+            if [[ -n "${dashscope_skipped}" ]]; then
+                echo "${C_DIM}    ${dashscope_skipped} holds a token-plan key (sk-sp-...), which ${DASHSCOPE_BACKEND_URL} rejects; export a pay-as-you-go key instead.${C_RESET}" >&2
+            fi
+            echo "${C_DIM}    The key stays in the environment: kimi's KIMI_MODEL_* channel references it by name, never on disk.${C_RESET}" >&2
+            return 1
+        fi
+        active_host="${DASHSCOPE_BACKEND_URL}"
+        if ! ${opt_model_explicit} || [[ -z "${target_model}" || "${target_model}" == kimi ]]; then
+            resolved_model="${DASHSCOPE_DEFAULT_MODEL}"
+        else
+            resolved_model="${target_model#dashscope/}"
+        fi
+    elif [[ "${cloud_provider}" == "abliteration" ]]; then
         if ! abliteration_cli_supported "${provider}"; then
             echo "${C_RED}Error: '--provider abliteration' supports ${ABLITERATION_CLIS}; '${provider}' has no abliteration launch branch yet.${C_RESET}" >&2
             echo "${C_DIM}    Those CLIs are wired for a self-hosted Ollama host. Drop --provider to route '${provider}' to Ollama.${C_RESET}" >&2
@@ -5805,8 +6249,8 @@ cmd_launch() {
     # Other models on the target host are only unloaded when asked (--evict,
     # KIMO_LAUNCH_EVICT=always, or yes at the prompt): they may belong to other
     # users or sessions sharing that GPU. There is no VRAM to free on a hosted
-    # API, so abliteration never evicts.
-    if [[ "${cloud_provider}" != "abliteration" ]]; then
+    # API, so a cloud provider never evicts.
+    if ! hosted_provider "${cloud_provider}"; then
         ${opt_dry_run} || evict_other_models "${active_host}" "${resolved_model}" "${opt_evict}"
     fi
 
@@ -5827,6 +6271,17 @@ cmd_launch() {
         # Claude Code does not prompt about a "custom API key" it also sees.
         export ANTHROPIC_AUTH_TOKEN="${ablit_key}"
         unset ANTHROPIC_API_KEY
+    elif openai_backend "${cloud_provider}"; then
+        unset OLLAMA_HOST OLLAMA_BASE_URL CODEX_OSS_BASE_URL
+        # Stale wrapper endpoints must not redirect the native OpenAI login, and
+        # both backends take their base URL from kimi's config.toml (or from
+        # codex's own default), never from the environment.
+        unset OPENAI_BASE_URL OPENAI_API_BASE API_BASE
+    elif [[ "${cloud_provider}" == "dashscope" ]]; then
+        unset OLLAMA_HOST OLLAMA_BASE_URL
+        # The DashScope base URL reaches kimi through the KIMI_MODEL_* channel
+        # only; stale wrapper endpoints must not redirect it.
+        unset OPENAI_BASE_URL OPENAI_API_BASE API_BASE
     else
         export OLLAMA_HOST="${active_host}"
         export OLLAMA_BASE_URL="${active_host}"
@@ -5854,10 +6309,11 @@ cmd_launch() {
     # future one) can forget it; claude/qwen/opencode keep their own checks.
     # A selected cloud provider is the exception: its key is meant for that
     # endpoint, and scrubbing it would make every request 401.
-    if [[ "${cloud_provider}" != "abliteration" ]] && ! host_is_plain_local "${active_host}"; then
+    if ! hosted_provider "${cloud_provider}" && ! host_is_plain_local "${active_host}"; then
         export OPENAI_API_KEY="ollama"
         export ANTHROPIC_API_KEY="ollama"
         unset ANTHROPIC_AUTH_TOKEN CURSOR_API_KEY
+        unset CODEX_API_KEY CODEX_AUTH_TOKEN CODEX_ACCESS_TOKEN DASHSCOPE_API_KEY MODELSTUDIO_API_KEY
     fi
 
     local cli_cmd="${EXTERNAL_CLI_MAP[$provider]:-}"
@@ -5866,7 +6322,7 @@ cmd_launch() {
     # The tuning registry is keyed by Ollama tag and its num_ctx/num_gpu/...
     # options are daemon parameters, so it does not apply to a hosted API.
     local tp=""
-    if [[ "${cloud_provider}" != "abliteration" ]]; then
+    if ! hosted_provider "${cloud_provider}"; then
         tp=$(tuned_params "${resolved_model}" || true)
         if [[ -n "${tp}" ]]; then
             local nctx
@@ -5874,7 +6330,7 @@ cmd_launch() {
             if [[ -n "${nctx}" ]]; then
                 export OLLAMA_CONTEXT_LENGTH="${nctx}"
             fi
-            echo "${C_DIM}[*] Tuned defaults for '${resolved_model}': $(echo "${tp}" | jq -c .)${C_RESET}"
+            echo "${C_DIM}[*] Tuned defaults for '${resolved_model}': $(echo "${tp}" | jq -c .)${C_RESET}" >&2
         fi
 
         if [[ -n "${opt_launch_ctx}" ]]; then
@@ -5893,6 +6349,41 @@ cmd_launch() {
             cli_available=1
         fi
     fi
+    if openai_backend "${cloud_provider}" && [[ "${cli_available}" -eq 0 ]]; then
+        echo "${C_RED}Error: '${cli_cmd}' is not installed. Run '${0##*/} install ${provider}'.${C_RESET}" >&2
+        return 1
+    fi
+
+    # Build Codex argv once for execution and dry-run. Runtime flags belong
+    # after exec/resume/fork; review accepts provider/model via -c instead.
+    local -a codex_argv=(codex) codex_options=() codex_tail=("${cli_passthrough_args[@]}")
+    if [[ "${cli_cmd}" == codex ]]; then
+        local codex_idx=0
+        while ((codex_idx < ${#codex_tail[@]})); do
+            case "${codex_tail[codex_idx]}" in
+                -c|--config|-p|--profile|-s|--sandbox|-C|--cd|-i|--image|--add-dir|--enable|--disable|--remote|--remote-auth-token-env|-a|--ask-for-approval)
+                    ((codex_idx+=2)) ;;
+                -*) ((codex_idx+=1)) ;;
+                *) break ;;
+            esac
+        done
+        # --oss is the Ollama routing switch; an OpenAI backend must not get it.
+        hosted_provider "${cloud_provider}" || codex_options+=(--oss --local-provider ollama)
+        [[ -z "${resolved_model}" ]] || codex_options+=(--model "${resolved_model}")
+        [[ -z "${opt_launch_ctx}" ]] || codex_options+=(--config "model_context_window=${opt_launch_ctx}")
+        case "${codex_tail[codex_idx]:-}" in
+            exec|e|resume|fork)
+                codex_argv+=("${codex_tail[@]:0:codex_idx}" "${codex_tail[codex_idx]}" "${codex_options[@]}" "${codex_tail[@]:codex_idx+1}") ;;
+            review)
+                if ! hosted_provider "${cloud_provider}"; then
+                    codex_argv+=(--config 'model_provider="ollama"')
+                fi
+                [[ -z "${resolved_model}" ]] || codex_argv+=(--config "model=$(jq -nc --arg model "${resolved_model}" '$model')")
+                [[ -z "${opt_launch_ctx}" ]] || codex_argv+=(--config "model_context_window=${opt_launch_ctx}")
+                codex_argv+=("${codex_tail[@]}") ;;
+            *) codex_argv+=("${codex_options[@]}" "${codex_tail[@]}") ;;
+        esac
+    fi
 
     # --dry-run: report what would run and stop before anything with side
     # effects (no eviction above, no shim, no CLI config edits, no exec).
@@ -5901,7 +6392,7 @@ cmd_launch() {
         local -a dry_argv=()
         local kimi_slug="${active_host#*://}"
         case "${cli_cmd}" in
-            codex) dry_argv=(codex --oss --local-provider ollama --model "${resolved_model}") ;;
+            codex) dry_argv=("${codex_argv[@]}") ;;
             qwen) dry_argv=(qwen --openai-base-url "${active_host}/v1" --auth-type openai --model "${resolved_model}") ;;
             kimi) dry_argv=(kimi -m "ollama-${kimi_slug//[^a-zA-Z0-9]/-}/${resolved_model}") ;;
             cyberstrike) dry_argv=(cyberstrike --model "$([[ "${resolved_model}" == */* ]] && echo "${resolved_model}" || echo "ollama/${resolved_model}")") ;;
@@ -5917,18 +6408,36 @@ cmd_launch() {
                 kimi) dry_argv=(kimi) ;;
                 *) dry_argv=("${cli_cmd}" --model "${resolved_model}") ;;
             esac
+        elif openai_backend "${cloud_provider}"; then
+            case "${cli_cmd}" in
+                codex) dry_argv=("${codex_argv[@]}") ;;
+                kimi) dry_argv=(kimi -m "${resolved_model}") ;;
+                *) dry_argv=("${cli_cmd}" --model "${resolved_model}") ;;
+            esac
+        elif [[ "${cloud_provider}" == "dashscope" ]]; then
+            case "${cli_cmd}" in
+                kimi) dry_argv=(kimi) ;;
+                *) dry_argv=("${cli_cmd}" --model "${resolved_model}") ;;
+            esac
         fi
         [[ "${cli_available}" -eq 1 || -z "${cli_cmd}" ]] || dry_argv=(ollama run "${resolved_model}")
-        dry_argv+=("${cli_passthrough_args[@]}")
+        [[ "${cli_cmd}" == codex && "${cli_available}" -eq 1 ]] || dry_argv+=("${cli_passthrough_args[@]}")
         _dry_secret() { # <var>: never print a credential
             if [[ -z "${!1+x}" ]]; then echo "<unset>"
             elif [[ "${!1}" == "ollama" ]]; then echo "ollama (placeholder)"
             elif [[ "${cloud_provider}" == "abliteration" ]]; then echo "<kept: real value, abliteration.ai provider>"
+            elif [[ "${cloud_provider}" == "codex" ]]; then echo "<kept: real value, codex token/key>"
+            elif [[ "${cloud_provider}" == "openai" ]]; then echo "<kept: real value, OpenAI platform key>"
+            elif [[ "${cloud_provider}" == "dashscope" ]]; then echo "<kept: real value, DashScope key>"
             else echo "<kept: real value, plain local host>"; fi
         }
         local -a env_names=(OLLAMA_HOST OPENAI_BASE_URL ANTHROPIC_BASE_URL OLLAMA_CONTEXT_LENGTH)
-        local -a secret_names=(OPENAI_API_KEY ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN CURSOR_API_KEY)
+        local -a secret_names=(OPENAI_API_KEY ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN CURSOR_API_KEY CODEX_API_KEY CODEX_AUTH_TOKEN CODEX_ACCESS_TOKEN)
         [[ "${cloud_provider}" == "abliteration" ]] && secret_names+=(ABLITERATION_API_KEY)
+        [[ "${cloud_provider}" == "dashscope" ]] && secret_names+=(DASHSCOPE_API_KEY MODELSTUDIO_API_KEY)
+        if openai_backend "${cloud_provider}"; then
+            env_names+=(CODEX_OSS_BASE_URL)
+        fi
         local n
         if [[ "${OPT_JSON:-false}" == "true" ]]; then
             local env_json='{}'
@@ -5952,11 +6461,16 @@ cmd_launch() {
             echo "${C_BOLD}kimo launch ${provider} --dry-run${C_RESET} (nothing is started or changed)"
             echo "  provider: ${cloud_provider:-ollama}"
             echo "  host   : ${active_host}"
-            echo "  model  : ${resolved_model}"
+            echo "  model  : ${resolved_model:-<Codex default>}"
             if [[ "${cloud_provider}" == "abliteration" ]]; then
                 echo "  evict  : n/a (hosted API, no VRAM to free)"
                 echo "  context: ${ablit_ctx} tokens"
                 echo "  caps   : ${ablit_caps}"
+            elif [[ "${cloud_provider}" == "dashscope" ]]; then
+                echo "  evict  : n/a (hosted API, no VRAM to free)"
+                echo "  context: ${opt_launch_ctx:-${DASHSCOPE_DEFAULT_CTX}} tokens"
+            elif hosted_provider "${cloud_provider}"; then
+                echo "  evict  : n/a (hosted API, no VRAM to free)"
             else
                 echo "  evict  : ${opt_evict} (other loaded models are left alone in a dry run)"
             fi
@@ -5974,6 +6488,10 @@ cmd_launch() {
                 kimi|grok|agy|cyberstrike)
                     if [[ "${cloud_provider}" == "abliteration" ]]; then
                         echo "  ${C_DIM}(kimi gets a zero-footprint KIMI_MODEL_* env provider; no config.toml is written)${C_RESET}"
+                    elif [[ "${cloud_provider}" == "dashscope" ]]; then
+                        echo "  ${C_DIM}(kimi gets a zero-footprint KIMI_MODEL_* env provider; no config.toml is written)${C_RESET}"
+                    elif openai_backend "${cloud_provider}"; then
+                        echo "  ${C_DIM}(Kimi's ${cloud_provider}/ aliases are synced at launch; this dry run writes no config)${C_RESET}"
                     else
                         echo "  ${C_DIM}(${cli_cmd} also gets session config at launch: kimi aliases, grok context_window, agy shim, cyberstrike provider)${C_RESET}"
                     fi
@@ -5984,7 +6502,7 @@ cmd_launch() {
     fi
 
     if [[ "${cli_available}" -eq 1 ]]; then
-        echo "${C_GREEN}[*] Launching external CLI '${cli_cmd}' (Model: ${resolved_model}, Host: ${active_host})...${C_RESET}"
+        echo "${C_GREEN}[*] Launching external CLI '${cli_cmd}' (Model: ${resolved_model:-Codex default}, Host: ${active_host})...${C_RESET}" >&2
         case "${cli_cmd}" in
             claude)
                 # Same token-scrub rule as qwen: claude sends ANTHROPIC_API_KEY
@@ -6025,8 +6543,13 @@ cmd_launch() {
                 exec "${cli_cmd}" --model "${resolved_model}" "${cli_passthrough_args[@]}"
                 ;;
             codex)
+                # An OpenAI backend needs no wrapper endpoint: codex reaches
+                # api.openai.com (platform key) or its ChatGPT login natively.
+                if openai_backend "${cloud_provider}"; then
+                    exec "${codex_argv[@]}"
+                fi
                 export CODEX_OSS_BASE_URL="${active_host}/v1"
-                exec "${cli_cmd}" --oss --local-provider ollama --model "${resolved_model}" "${cli_passthrough_args[@]}"
+                exec "${codex_argv[@]}"
                 ;;
             qwen)
                 export OPENAI_MODEL="${resolved_model}"
@@ -6083,6 +6606,27 @@ cmd_launch() {
                 exit "${grok_rc}"
                 ;;
             kimi)
+                if openai_backend "${cloud_provider}"; then
+                    # Both OpenAI backends route through config.toml: kimi needs a
+                    # [providers.<backend>] entry (base_url plus the NAME of the
+                    # env var holding the credential) and an alias for the
+                    # launched model. The credential itself stays in the
+                    # environment, so nothing secret is written to disk.
+                    if [[ "${cloud_provider}" == codex ]]; then
+                        _resolve_codex_auth
+                        _codex_sync_kimi "${resolved_model}" >&2 || return 1
+                        echo "${C_DIM}[*] kimi on codex provider: ${resolved_model} (ChatGPT OAuth, renewed as needed)${C_RESET}" >&2
+                    else
+                        _openai_sync_kimi "${resolved_model}" >&2 || return 1
+                        echo "${C_DIM}[*] kimi on openai provider: ${resolved_model} (platform API key)${C_RESET}" >&2
+                    fi
+                    unset KIMI_MODEL_NAME KIMI_MODEL_API_KEY KIMI_MODEL_PROVIDER_TYPE \
+                        KIMI_MODEL_BASE_URL KIMI_MODEL_MAX_CONTEXT_SIZE KIMI_MODEL_CAPABILITIES \
+                        KIMI_MODEL_REASONING_KEY KIMI_MODEL_THINKING_EFFORT
+                    export KIMI_DISABLE_TELEMETRY="${KIMI_DISABLE_TELEMETRY:-1}"
+                    export KIMI_CODE_NO_AUTO_UPDATE="${KIMI_CODE_NO_AUTO_UPDATE:-1}"
+                    exec "${cli_cmd}" -m "${resolved_model}" "${cli_passthrough_args[@]}"
+                fi
                 if [[ "${cloud_provider}" == "abliteration" ]]; then
                     # abliteration.ai path: the KIMI_MODEL_* env channel only.
                     # A config.toml alias would have to store a third-party API
@@ -6117,6 +6661,32 @@ cmd_launch() {
                         echo "${C_DIM}[*] -W/--webbridge is a Moonshot-quota fallback; abliteration.ai serves its own server-side web_search tool.${C_RESET}"
                     fi
                     echo "${C_DIM}[*] kimi on abliteration.ai '${resolved_model}' via ${ablit_openai_url} (context ${ablit_ctx}, caps ${KIMI_MODEL_CAPABILITIES}, effort ${kimi_ablit_effort})${C_RESET}"
+                    exec "${cli_cmd}" "${cli_passthrough_args[@]}"
+                fi
+                if [[ "${cloud_provider}" == "dashscope" ]]; then
+                    # DashScope path: the KIMI_MODEL_* env channel only, exactly
+                    # like abliteration - a config.toml alias would store a
+                    # third-party API key in plaintext on disk, and kimi's own
+                    # config is deliberately left alone. There is no /api/show
+                    # to probe: the context window and capabilities come from
+                    # the endpoint's documented limits.
+                    unset KIMI_MODEL_NAME KIMI_MODEL_API_KEY KIMI_MODEL_PROVIDER_TYPE \
+                        KIMI_MODEL_BASE_URL KIMI_MODEL_MAX_CONTEXT_SIZE KIMI_MODEL_CAPABILITIES \
+                        KIMI_MODEL_REASONING_KEY KIMI_MODEL_THINKING_EFFORT
+                    export KIMI_DISABLE_TELEMETRY="${KIMI_DISABLE_TELEMETRY:-1}"
+                    export KIMI_CODE_NO_AUTO_UPDATE="${KIMI_CODE_NO_AUTO_UPDATE:-1}"
+                    export KIMI_MODEL_NAME="${resolved_model}"
+                    export KIMI_MODEL_PROVIDER_TYPE="openai"
+                    export KIMI_MODEL_BASE_URL="${active_host}"
+                    export KIMI_MODEL_API_KEY="${dashscope_key}"
+                    export KIMI_MODEL_MAX_CONTEXT_SIZE="${opt_launch_ctx:-${DASHSCOPE_DEFAULT_CTX}}"
+                    export KIMI_MODEL_CAPABILITIES="${KIMO_KIMI_CAPABILITIES:-thinking,tool_use}"
+                    # DashScope returns its reasoning trace as
+                    # 'reasoning_content' on /v1/chat/completions - the field
+                    # kimi auto-detects, unlike Ollama's 'reasoning'.
+                    export KIMI_MODEL_REASONING_KEY="${KIMO_KIMI_REASONING_KEY:-reasoning_content}"
+                    export KIMI_MODEL_THINKING_EFFORT="${KIMO_KIMI_EFFORT:-${OM_KIMI_EFFORT:-high}}"
+                    echo "${C_DIM}[*] kimi on DashScope '${resolved_model}' via ${active_host} (context ${KIMI_MODEL_MAX_CONTEXT_SIZE}, caps ${KIMI_MODEL_CAPABILITIES}, effort ${KIMI_MODEL_THINKING_EFFORT})${C_RESET}"
                     exec "${cli_cmd}" "${cli_passthrough_args[@]}"
                 fi
                 # kimi (Kimi Code CLI). Two routing paths, tried in order:
@@ -8397,7 +8967,7 @@ _kimo() {
         cword=$COMP_CWORD
     fi
 
-    local commands="list ls search find ps top warm preload stop unload tune set-ctx param bench eval benchmark info show tag alias rm delete pull download sync run launch install setup update upgrade doctor diagnose diag config cfg completion freetier free-tier kimi-sync quota quotas quote tunnel gemini gemini-sync kimi-gemini version status health hosts init scan discover check ping stream logs status-report report rotate-token web help"
+    local commands="list ls search find ps top warm preload stop unload tune set-ctx param bench eval benchmark info show tag alias rm delete pull download sync run launch install setup update upgrade doctor diagnose diag config cfg completion freetier free-tier kimi-sync quota quotas quote tunnel gemini gemini-sync kimi-gemini codex codex-sync kimi-codex version status health hosts init scan discover check ping stream logs status-report report rotate-token web help"
     local global_opts="--remote --local --host --json --no-color -v --version -h --help"
     local supported_clis="claude grok kimi agy codex qwen cursor opencode cyberstrike openclaw hermes"
     local config_subcmds="get set unset list show path validate help"
@@ -8472,7 +9042,7 @@ _kimo() {
                 return 0
             fi
             if [[ "${prev}" == "--provider" ]]; then
-                COMPREPLY=( $(compgen -W "ollama abliteration" -- "${cur}") )
+                COMPREPLY=( $(compgen -W "ollama abliteration codex openai dashscope" -- "${cur}") )
                 return 0
             fi
             if [[ "${cur}" == -* ]]; then
@@ -8614,6 +9184,13 @@ _kimo() {
                 COMPREPLY=( $(compgen -W "--check-auth --dry-run --from-json --save-json --min-remaining --min-days-left --qwen-only --include --exclude --sort --limit --verify --verify-prune --verify-timeout --jobs --set-default --context-window --max-output --base-url --api-key --config --list-only --output-json --verbose -h --help" -- "${cur}") )
             fi
             ;;
+        codex|codex-sync|kimi-codex)
+            if [[ "${cur}" == -* ]]; then
+                COMPREPLY=( $(compgen -W "--status --token --export --sync --set-default --json -h --help" -- "${cur}") )
+            elif [[ $cword -eq $((cmd_idx + 1)) ]]; then
+                COMPREPLY=( $(compgen -W "status token export sync set-default login logout exec review resume fork mcp plugin app-server doctor update completion features help" -- "${cur}") )
+            fi
+            ;;
         doctor|diagnose|diag)
             if [[ "${cur}" == -* ]]; then
                 COMPREPLY=( $(compgen -W "--json -h --help" -- "${cur}") )
@@ -8694,6 +9271,7 @@ _kimo() {
         'sync:Replicate models across cluster hosts'
         'freetier:Sync Kimi config with Model Studio free-tier quotas'
         'gemini:Register Gemini API models in Kimi config'
+        'codex:Codex OAuth and session token bridge for Kimi Code and Codex CLI'
         'run:Run an Ollama model directly'
         'launch:Launch external agent CLI'
         'install:Install external LLM CLIs'
@@ -8747,7 +9325,7 @@ _kimo() {
                     _arguments \
                         '(-m --model)'{-m,--model}'[Target model name]:model:_kimo_models' \
                         '(-c --ctx --context)'{-c,--ctx,--context}'[Override context window length]:tokens:' \
-                        '--provider[Inference backend]:backend:(ollama abliteration)' \
+                        '--provider[Inference backend]:backend:(ollama abliteration codex openai dashscope)' \
                         '(-W --webbridge)'{-W,--webbridge}'[Inject WebBridge skill into session]' \
                         '(--evict --no-evict)'{--evict,--no-evict}'[Unload / keep other models on the host]' \
                         '--dry-run[Show routing plan, start nothing]' \
@@ -8824,6 +9402,16 @@ _kimo() {
                         '--list-only[Print selected ids and exit]' \
                         '--output-json[Emit JSON rows]' \
                         '--verbose[Verbose progress]' \
+                        '(-h --help)'{-h,--help}'[Show help]' && return 0
+                    ;;
+                codex|codex-sync|kimi-codex)
+                    _arguments \
+                        '--status[Display status snapshot]' \
+                        '--token[Print resolved CODEX_AUTH_TOKEN]' \
+                        '--export[Print export command for shell eval]' \
+                        '--sync[Synchronize Codex provider and models into Kimi config]' \
+                        '--set-default[Set default model in Kimi config]:model:' \
+                        '--json[Output in JSON format]' \
                         '(-h --help)'{-h,--help}'[Show help]' && return 0
                     ;;
                 tunnel)
@@ -9164,6 +9752,16 @@ _freetier_write_config() {
         [[ -n "${default_alias}" ]] && echo "${C_DIM}[dry-run] default_model -> ${default_alias}${C_RESET}" >&2
         printf '%s\n' "${rows}" | jq -r '.[].model'
         return 0
+    fi
+
+    # Full-file read-modify-write: hold the shared Kimi config lock so a
+    # concurrent codex/openai sync (which takes the same lock before its
+    # os.replace) can't land between our awk read and the final mv and have its
+    # model group silently stripped. Same fd/lock contract as _gemini_write_config.
+    if command -v flock >/dev/null 2>&1; then
+        ensure_private_dir "${KIMO_RUNTIME_DIR}" || return 1
+        exec 8>>"${KIMI_CONFIG_LOCK}"
+        flock 8
     fi
 
     candidate=$(mktemp) || return 1
@@ -9994,6 +10592,196 @@ cmd_gemini() {
 }
 
 # -----------------------------------------------------------------------------
+# Command: codex (Codex CLI OAuth & session token bridge for Kimi Code)
+# -----------------------------------------------------------------------------
+_codex_usage() {
+    cat <<EOF
+${C_BOLD}kimo codex${C_RESET} - manage Codex CLI authentication and Kimi Code integration
+
+${C_YELLOW}Description:${C_RESET}
+  Inspect Codex CLI OAuth session tokens (~/.codex/auth.json), environment variables,
+  and synchronize Codex provider and models into Kimi Code configuration (~/.kimi-code/config.toml).
+
+  An expired ChatGPT OAuth token is renewed from auth.json's refresh_token - the
+  same call the Codex CLI makes - whenever 'launch --provider codex', '--token' or
+  '--export' needs a working credential. The renewed token is written back to
+  auth.json (owner-only, atomically, and never printed); set
+  KIMO_CODEX_NO_REFRESH=1 to keep kimo offline instead.
+
+${C_YELLOW}Usage:${C_RESET}
+  ${0##*/} codex [options]
+  ${0##*/} codex <native-command> [args]  ${C_DIM}# Forward directly to Codex (login, exec, resume, mcp, ...)${C_RESET}
+  ${0##*/} codex status            ${C_DIM}# Display Codex authentication and model status${C_RESET}
+  ${0##*/} codex token             ${C_DIM}# Print resolved CODEX_AUTH_TOKEN (renewed if stale)${C_RESET}
+  ${0##*/} codex sync              ${C_DIM}# Ensure [providers.codex] and models exist in Kimi config${C_RESET}
+  ${0##*/} codex set-default [M]   ${C_DIM}# Set default Kimi model (default: cached Codex model)${C_RESET}
+
+${C_YELLOW}Options:${C_RESET}
+  --status                Display status snapshot (default)
+  --token                 Print resolved CODEX_AUTH_TOKEN
+  --export                Print 'export CODEX_AUTH_TOKEN=...' command for shell eval
+  --sync                  Synchronize models from Codex's local models_cache.json into Kimi config
+  --set-default [MODEL]   Set default model in Kimi config (default: cached Codex model)
+  --json                  Output in JSON format
+  -h, --help              Show this help
+
+${C_YELLOW}Environment Variables:${C_RESET}
+  CODEX_AUTH_TOKEN        ChatGPT OAuth bearer token for the codex backend
+  CODEX_API_KEY           Native Codex exec API key; JWT values also bridge to Kimi
+  OPENAI_API_KEY          OpenAI Platform API key (sk-...), used by '--provider openai'
+  CODEX_HOME              Codex config directory (default: ~/.codex)
+  KIMO_CODEX_NO_REFRESH   Set 1 to never renew an expired OAuth token
+  KIMO_CODEX_TOKEN_URL    Override the OAuth token endpoint (default: auth.openai.com)
+
+${C_YELLOW}Examples:${C_RESET}
+  ${0##*/} codex
+  ${0##*/} codex --token
+  eval \$(${0##*/} codex --export)
+  ${0##*/} codex --sync
+  ${0##*/} codex --set-default codex/gpt-6.1-sol
+  ${0##*/} codex login --device-auth
+  ${0##*/} codex exec --json 'Review this repository'
+  ${0##*/} launch kimi --provider openai --model gpt-5.1-codex  ${C_DIM}# metered platform key instead${C_RESET}
+EOF
+    return 0
+}
+
+# Resolve helpers from a checkout, development symlink, or installed share dir.
+# Credential values stay in the environment, never in argv.
+_codex_helper() {
+    local source_dir candidate
+    source_dir=$(python3 -c 'import os,sys; print(os.path.dirname(os.path.realpath(sys.argv[1])))' "${BASH_SOURCE[0]}") || return 1
+    for candidate in "${KIMO_CODEX_HELPER:-}" "${source_dir}/lib/kimo-codex.py" \
+        "${SCRIPT_DIR}/../share/kimo/kimo-codex.py" \
+        "${PREFIX:-/usr/local}/share/kimo/kimo-codex.py"; do
+        if [[ -n "${candidate}" && -f "${candidate}" ]]; then
+            CODEX_HOME="${CODEX_HOME}" KIMI_CONFIG="${KIMI_CONFIG}" python3 "${candidate}" "$@"
+            return $?
+        fi
+    done
+    echo "Error: kimo-codex.py is missing; reinstall kimo." >&2
+    return 1
+}
+
+_codex_show_status() {
+    local -a options=()
+    [[ "${1:-false}" == true ]] && options+=(--json)
+    _codex_helper status "${options[@]}"
+}
+
+_codex_sync_kimi() (
+    mkdir -p "$(dirname "${KIMI_CONFIG_LOCK}")" || return 1
+    exec 9>>"${KIMI_CONFIG_LOCK}" || return 1
+    flock -w 15 9 || { echo "Error: Kimi config is busy; retry the Codex sync." >&2; return 1; }
+    _codex_helper sync "$@"
+)
+
+# Same lock-and-upsert contract as _codex_sync_kimi, for the metered platform
+# provider: [providers.openai] plus openai/<slug> aliases, api_key_env naming
+# OPENAI_API_KEY so the key itself is never written to the config.
+_openai_sync_kimi() (
+    mkdir -p "$(dirname "${KIMI_CONFIG_LOCK}")" || return 1
+    exec 9>>"${KIMI_CONFIG_LOCK}" || return 1
+    flock -w 15 9 || { echo "Error: Kimi config is busy; retry the OpenAI sync." >&2; return 1; }
+    _codex_helper sync-openai "$@"
+)
+
+cmd_codex() {
+    # Bridge actions are reserved; everything else uses the native CLI with
+    # its own config, login/refresh, stdin, stdout and exit status intact.
+    local native=false
+    case "${1:-}" in
+        ""|status|--status|token|--token|export|--export|sync|--sync|set-default|--set-default|--json|-h|--help) ;;
+        help) [[ $# -le 1 ]] || native=true ;;
+        *) native=true ;;
+    esac
+    if ${native}; then
+        if ! command -v codex >/dev/null 2>&1; then
+            echo "Error: Codex CLI is not installed. Run '${0##*/} install codex'." >&2
+            return 1
+        fi
+        exec codex "$@"
+    fi
+    local action="status"
+    local opt_json="${OPT_JSON:-false}"
+    local set_default_model=""
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            status|--status) action="status"; shift ;;
+            token|--token) action="token"; shift ;;
+            export|--export) action="export"; shift ;;
+            sync|--sync) action="sync"; shift ;;
+            set-default|--set-default)
+                action="set-default"
+                shift
+                if [[ $# -gt 0 && "$1" != -* ]]; then
+                    set_default_model="$1"
+                    shift
+                else
+                    set_default_model=$(_codex_helper default-model) || return 1
+                fi
+                ;;
+            --json) opt_json="true"; shift ;;
+            -h|--help|help) _codex_usage; return 0 ;;
+            *)
+                echo "${C_RED}Error: unknown option '$1' for kimo codex (try --help).${C_RESET}" >&2
+                return 1
+                ;;
+        esac
+    done
+
+    _resolve_codex_auth
+
+    case "${action}" in
+        status)
+            _codex_show_status "${opt_json}"
+            ;;
+        token)
+            # Hand out a credential that actually works: renew a stale token
+            # first, so 'eval $(kimo codex --export)' does not export a token
+            # that 401s on the first request. The renewal notice goes to stderr,
+            # leaving stdout pure for exactly this eval/pipe use.
+            _ensure_codex_token || return 1
+            if [[ "${opt_json}" == "true" ]]; then
+                python3 -c 'import json,os; print(json.dumps({"token": os.environ["CODEX_AUTH_TOKEN"]}))'
+            else
+                printf '%s\n' "${CODEX_AUTH_TOKEN}"
+            fi
+            ;;
+        export)
+            _ensure_codex_token || return 1
+            printf 'export CODEX_AUTH_TOKEN=%q\n' "${CODEX_AUTH_TOKEN}"
+            ;;
+        sync)
+            local -a sync_options=()
+            [[ "${opt_json}" == true ]] && sync_options+=(--json)
+            # Namespace selects the backend: an openai/<slug> model syncs the
+            # metered platform provider, everything else the ChatGPT codex one.
+            case "${set_default_model}" in
+                openai/*) _openai_sync_kimi "${set_default_model}" "${sync_options[@]}" ;;
+                *) _codex_sync_kimi "${set_default_model}" "${sync_options[@]}" ;;
+            esac
+            ;;
+        set-default)
+            local -a default_options=()
+            [[ "${opt_json}" == true ]] && default_options+=(--json)
+            case "${set_default_model}" in
+                openai/*)
+                    # 'kimo codex --set-default openai/gpt-x' must not be re-prefixed
+                    # to codex/openai/gpt-x; hand it to the openai sync as-is.
+                    _openai_sync_kimi "${set_default_model}" "${default_options[@]}"
+                    ;;
+                *)
+                    [[ "${set_default_model}" == codex/* ]] || set_default_model="codex/${set_default_model}"
+                    _codex_sync_kimi "${set_default_model}" "${default_options[@]}"
+                    ;;
+            esac
+            ;;
+    esac
+}
+
+# -----------------------------------------------------------------------------
 # Command: web (WebBridge real-browser relay & quota-free research)
 # -----------------------------------------------------------------------------
 # Single-quote one argument for a copy-pasteable shell command, so payloads
@@ -10722,7 +11510,7 @@ fi
 # With several --host values, read-only/aggregate commands query every host;
 # commands that act on one model go to the first host that has it (else the
 # first --host).
-if [[ "${HOST_MODE}" == "multi" ]]; then
+if [[ "${HOST_MODE}" == "multi" ]] && command_needs_remote "${COMMAND}"; then
     case "${COMMAND}" in
         check|ping|hosts|init|scan|discover|ps|top|list|ls|search|find|stop|unload|info|show|status|health|status-report|report|logs|log|rotate-token|rotate|install|setup|update|upgrade|doctor|diagnose|diag|config|cfg|completion|sync|freetier|free-tier|kimi-sync|gemini|gemini-sync|kimi-gemini|web|version|help|-h|--help|tunnel|quota|quotas|quote) ;;
         # rm finds each model's host itself (exact names, several models).
@@ -10886,6 +11674,12 @@ case "${COMMAND}" in
         ;;
     gemini|gemini-sync|kimi-gemini)
         cmd_gemini "${ARGS[@]}"
+        ;;
+    codex)
+        cmd_codex "${ARGS[@]}"
+        ;;
+    codex-sync|kimi-codex)
+        cmd_codex --sync "${ARGS[@]}"
         ;;
     web)
         cmd_web "${ARGS[@]}"
