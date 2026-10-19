@@ -598,6 +598,14 @@ check "the accepted backends are declared once" "ollama abliteration codex opena
 check_contains "Bash completion offers every backend" "${providers}" "${bash_completion}"
 check_contains "Zsh completion offers every backend" "${providers}" "$("${KIMO}" completion zsh)"
 check_contains "Zsh completion includes Codex bridge" '--sync[Synchronize Codex provider' "$("${KIMO}" completion zsh)"
+comp_script="${HARNESS_ROOT}/comp.bash"
+"${KIMO}" completion bash > "${comp_script}"
+comp_codex=$(CODEX_HOME="${HOME}/.codex" bash -c "source '${comp_script}'; COMP_WORDS=(kimo launch kimi --provider codex -m ''); COMP_CWORD=6; _kimo; printf '%s\n' \"\${COMPREPLY[@]}\"")
+check_contains "completion offers codex catalog models with --provider codex" "codex/gpt-6.1-sol" "${comp_codex}"
+check_not_contains "completion hides hidden catalog models" "codex/hidden-model" "${comp_codex}"
+comp_plain=$(CODEX_HOME="${HOME}/.codex" bash -c "source '${comp_script}'; COMP_WORDS=(kimo launch kimi -m ''); COMP_CWORD=4; _kimo; printf '%s\n' \"\${COMPREPLY[@]}\"")
+check_not_contains "no hosted aliases without --provider" "codex/gpt-6.1-sol" "${comp_plain}"
+check_contains "zsh completion embeds the hosted model helper" "_kimo_hosted_models" "$("${KIMO}" completion zsh)"
 
 echo
 harness_summary "codex_auth_test"

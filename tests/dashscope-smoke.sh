@@ -48,10 +48,28 @@ printf '{"native":true}\n'
 exit "${DASHSCOPE_TEST_RC:-0}"
 SH
 chmod +x "${FAKE_BIN}/kimi"
+cat > "${FAKE_BIN}/claude" <<'SH'
+#!/usr/bin/env bash
+{
+    printf 'ARGV\n'
+    printf '%s\n' "$@"
+    printf 'ENV\n'
+    for key in ANTHROPIC_BASE_URL ANTHROPIC_AUTH_TOKEN ANTHROPIC_API_KEY ANTHROPIC_MODEL \
+        ANTHROPIC_DEFAULT_HAIKU_MODEL ANTHROPIC_DEFAULT_SONNET_MODEL ANTHROPIC_DEFAULT_OPUS_MODEL \
+        CLAUDE_CODE_SUBAGENT_MODEL CLAUDE_CODE_MAX_CONTEXT_TOKENS; do
+        printf '%s=%s\n' "${key}" "${!key-<unset>}"
+    done
+} > "${DASHSCOPE_TEST_CAPTURE:?}"
+printf '{"native":true}\n'
+exit 0
+SH
+chmod +x "${FAKE_BIN}/claude"
 export PATH="${FAKE_BIN}:${PATH}"
 
 KEY="sk-dashscope-fixture-12345"
+SP_KEY="sk-sp-token-plan-fixture-67890"
 HOST="https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
+PLAN_HOST="https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1"
 
 echo "[*] [1] Routing and dry-run report"
 dry=$(DASHSCOPE_API_KEY="${KEY}" "${KIMO}" launch kimi --provider dashscope --dry-run)
@@ -82,12 +100,10 @@ DASHSCOPE_API_KEY=ollama "${KIMO}" launch kimi --provider dashscope --dry-run >/
 check "kimo's own placeholder is not sent to DashScope" 1 "${rc}"
 dry=$(MODELSTUDIO_API_KEY="${KEY}" "${KIMO}" launch kimi --provider dashscope --dry-run)
 check_contains "MODELSTUDIO_API_KEY is accepted" "provider: dashscope" "${dry}"
-rc=0
-only_sp=$(DASHSCOPE_API_KEY=sk-sp-dead-token-plan-fixture "${KIMO}" launch kimi --provider dashscope --dry-run 2>&1) || rc=$?
-check "a lone token-plan key fails" 1 "${rc}"
-check_contains "the failure names the token-plan class" "token-plan" "${only_sp}"
-mixed=$(DASHSCOPE_API_KEY=sk-sp-dead-token-plan-fixture MODELSTUDIO_API_KEY="${KEY}" "${KIMO}" launch kimi --provider dashscope --dry-run)
-check_contains "a token-plan key defers to the next variable" "provider: dashscope" "${mixed}"
+plan=$(DASHSCOPE_API_KEY="${SP_KEY}" "${KIMO}" launch kimi --provider dashscope --dry-run)
+check_contains "a token-plan key selects the plan surface" "host   : ${PLAN_HOST}" "${plan}"
+mixed=$(DASHSCOPE_API_KEY="${SP_KEY}" MODELSTUDIO_API_KEY="${KEY}" "${KIMO}" launch kimi --provider dashscope --dry-run)
+check_contains "the first set variable wins (plan)" "host   : ${PLAN_HOST}" "${mixed}"
 
 echo "[*] [4] Zero-footprint kimi env channel"
 DASHSCOPE_API_KEY="${KEY}" "${KIMO}" launch kimi --provider dashscope >/dev/null 2>&1
@@ -101,15 +117,15 @@ check "no Ollama host is exported" "<unset>" "$(env_val "${CAPTURE}" OLLAMA_HOST
 check "no kimi config is written" no "$([[ -f "${HOME}/.kimi-code/config.toml" ]] && echo yes || echo no)"
 DASHSCOPE_API_KEY="${KEY}" "${KIMO}" launch kimi --provider dashscope --ctx 4096 >/dev/null 2>&1
 check "--ctx reaches the env channel" "4096" "$(env_val "${CAPTURE}" KIMI_MODEL_MAX_CONTEXT_SIZE)"
-DASHSCOPE_API_KEY=sk-sp-dead-token-plan-fixture MODELSTUDIO_API_KEY="${KEY}" \
-    "${KIMO}" launch kimi --provider dashscope >/dev/null 2>&1
-check "the skipped token-plan key never reaches kimi" "${KEY}" "$(env_val "${CAPTURE}" KIMI_MODEL_API_KEY)"
+DASHSCOPE_API_KEY="${SP_KEY}" "${KIMO}" launch kimi --provider dashscope >/dev/null 2>&1
+check "the token-plan key reaches kimi on the plan surface" "${SP_KEY}" "$(env_val "${CAPTURE}" KIMI_MODEL_API_KEY)"
+check "kimi receives the plan base URL" "${PLAN_HOST}" "$(env_val "${CAPTURE}" KIMI_MODEL_BASE_URL)"
 
 echo "[*] [5] Precedence, supported CLIs and scrubbing"
 rc=0
-unsupported=$("${KIMO}" launch claude --provider dashscope --dry-run 2>&1) || rc=$?
+unsupported=$("${KIMO}" launch grok --provider dashscope --dry-run 2>&1) || rc=$?
 check "unsupported cloud CLI rejected" 1 "${rc}"
-check_contains "the rejection names the supported CLIs" "kimi" "${unsupported}"
+check_contains "the rejection names the supported CLIs" "claude kimi" "${unsupported}"
 "${KIMO}" config set cloud_provider dashscope >/dev/null
 check "config accepts dashscope" dashscope "$("${KIMO}" config get cloud_provider)"
 dry=$(DASHSCOPE_API_KEY="${KEY}" "${KIMO}" launch kimi --dry-run)
@@ -131,6 +147,49 @@ chmod +x "${FAKE_BIN}/curl"
 ( unset OLLAMA_REMOTE_URL; DASHSCOPE_API_KEY="${KEY}" "${KIMO}" --remote launch kimi --provider dashscope --dry-run >/dev/null )
 check "dashscope routing never probes Ollama" no "$([[ -f "${CAPTURE}.curl" ]] && echo yes || echo no)"
 rm -f "${FAKE_BIN}/curl"
+
+echo "[*] [7] Claude on the Model Studio surfaces"
+DASHSCOPE_API_KEY="${KEY}" "${KIMO}" launch claude --provider dashscope >/dev/null 2>&1
+check "claude gets the intl anthropic surface" "https://dashscope-intl.aliyuncs.com/apps/anthropic" "$(env_val "${CAPTURE}" ANTHROPIC_BASE_URL)"
+check "claude gets the bearer token" "${KEY}" "$(env_val "${CAPTURE}" ANTHROPIC_AUTH_TOKEN)"
+check "claude's x-api-key is unset" "<unset>" "$(env_val "${CAPTURE}" ANTHROPIC_API_KEY)"
+check "claude defaults to the opus mapping on intl" "qwen3.8-max" "$(env_val "${CAPTURE}" ANTHROPIC_MODEL)"
+check "haiku tier maps to qwen3.6-flash" "qwen3.6-flash" "$(env_val "${CAPTURE}" ANTHROPIC_DEFAULT_HAIKU_MODEL)"
+check "sonnet tier maps to qwen3.8-flash" "qwen3.8-flash" "$(env_val "${CAPTURE}" ANTHROPIC_DEFAULT_SONNET_MODEL)"
+check "opus tier maps to qwen3.8-max" "qwen3.8-max" "$(env_val "${CAPTURE}" ANTHROPIC_DEFAULT_OPUS_MODEL)"
+check "subagents stay on the surface" "auto" "$(env_val "${CAPTURE}" CLAUDE_CODE_SUBAGENT_MODEL)"
+check "claude context is 983616" "983616" "$(env_val "${CAPTURE}" CLAUDE_CODE_MAX_CONTEXT_TOKENS)"
+DASHSCOPE_API_KEY="${SP_KEY}" "${KIMO}" launch claude --provider dashscope -m qwen3.8-max >/dev/null 2>&1
+check "claude gets the plan anthropic surface" "https://token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic" "$(env_val "${CAPTURE}" ANTHROPIC_BASE_URL)"
+check "explicit model reaches ANTHROPIC_MODEL" "qwen3.8-max" "$(env_val "${CAPTURE}" ANTHROPIC_MODEL)"
+DASHSCOPE_API_KEY="${SP_KEY}" "${KIMO}" launch claude --provider dashscope >/dev/null 2>&1
+check "claude defaults to auto on the plan surface" "auto" "$(env_val "${CAPTURE}" ANTHROPIC_MODEL)"
+rc=0
+nokey_claude=$("${KIMO}" launch claude --provider dashscope --dry-run 2>&1) || rc=$?
+check "claude has no freetier fallback" 1 "${rc}"
+check_contains "the fallback refusal names the env vars" "DASHSCOPE_API_KEY" "${nokey_claude}"
+
+echo "[*] [8] Free-tier fallback via kimi's freetier block"
+FT_CONFIG="${HARNESS_ROOT}/ft/config.toml"
+mkdir -p "$(dirname "${FT_CONFIG}")"
+cat > "${FT_CONFIG}" <<'TOML'
+default_model = "alibaba/qwen3-coder-flash-2025-07-28"
+[providers.alibaba]
+type = "openai"
+base_url = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
+api_key = "sk-ws-fixture-stored-key"
+[models."alibaba/qwen3-coder-flash-2025-07-28"]
+provider = "alibaba"
+model = "qwen3-coder-flash-2025-07-28"
+max_context_size = 131072
+max_output_size = 32768
+TOML
+ft=$(KIMI_CONFIG="${FT_CONFIG}" "${KIMO}" launch kimi --provider dashscope --dry-run)
+check_contains "fallback rides the freetier alias" "model  : alibaba/qwen3-coder-flash-2025-07-28" "${ft}"
+check_contains "fallback notes kimi's own provider" "freetier-managed [providers.alibaba]" "${ft}"
+KIMI_CONFIG="${FT_CONFIG}" "${KIMO}" launch kimi --provider dashscope >/dev/null 2>&1
+check "fallback launches kimi with the alias" "alibaba/qwen3-coder-flash-2025-07-28" "$(flag_val "${CAPTURE}" -m)"
+check "fallback exports no KIMI_MODEL key" "<unset>" "$(env_val "${CAPTURE}" KIMI_MODEL_API_KEY)"
 
 echo
 harness_summary "dashscope_smoke"

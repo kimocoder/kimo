@@ -339,7 +339,43 @@ DASHSCOPE_DEFAULT_MODEL="qwen3.8-max"
 # it; --ctx and KIMO_DASHSCOPE_CTX override.
 DASHSCOPE_DEFAULT_CTX="${KIMO_DASHSCOPE_CTX:-1000000}"
 # CLIs whose launch branch knows how to reach DashScope.
-DASHSCOPE_CLIS="kimi"
+DASHSCOPE_CLIS="claude kimi"
+# The token-plan (subscription) surface. Key class picks the surface: sk-sp-
+# keys belong here and 401 on pay-as-you-go intl, sk-ws-/sk- keys the other
+# way round. Both surfaces also speak the Anthropic wire under /apps/anthropic
+# (verified 2026-10-19), which is what claude rides.
+DASHSCOPE_PLAN_ORIGIN="${KIMO_DASHSCOPE_PLAN_BASE_URL:-https://token-plan.ap-southeast-1.maas.aliyuncs.com}"
+# Claude tier mapping for the Model Studio surfaces (user-supplied 2026-10-19):
+# tier and subagent requests stay on the surface instead of falling back to
+# real Anthropic ids these keys cannot serve.
+DASHSCOPE_CLAUDE_HAIKU="${KIMO_DASHSCOPE_CLAUDE_HAIKU:-qwen3.6-flash}"
+DASHSCOPE_CLAUDE_SONNET="${KIMO_DASHSCOPE_CLAUDE_SONNET:-qwen3.8-flash}"
+DASHSCOPE_CLAUDE_OPUS="${KIMO_DASHSCOPE_CLAUDE_OPUS:-qwen3.8-max}"
+DASHSCOPE_CLAUDE_MAX_CONTEXT="${KIMO_DASHSCOPE_CLAUDE_MAX_CONTEXT:-983616}"
+
+# First freetier-managed kimi alias with remaining free quota: default_model
+# when it is one, else the first alibaba/ entry. Prints nothing and returns 1
+# when the kimi config has no freetier block to ride.
+_kimi_freetier_alias() {
+    python3 - "${KIMI_CONFIG}" 2>/dev/null <<'PY'
+import sys
+try:
+    import tomlkit
+    doc = tomlkit.parse(open(sys.argv[1]).read())
+except (OSError, ValueError, ImportError):
+    sys.exit(1)
+models = doc.get("models", {})
+default = doc.get("default_model", "")
+if isinstance(default, str) and default.startswith("alibaba/") and default in models:
+    print(default)
+    sys.exit(0)
+for key in models:
+    if isinstance(key, str) and key.startswith("alibaba/"):
+        print(key)
+        sys.exit(0)
+sys.exit(1)
+PY
+}
 
 # Backend names 'launch --provider' accepts, in the order they are offered by
 # completion and listed in errors. 'none' and '' are synonyms for ollama.
@@ -5800,16 +5836,26 @@ ${C_YELLOW}Cloud Provider: OpenAI (--provider codex | --provider openai):${C_RES
   forbid the OAuth renewal (kimo then needs an already valid token).
 
 ${C_YELLOW}Cloud Provider: DashScope (--provider dashscope):${C_RESET}
-  ${DASHSCOPE_BACKEND_URL}
-  Alibaba Model Studio's international OpenAI-compatible surface, billed
-  pay-as-you-go and authenticated with an sk- key from \$DASHSCOPE_API_KEY
-  (MODELSTUDIO_API_KEY is accepted too). Wired for ${C_BOLD}${DASHSCOPE_CLIS}${C_RESET}; every other
-  CLI stays on Ollama routing. kimi rides its zero-footprint KIMI_MODEL_* env
-  channel, so nothing is written to kimi's config and the key never reaches
-  argv or disk. Without -m the default model is ${DASHSCOPE_DEFAULT_MODEL}
-  (context ${DASHSCOPE_DEFAULT_CTX} tokens; --ctx or \$KIMO_DASHSCOPE_CTX override).
-  Like every hosted backend it skips host probing, Ollama tag resolution,
-  eviction and tune settings.
+  Two Model Studio surfaces; the key's class picks one:
+  ${C_CYAN}intl${C_RESET}  ${DASHSCOPE_BACKEND_URL}
+          Pay-as-you-go, for sk-ws-/sk- keys from \$DASHSCOPE_API_KEY
+          (MODELSTUDIO_API_KEY is accepted too).
+  ${C_CYAN}plan${C_RESET}  ${DASHSCOPE_PLAN_ORIGIN}/compatible-mode/v1
+          The token-plan subscription surface, for sk-sp- keys (which 401
+          on intl, and vice versa).
+  Wired for ${C_BOLD}${DASHSCOPE_CLIS}${C_RESET}; every other CLI stays on Ollama routing. kimi rides its
+  zero-footprint KIMI_MODEL_* env channel, so nothing is written to kimi's
+  config and the key never reaches argv or disk. claude rides each surface's
+  Anthropic-compatible /apps/anthropic endpoint with the tier mapping
+  haiku=${DASHSCOPE_CLAUDE_HAIKU}, sonnet=${DASHSCOPE_CLAUDE_SONNET}, opus=${DASHSCOPE_CLAUDE_OPUS}
+  (subagents 'auto', context ${DASHSCOPE_CLAUDE_MAX_CONTEXT}), so its internal
+  requests stay on models these keys can serve. Without -m the default model
+  is ${DASHSCOPE_DEFAULT_MODEL} (context ${DASHSCOPE_DEFAULT_CTX} tokens; --ctx or \$KIMO_DASHSCOPE_CTX
+  override); claude defaults to 'auto'. With no usable env key at all, kimi
+  falls back to the freetier-managed [providers.alibaba] aliases (free-quota
+  models, kimi's own stored credential) - 'bl auth login --console' plus
+  '${0##*/} freetier' keeps that block fresh. Like every hosted backend it
+  skips host probing, Ollama tag resolution, eviction and tune settings.
 
 ${C_YELLOW}CLI Integration Mechanics:${C_RESET}
   ${C_BOLD}agy${C_RESET}          Google Antigravity CLI speaks only the Gemini wire protocol. A per-session
@@ -5868,6 +5914,9 @@ ${C_YELLOW}Environment Overrides:${C_RESET}
   DASHSCOPE_API_KEY           DashScope sk- key; the credential for '--provider dashscope'
   KIMO_DASHSCOPE_BASE_URL     Override the DashScope compatible-mode origin
   KIMO_DASHSCOPE_CTX          Override the DashScope default context window in tokens
+  KIMO_DASHSCOPE_PLAN_BASE_URL  Override the token-plan surface origin
+  KIMO_DASHSCOPE_CLAUDE_HAIKU / _SONNET / _OPUS  Claude tier mapping on Model Studio
+  KIMO_DASHSCOPE_CLAUDE_MAX_CONTEXT  Claude context tokens on Model Studio
   KIMO_KIMI_CONTEXT         Override Kimi model max context size in tokens (or 'kimo config set kimi_context <N>')
   KIMO_CONTEXT              Global context window override in tokens for external CLIs
   KIMO_KIMI_EFFORT          Default thinking effort (low, medium, high, xhigh, max)
@@ -5913,6 +5962,8 @@ ${C_YELLOW}Examples:${C_RESET}
   ${C_DIM}# DashScope (Alibaba Model Studio): export DASHSCOPE_API_KEY=sk-... first${C_RESET}
   ${0##*/} launch kimi --provider dashscope
   ${0##*/} launch kimi --provider dashscope --model qwen3-coder-plus
+  ${0##*/} launch claude --provider dashscope            ${C_DIM}# Anthropic wire on /apps/anthropic${C_RESET}
+  ${0##*/} launch kimi --provider dashscope              ${C_DIM}# no env key: rides kimi's freetier block${C_RESET}
 EOF
 }
 
@@ -6146,33 +6197,58 @@ cmd_launch() {
             echo "${C_DIM}    Those CLIs are wired for a self-hosted Ollama host. Drop --provider to route '${provider}' to Ollama.${C_RESET}" >&2
             return 1
         fi
-        # A token-plan-class key (sk-sp-...) is bound to the subscription
-        # surface and 401s on the pay-as-you-go intl endpoint, so it never
-        # selects it: the next variable in line gets the chance instead.
-        local dashscope_var="" dashscope_skipped=""
+        # The key's class picks the surface: token-plan keys (sk-sp-...) belong
+        # to the subscription endpoint and 401 on pay-as-you-go intl, sk-ws-/
+        # sk- keys the other way round.
+        local dashscope_var="" dashscope_surface=""
         for dashscope_var in DASHSCOPE_API_KEY MODELSTUDIO_API_KEY; do
-            [[ -n "${!dashscope_var:-}" ]] || continue
-            if [[ "${!dashscope_var}" == sk-sp-* ]]; then
-                dashscope_skipped="${dashscope_var}"
-                continue
-            fi
+            [[ -n "${!dashscope_var:-}" && "${!dashscope_var}" != "ollama" ]] || continue
             dashscope_key="${!dashscope_var}"
             break
         done
-        if [[ -z "${dashscope_key}" || "${dashscope_key}" == "ollama" ]]; then
-            echo "${C_RED}Error: '--provider dashscope' needs a DashScope API key, and none was found.${C_RESET}" >&2
-            echo "${C_DIM}    Export DASHSCOPE_API_KEY=sk-... (MODELSTUDIO_API_KEY is accepted too).${C_RESET}" >&2
-            if [[ -n "${dashscope_skipped}" ]]; then
-                echo "${C_DIM}    ${dashscope_skipped} holds a token-plan key (sk-sp-...), which ${DASHSCOPE_BACKEND_URL} rejects; export a pay-as-you-go key instead.${C_RESET}" >&2
+        if [[ -n "${dashscope_key}" ]]; then
+            if [[ "${dashscope_key}" == sk-sp-* ]]; then
+                dashscope_surface="plan"
+                active_host="${DASHSCOPE_PLAN_ORIGIN}/compatible-mode/v1"
+            else
+                dashscope_surface="intl"
+                active_host="${DASHSCOPE_BACKEND_URL}"
             fi
+            if [[ "${provider}" == claude ]] && ! ${opt_model_explicit}; then
+                # 'auto' exists only on the token-plan surface; intl answers it
+                # with 403 AccessDenied, so claude's main slot falls back to
+                # the opus tier mapping there.
+                if [[ "${dashscope_surface}" == plan ]]; then
+                    resolved_model="auto"
+                else
+                    resolved_model="${DASHSCOPE_CLAUDE_OPUS}"
+                fi
+            elif ! ${opt_model_explicit} || [[ -z "${target_model}" || "${target_model}" == kimi || "${target_model}" == claude ]]; then
+                resolved_model="${DASHSCOPE_DEFAULT_MODEL}"
+            else
+                resolved_model="${target_model#dashscope/}"
+            fi
+        elif [[ "${provider}" == kimi ]] && { ! ${opt_model_explicit} || [[ "${target_model}" == alibaba/* ]]; }; then
+            # No usable env key: kimi can still ride the freetier-managed
+            # [providers.alibaba] block (quota-verified models, kimi's own
+            # stored credential), so the launch needs no secret from us.
+            dashscope_surface="freetier"
+            active_host="${KIMI_FT_BASE_URL_DEFAULT}"
+            if ${opt_model_explicit}; then
+                resolved_model="${target_model}"
+            elif ! resolved_model=$(_kimi_freetier_alias); then
+                resolved_model=""
+            fi
+            if [[ -z "${resolved_model}" ]]; then
+                echo "${C_RED}Error: '--provider dashscope' needs a DashScope API key, and none was found.${C_RESET}" >&2
+                echo "${C_DIM}    Export DASHSCOPE_API_KEY=sk-... (MODELSTUDIO_API_KEY is accepted too), or sync the free-tier block: 'bl auth login --console --console-site international' then '${0##*/} freetier'.${C_RESET}" >&2
+                return 1
+            fi
+        else
+            echo "${C_RED}Error: '--provider dashscope' needs a DashScope API key, and none was found.${C_RESET}" >&2
+            echo "${C_DIM}    Export DASHSCOPE_API_KEY=sk-... (MODELSTUDIO_API_KEY is accepted too), or sync the free-tier block: 'bl auth login --console --console-site international' then '${0##*/} freetier'.${C_RESET}" >&2
             echo "${C_DIM}    The key stays in the environment: kimi's KIMI_MODEL_* channel references it by name, never on disk.${C_RESET}" >&2
             return 1
-        fi
-        active_host="${DASHSCOPE_BACKEND_URL}"
-        if ! ${opt_model_explicit} || [[ -z "${target_model}" || "${target_model}" == kimi ]]; then
-            resolved_model="${DASHSCOPE_DEFAULT_MODEL}"
-        else
-            resolved_model="${target_model#dashscope/}"
         fi
     elif [[ "${cloud_provider}" == "abliteration" ]]; then
         if ! abliteration_cli_supported "${provider}"; then
@@ -6416,7 +6492,13 @@ cmd_launch() {
             esac
         elif [[ "${cloud_provider}" == "dashscope" ]]; then
             case "${cli_cmd}" in
-                kimi) dry_argv=(kimi) ;;
+                kimi)
+                    if [[ "${dashscope_surface}" == freetier ]]; then
+                        dry_argv=(kimi -m "${resolved_model}")
+                    else
+                        dry_argv=(kimi)
+                    fi ;;
+                claude) dry_argv=(claude) ;;
                 *) dry_argv=("${cli_cmd}" --model "${resolved_model}") ;;
             esac
         fi
@@ -6468,7 +6550,11 @@ cmd_launch() {
                 echo "  caps   : ${ablit_caps}"
             elif [[ "${cloud_provider}" == "dashscope" ]]; then
                 echo "  evict  : n/a (hosted API, no VRAM to free)"
-                echo "  context: ${opt_launch_ctx:-${DASHSCOPE_DEFAULT_CTX}} tokens"
+                if [[ "${provider}" == claude ]]; then
+                    echo "  context: ${CLAUDE_CODE_MAX_CONTEXT_TOKENS:-${DASHSCOPE_CLAUDE_MAX_CONTEXT}} tokens"
+                else
+                    echo "  context: ${opt_launch_ctx:-${DASHSCOPE_DEFAULT_CTX}} tokens"
+                fi
             elif hosted_provider "${cloud_provider}"; then
                 echo "  evict  : n/a (hosted API, no VRAM to free)"
             else
@@ -6489,7 +6575,11 @@ cmd_launch() {
                     if [[ "${cloud_provider}" == "abliteration" ]]; then
                         echo "  ${C_DIM}(kimi gets a zero-footprint KIMI_MODEL_* env provider; no config.toml is written)${C_RESET}"
                     elif [[ "${cloud_provider}" == "dashscope" ]]; then
-                        echo "  ${C_DIM}(kimi gets a zero-footprint KIMI_MODEL_* env provider; no config.toml is written)${C_RESET}"
+                        if [[ "${dashscope_surface}" == freetier ]]; then
+                            echo "  ${C_DIM}(kimi rides its freetier-managed [providers.alibaba]; no env key, no config write)${C_RESET}"
+                        else
+                            echo "  ${C_DIM}(kimi gets a zero-footprint KIMI_MODEL_* env provider; no config.toml is written)${C_RESET}"
+                        fi
                     elif openai_backend "${cloud_provider}"; then
                         echo "  ${C_DIM}(Kimi's ${cloud_provider}/ aliases are synced at launch; this dry run writes no config)${C_RESET}"
                     else
@@ -6532,6 +6622,27 @@ cmd_launch() {
                     export CLAUDE_CODE_EFFORT_LEVEL="${CLAUDE_CODE_EFFORT_LEVEL:-high}"
                     echo "${C_DIM}[*] claude on abliteration.ai: ${claude_model} (context ${ablit_ctx})${C_RESET}"
                     exec "${cli_cmd}" --model "${claude_model}" "${cli_passthrough_args[@]}"
+                fi
+                if [[ "${cloud_provider}" == "dashscope" ]]; then
+                    if [[ "${dashscope_surface}" == freetier ]]; then
+                        echo "${C_RED}Error: the DashScope free-tier fallback rides kimi's config; claude has no such fallback. Export DASHSCOPE_API_KEY or MODELSTUDIO_API_KEY.${C_RESET}" >&2
+                        return 1
+                    fi
+                    # Model Studio's Anthropic-compatible app endpoint. The
+                    # bearer goes in ANTHROPIC_AUTH_TOKEN (claude sends it as
+                    # such), and the tier mapping keeps claude's internal
+                    # requests on models these keys can actually serve.
+                    export ANTHROPIC_BASE_URL="${active_host%/compatible-mode/v1}/apps/anthropic"
+                    export ANTHROPIC_AUTH_TOKEN="${dashscope_key}"
+                    unset ANTHROPIC_API_KEY
+                    export ANTHROPIC_MODEL="${resolved_model}"
+                    export ANTHROPIC_DEFAULT_HAIKU_MODEL="${ANTHROPIC_DEFAULT_HAIKU_MODEL:-${DASHSCOPE_CLAUDE_HAIKU}}"
+                    export ANTHROPIC_DEFAULT_SONNET_MODEL="${ANTHROPIC_DEFAULT_SONNET_MODEL:-${DASHSCOPE_CLAUDE_SONNET}}"
+                    export ANTHROPIC_DEFAULT_OPUS_MODEL="${ANTHROPIC_DEFAULT_OPUS_MODEL:-${DASHSCOPE_CLAUDE_OPUS}}"
+                    export CLAUDE_CODE_SUBAGENT_MODEL="${CLAUDE_CODE_SUBAGENT_MODEL:-auto}"
+                    export CLAUDE_CODE_MAX_CONTEXT_TOKENS="${CLAUDE_CODE_MAX_CONTEXT_TOKENS:-${DASHSCOPE_CLAUDE_MAX_CONTEXT}}"
+                    echo "${C_DIM}[*] claude on DashScope ${dashscope_surface}: ${resolved_model} via ${ANTHROPIC_BASE_URL}${C_RESET}"
+                    exec "${cli_cmd}" "${cli_passthrough_args[@]}"
                 fi
                 if host_is_plain_local "${active_host}"; then
                     export ANTHROPIC_API_KEY="${ANTHROPIC_API_KEY:-ollama}"
@@ -6662,6 +6773,19 @@ cmd_launch() {
                     fi
                     echo "${C_DIM}[*] kimi on abliteration.ai '${resolved_model}' via ${ablit_openai_url} (context ${ablit_ctx}, caps ${KIMI_MODEL_CAPABILITIES}, effort ${kimi_ablit_effort})${C_RESET}"
                     exec "${cli_cmd}" "${cli_passthrough_args[@]}"
+                fi
+                if [[ "${cloud_provider}" == "dashscope" && "${dashscope_surface}" == freetier ]]; then
+                    # kimi's own [providers.alibaba] holds the credential and
+                    # the quota-verified model; kimo adds nothing but -m.
+                    # Config-based launches make kimi validate every provider's
+                    # api_key_env at startup, so resolve the Codex bearer too
+                    # (offline, from auth.json) or the launch dies on an
+                    # unrelated provider before the first request.
+                    _resolve_codex_auth || true
+                    export KIMI_DISABLE_TELEMETRY="${KIMI_DISABLE_TELEMETRY:-1}"
+                    export KIMI_CODE_NO_AUTO_UPDATE="${KIMI_CODE_NO_AUTO_UPDATE:-1}"
+                    echo "${C_DIM}[*] kimi on DashScope free tier: ${resolved_model} via kimi's [providers.alibaba] (no env key needed)${C_RESET}"
+                    exec "${cli_cmd}" -m "${resolved_model}" "${cli_passthrough_args[@]}"
                 fi
                 if [[ "${cloud_provider}" == "dashscope" ]]; then
                     # DashScope path: the KIMI_MODEL_* env channel only, exactly
@@ -8989,6 +9113,31 @@ _kimo() {
         fi
     done
 
+    # Hosted-backend aliases for the model list: the Codex catalog on disk plus
+    # whatever kimi's config already registers, so '--provider codex' completion
+    # offers codex/<slug> without any network probe.
+    _kimo_hosted_models() {
+        case "$1" in
+            codex|openai) ;;
+            *) return 0 ;;
+        esac
+        local home="${CODEX_HOME:-$HOME/.codex}"
+        local cfg="${KIMI_CONFIG:-${KIMI_CODE_HOME:-$HOME/.kimi-code}/config.toml}"
+        {
+            jq -r --arg p "$1" '.models[]? | select((.visibility // "list") == "list") | "\($p)/\(.slug)"' "${home}/models_cache.json" 2>/dev/null
+            grep -oE "^\[models\.\"$1/[^\"]+\"\]" "${cfg}" 2>/dev/null | sed -E 's/^\[models\."([^"]+)"\]$/\1/'
+        } | sort -u
+    }
+    _kimo_provider_word() {
+        local i
+        for ((i=1; i < cword; i++)); do
+            case "${words[i]}" in
+                --provider) printf '%s' "${words[i+1]}"; return 0 ;;
+                --provider=*) printf '%s' "${words[i]#*=}"; return 0 ;;
+            esac
+        done
+    }
+
     # Cached, bounded model list for completion. Probes only the local daemon
     # and the localhost tunnel (never a LAN host), 1s budget each; repeats within
     # 30s are served from ~/.cache/kimo/models without hitting the network. This
@@ -9006,6 +9155,7 @@ _kimo() {
             fi
             if (( now - mtime < ttl )); then
                 cat "${cache}" 2>/dev/null
+                _kimo_hosted_models "$(_kimo_provider_word)"
                 return 0
             fi
         fi
@@ -9018,6 +9168,7 @@ _kimo() {
         } | jq -r '.models[]?.name' 2>/dev/null | sort -u > "${cache}.$$" 2>/dev/null
         mv -f "${cache}.$$" "${cache}" 2>/dev/null || true
         cat "${cache}" 2>/dev/null
+        _kimo_hosted_models "$(_kimo_provider_word)"
     }
 
     _kimo_complete_models() {
@@ -9227,6 +9378,32 @@ EOFBASH
 # Cached, bounded model list for completion. Probes only the local daemon and
 # the localhost tunnel (never a LAN host), 1s budget each; repeats within 30s
 # are served from ~/.cache/kimo/models without hitting the network.
+
+# Hosted-backend aliases for the model list: the Codex catalog on disk plus
+# whatever kimi's config already registers, so '--provider codex' completion
+# offers codex/<slug> without any network probe.
+_kimo_hosted_models() {
+    case "$1" in
+        codex|openai) ;;
+        *) return 0 ;;
+    esac
+    local home="${CODEX_HOME:-$HOME/.codex}"
+    local cfg="${KIMI_CONFIG:-${KIMI_CODE_HOME:-$HOME/.kimi-code}/config.toml}"
+    {
+        jq -r --arg p "$1" '.models[]? | select((.visibility // "list") == "list") | "\($p)/\(.slug)"' "${home}/models_cache.json" 2>/dev/null
+        grep -oE "^\[models\.\"$1/[^\"]+\"\]" "${cfg}" 2>/dev/null | sed -E 's/^\[models\."([^"]+)"\]$/\1/'
+    } | sort -u
+}
+_kimo_provider_word() {
+    local i
+    for ((i=2; i < CURRENT; i++)); do
+        case "${words[i]}" in
+            --provider) printf '%s' "${words[i+1]}"; return 0 ;;
+            --provider=*) printf '%s' "${words[i]#*=}"; return 0 ;;
+        esac
+    done
+}
+
 _kimo_models() {
     local cache="${XDG_CACHE_HOME:-$HOME/.cache}/kimo/models"
     local ttl=30 now mtime
@@ -9239,6 +9416,7 @@ _kimo_models() {
         fi
         if (( now - mtime < ttl )); then
             cat "${cache}" 2>/dev/null
+            _kimo_hosted_models "$(_kimo_provider_word)"
             return 0
         fi
     fi
@@ -9251,6 +9429,7 @@ _kimo_models() {
     } | jq -r '.models[]?.name' 2>/dev/null | sort -u > "${cache}.$$" 2>/dev/null
     mv -f "${cache}.$$" "${cache}" 2>/dev/null || true
     cat "${cache}" 2>/dev/null
+    _kimo_hosted_models "$(_kimo_provider_word)"
 }
 
 _kimo() {
@@ -9842,7 +10021,9 @@ ${C_YELLOW}Source:${C_RESET} ${KIMI_FT_CONSOLE_URL}
 ${C_YELLOW}Writes${C_RESET} (surgical edit, timestamped backup first, everything else preserved):
   [providers.alibaba] + one [models."alibaba/<id>"] per quota-verified model
   (managed block marked with "kimi-freetier-sync"). default_model is untouched
-  unless --set-default is given. max_output_size caps max_tokens at 65536.
+  unless --set-default is given. max_output_size caps max_tokens at 32768 -
+  the intl wire's strictest observed ceiling (qwen-plus-2025-12-01 answers a
+  larger max_tokens with 400 "Range of max_tokens should be [1, 32768]").
 
 ${C_YELLOW}Options:${C_RESET}
   --check-auth            Is the console session live? (exit 0 live / 3 dead)
@@ -9864,7 +10045,7 @@ ${C_YELLOW}Options:${C_RESET}
   --limit N               Cap selection to N models
   --set-default first|none|ALIAS   Optionally rewrite default_model
   --context-window N      max_context_size written per model (default 131072)
-  --max-output N          max_output_size written per model (default 65536)
+  --max-output N          max_output_size written per model (default 32768)
   --base-url URL          DashScope compatible-mode base URL
   --api-key KEY           API key (else ~/.qwen/settings.json, DASHSCOPE_API_KEY, bl profile)
   --config FILE           Target config.toml (default: ${KIMI_FT_CONFIG})
@@ -9901,7 +10082,7 @@ cmd_freetier() {
     KIMI_FT_VERIFY_JOBS=6
     KIMI_FT_SET_DEFAULT=""
     KIMI_FT_CONTEXT_WINDOW="${KIMO_KIMI_FT_CONTEXT:-131072}"
-    KIMI_FT_MAX_OUTPUT="${KIMO_KIMI_FT_MAX_OUTPUT:-65536}"
+    KIMI_FT_MAX_OUTPUT="${KIMO_KIMI_FT_MAX_OUTPUT:-32768}"
     KIMI_FT_DRY_RUN=0
     KIMI_FT_LIST_ONLY=0
     KIMI_FT_OUTPUT_JSON=0

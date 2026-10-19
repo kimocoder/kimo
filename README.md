@@ -28,7 +28,7 @@
   - **Cyberstrike AI Pentesting CLI** (`cyberstrike`)
   - **Hermes / OpenClaw**
 - **Hosted Cloud Provider**: `launch --provider abliteration` routes `claude` and `kimi` at the [abliteration.ai](https://docs.abliteration.ai) Anthropic-/OpenAI-compatible API instead of a self-hosted Ollama daemon — no host probing, no model eviction, and the API key stays in the environment only.
-- **DashScope (Alibaba Model Studio)**: `launch --provider dashscope` routes `kimi` at the international OpenAI-compatible Model Studio API, billed pay-as-you-go with the key from `DASHSCOPE_API_KEY` (or `MODELSTUDIO_API_KEY`) — zero-footprint env channel, nothing written to kimi's config.
+- **DashScope (Alibaba Model Studio)**: `launch --provider dashscope` routes `kimi` and `claude` at Model Studio — the key's class picks the surface (`sk-ws-`/`sk-` → pay-as-you-go intl, `sk-sp-` → token-plan); kimi rides a zero-footprint env channel, claude the Anthropic-compatible `/apps/anthropic` endpoint, and with no env key kimi falls back to the freetier-managed `alibaba/` aliases.
 
 ---
 
@@ -713,19 +713,22 @@ Other models already loaded on the target host are **not** unloaded unless you a
 
 ### Cloud Provider: DashScope (Alibaba Model Studio)
 
-`--provider dashscope` routes a launch at Alibaba Model Studio's international OpenAI-compatible API (`https://dashscope-intl.aliyuncs.com/compatible-mode/v1`), billed pay-as-you-go. It is currently wired for **`kimi`**; every other CLI stays on Ollama routing and errors out if you ask it to use the provider.
+`--provider dashscope` routes a launch at Alibaba Model Studio. The credential's class picks the surface: `sk-ws-`/`sk-` keys go to the pay-as-you-go international endpoint (`https://dashscope-intl.aliyuncs.com/compatible-mode/v1`), `sk-sp-` token-plan keys to the subscription endpoint (`https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1`) — each class 401s on the other's surface. It is wired for **`kimi`** and **`claude`**; every other CLI stays on Ollama routing and errors out if you ask it to use the provider.
 
 ```bash
 export DASHSCOPE_API_KEY="sk-..."        # MODELSTUDIO_API_KEY is accepted too
 
 kimo launch kimi --provider dashscope                       # default: qwen3.8-max
 kimo launch kimi --provider dashscope --model qwen3-coder-plus
+kimo launch claude --provider dashscope                     # Anthropic wire, tier-mapped
 kimo launch kimi --provider dashscope --ctx 131072 --dry-run
 
 kimo config set cloud_provider dashscope                    # make it the default backend
 ```
 
-kimi rides its zero-footprint `KIMI_MODEL_*` env channel (wire type `openai`, reasoning key `reasoning_content`, context 1,000,000 unless `--ctx` or `KIMO_DASHSCOPE_CTX` says otherwise), so nothing is written to kimi's config and the key never reaches argv or disk. Like every hosted backend it skips host probing, Ollama tag resolution, eviction and tune settings.
+kimi rides its zero-footprint `KIMI_MODEL_*` env channel (wire type `openai`, reasoning key `reasoning_content`, context 1,000,000 unless `--ctx` or `KIMO_DASHSCOPE_CTX` says otherwise), so nothing is written to kimi's config and the key never reaches argv or disk. claude rides each surface's Anthropic-compatible `/apps/anthropic` endpoint with the bearer in `ANTHROPIC_AUTH_TOKEN` and a tier mapping that keeps its internal requests on Model Studio models (`haiku`→`qwen3.6-flash`, `sonnet`→`qwen3.8-flash`, `opus`→`qwen3.8-max`, subagents `auto`, context 983,616; all overridable via `KIMO_DASHSCOPE_CLAUDE_*`). Without `-m`, kimi defaults to `qwen3.8-max` and claude to `auto`.
+
+With no usable key in the environment at all, `launch kimi --provider dashscope` falls back to the freetier-managed `[providers.alibaba]` block (`kimo freetier`, quota data from `bl usage free`): kimi launches with `-m alibaba/<model>` against its own stored credential, so the free-tier surface works with no secret from kimo. `bl auth login --console --console-site international` refreshes the quota data when it expires. Like every hosted backend it skips host probing, Ollama tag resolution, eviction and tune settings.
 
 ### Cloud Provider: abliteration.ai
 
