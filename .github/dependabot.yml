@@ -9,3 +9,7 @@ updates:
     directory: "/"
     schedule:
       interval: "weekly"
+    # Let a new action release age a week before proposing it, so a
+    # compromised or broken release has time to be caught and pulled.
+    cooldown:
+      default-days: 7
