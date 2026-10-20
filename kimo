@@ -3367,11 +3367,12 @@ cmd_search() {
         exit 1
     fi
 
-    OM_REMOTE_HOST_URL="${REMOTE_HOST_URL}" OM_LOCAL_HOST_URL="${LOCAL_HOST_URL}" OM_query="${query}" OM_OPT_JSON="${OPT_JSON}" OM_HOST_MODE="${HOST_MODE}" OM_MULTI_HOSTS="${MULTI_HOSTS}" OM_TARGET_HOST="${TARGET_HOST}" OM_C_RESET="${C_RESET}" OM_C_BOLD="${C_BOLD}" OM_C_GREEN="${C_GREEN}" OM_C_YELLOW="${C_YELLOW}" OM_C_DIM="${C_DIM}" \
+    OM_REMOTE_HOST_URL="${REMOTE_HOST_URL}" OM_LOCAL_HOST_URL="${LOCAL_HOST_URL}" OM_query="${query}" OM_OPT_JSON="${OPT_JSON}" OM_HOST_MODE="${HOST_MODE}" OM_MULTI_HOSTS="${MULTI_HOSTS}" OM_TARGET_HOST="${TARGET_HOST}" OM_TUNINGS_FILE="${TUNINGS_FILE}" OM_C_RESET="${C_RESET}" OM_C_BOLD="${C_BOLD}" OM_C_GREEN="${C_GREEN}" OM_C_YELLOW="${C_YELLOW}" OM_C_DIM="${C_DIM}" \
         python3 - <<'PYEOF'
 import os as _om_os
 OM_REMOTE_HOST_URL = _om_os.environ["OM_REMOTE_HOST_URL"]
 OM_LOCAL_HOST_URL = _om_os.environ["OM_LOCAL_HOST_URL"]
+OM_TUNINGS_FILE = _om_os.environ["OM_TUNINGS_FILE"]
 OM_query = _om_os.environ["OM_query"]
 OM_OPT_JSON = _om_os.environ["OM_OPT_JSON"]
 OM_HOST_MODE = _om_os.environ["OM_HOST_MODE"]
@@ -3402,14 +3403,19 @@ if mode == 'multi':
     hosts = [(u.split('://', 1)[-1], u) for u in OM_MULTI_HOSTS.split()]
 elif mode == 'custom':
     hosts = [('custom', OM_TARGET_HOST)]
+elif mode == 'remote':
+    hosts = [('remote', remote_url)]
+elif mode == 'local':
+    hosts = [('local', local_url)]
 else:
     hosts = [('local', local_url), ('remote', remote_url)]
 
+# Per host: a model resident on one host is not ACTIVE on another.
 active = set()
-for _, url in hosts:
+for label, url in hosts:
     for m in fetch(url, '/api/ps').get('models', []):
         if m.get('name'):
-            active.add(m['name'])
+            active.add((label, m['name']))
 
 pins = {}
 try:
@@ -3420,7 +3426,7 @@ except Exception:
 
 tuned = {}
 try:
-    with open('/var/lib/ollama/tunings.json') as f:
+    with open(OM_TUNINGS_FILE) as f:
         tuned = json.load(f) or {}
 except Exception:
     tuned = {}
@@ -3441,7 +3447,7 @@ for label, url in hosts:
             'host': label,
             'size_gb': m.get('size', 0) / (1024 ** 3),
             'param': details.get('parameter_size', '-'),
-            'active': name in active,
+            'active': (label, name) in active,
             'pinned': name in pins,
             'tuned': name in tuned,
         })

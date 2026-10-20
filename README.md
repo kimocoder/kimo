@@ -90,6 +90,7 @@ make check
 | `make test-gh-guard` | Headless smoke test of GitHub CLI (`gh`) management-only guard |
 | `make test-launch-contract` | Launch contract for every CLI: credential scrub for non-local hosts, child-flag passthrough and `--`, opt-in `--evict` |
 | `make test-sync` | Blob-level `sync` between two fake daemons (upload, create, weight verification, `--force`), plus the digest-verified registry fallback |
+| `make test-model-commands` | Core model commands against fake local and remote daemons: `search` honors `--local`/`--remote` and reports VRAM residency per host |
 | `make test-shim` | Gemini shim contract: `model:tag` paths, JSON-array/SSE streaming, mid-stream errors, tools, images, `countTokens`, request validation |
 | `make test-install-packages` | Installers request only official npm/PyPI packages and never fall back to look-alike names |
 | `make clean` | Removes temporary and backup files (`*~`, `*.tmp`, `*.bak`) |

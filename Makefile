@@ -13,7 +13,7 @@ export KIMO_NO_AUTOSCAN := 1
 
 SCRIPT  := kimo
 
-.PHONY: all help install uninstall link unlink check lint test test-check test-web test-qwen test-claude test-agy test-opencode test-kimi test-codex test-codex-auth test-dashscope test-cursor test-grok test-gh test-thinking-tools test-gemini test-scan test-quota test-tunnel test-config-validate test-rotate-token test-jq-guard test-pull-json test-backup-prune test-web-url-esc test-gh-guard test-model-args test-launch-contract test-sync test-shim test-install-packages test-config-rules test-hardening test-extra clean install-completion uninstall-completion update update-% test-host-url test-web-bridge test-option-values test-update-lookup test-codex-update test-qwen-update test-cli-health
+.PHONY: all help install uninstall link unlink check lint test test-check test-web test-qwen test-claude test-agy test-opencode test-kimi test-codex test-codex-auth test-dashscope test-cursor test-grok test-gh test-thinking-tools test-gemini test-scan test-quota test-tunnel test-config-validate test-rotate-token test-jq-guard test-pull-json test-backup-prune test-web-url-esc test-gh-guard test-model-args test-launch-contract test-sync test-model-commands test-shim test-install-packages test-config-rules test-hardening test-extra clean install-completion uninstall-completion update update-% test-host-url test-web-bridge test-option-values test-update-lookup test-codex-update test-qwen-update test-cli-health
 
 all: help
 
@@ -62,6 +62,7 @@ help:
 	@echo "  make test-hardening        Installer download-then-run, request timeouts, symlinked shim lookup"
 	@echo "  make test-launch-contract  Launch credential scrub, argument passthrough (--) and opt-in eviction"
 	@echo "  make test-sync             Blob-level model sync between hosts, verified by weights/digest"
+	@echo "  make test-model-commands   Core model commands (search, ...) against fake local/remote hosts"
 	@echo "  make test-shim             Gemini shim contract: paths, streaming, tools, images, errors"
 	@echo "  make test-install-packages Installers use only official npm/PyPI packages (no look-alike fallbacks)"
 	@echo "  make test-host-url           Host URL normalization (https, proxied paths, IPv6)"
@@ -168,7 +169,7 @@ lint:
 	@python3 tests/check_buffer_splits.py
 	@echo "[✓] Lint check passed."
 
-test: test-check test-web test-scan test-gh test-thinking-tools test-gemini test-qwen test-claude test-agy test-opencode test-kimi test-abliteration test-codex test-codex-auth test-dashscope test-cursor test-grok test-quota test-tunnel test-config-validate test-rotate-token test-jq-guard test-pull-json test-backup-prune test-web-url-esc test-gh-guard test-model-args test-launch-contract test-sync test-shim test-install-packages test-config-rules test-hardening test-host-url test-web-bridge test-option-values test-update-lookup test-codex-update test-qwen-update test-cli-health
+test: test-check test-web test-scan test-gh test-thinking-tools test-gemini test-qwen test-claude test-agy test-opencode test-kimi test-abliteration test-codex test-codex-auth test-dashscope test-cursor test-grok test-quota test-tunnel test-config-validate test-rotate-token test-jq-guard test-pull-json test-backup-prune test-web-url-esc test-gh-guard test-model-args test-launch-contract test-sync test-model-commands test-shim test-install-packages test-config-rules test-hardening test-host-url test-web-bridge test-option-values test-update-lookup test-codex-update test-qwen-update test-cli-health
 	@echo ""
 	@echo "[✓] All test suites completed successfully."
 
@@ -297,6 +298,10 @@ test-sync:
 	@echo "[*] Running model sync tests..."
 	@tests/sync_test.sh
 
+test-model-commands:
+	@echo "[*] Running core model command tests..."
+	@tests/model_commands_test.sh
+
 test-shim:
 	@echo "[*] Running Gemini shim contract tests..."
 	@tests/lib/run-hermetic.sh python3 tests/gemini_shim_test.py
@@ -310,7 +315,7 @@ clean:
 	@rm -f *~ *.tmp *.bak
 	@echo "[✓] Clean."
 
-test-extra: test-config-validate test-rotate-token test-jq-guard test-pull-json test-backup-prune test-web-url-esc test-gh-guard test-model-args test-launch-contract test-sync test-shim test-install-packages test-config-rules test-hardening test-host-url test-web-bridge test-option-values test-update-lookup test-codex-update test-qwen-update test-cli-health
+test-extra: test-config-validate test-rotate-token test-jq-guard test-pull-json test-backup-prune test-web-url-esc test-gh-guard test-model-args test-launch-contract test-sync test-model-commands test-shim test-install-packages test-config-rules test-hardening test-host-url test-web-bridge test-option-values test-update-lookup test-codex-update test-qwen-update test-cli-health
 
 test-host-url:
 	@echo "[*] Running host-url tests..."
