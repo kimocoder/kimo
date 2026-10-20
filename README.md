@@ -90,7 +90,7 @@ make check
 | `make test-gh-guard` | Headless smoke test of GitHub CLI (`gh`) management-only guard |
 | `make test-launch-contract` | Launch contract for every CLI: credential scrub for non-local hosts, child-flag passthrough and `--`, opt-in `--evict` |
 | `make test-sync` | Blob-level `sync` between two fake daemons (upload, create, weight verification, `--force`), plus the digest-verified registry fallback |
-| `make test-model-commands` | Core model commands against fake local and remote daemons: `search` honors `--local`/`--remote` and reports VRAM residency per host; `stream` runs the shipped helper with kimo's remote resolution |
+| `make test-model-commands` | Core model commands against fake local and remote daemons: `search` honors `--local`/`--remote` and reports VRAM residency per host; `stream` runs the shipped helper with kimo's remote resolution; `bench` TTFT includes cold loads, `--runs`/`--warmup` |
 | `make test-shim` | Gemini shim contract: `model:tag` paths, JSON-array/SSE streaming, mid-stream errors, tools, images, `countTokens`, request validation |
 | `make test-install-packages` | Installers request only official npm/PyPI packages and never fall back to look-alike names |
 | `make clean` | Removes temporary and backup files (`*~`, `*.tmp`, `*.bak`) |
@@ -633,10 +633,16 @@ kimo bench kalidroid-27b:latest --json
 
 # Run benchmark explicitly on remote GPU server
 kimo --remote bench kalidroid-27b:latest -n 30
+
+# Load the model first, then report min/median/max over 5 timed runs
+kimo bench kalidroid-27b:latest --warmup --runs 5
 ```
 
+With no model argument, `bench` uses `default_model` (`kimo config set default_model …`), then the model resident in VRAM, and otherwise exits with an error.
+
 Metrics reported:
-- **Time to First Token (TTFT)**: Accurate prompt processing and cold/warm start latency.
+- **Time to First Token (TTFT)**: Client-measured time from sending the request to the first token, so it includes any model load, prefill and transport. Model load (`load_ms`) and prompt prefill are reported separately; a cold first run is flagged, and `--warmup` excludes it.
+- **Runs**: `--runs N` repeats the measurement (each with a distinct first prompt line, so Ollama's prompt cache cannot shorten prefill) and reports medians with min/max; `--json` adds `stats` and per-run `results`.
 - **Generation Speed**: Real-time streaming token throughput in tokens/sec (`tok/s`).
 - **Prompt Speed**: Prompt evaluation speed in tokens/sec (`tok/s`).
 - **Total Latency**: Wall-clock evaluation time.

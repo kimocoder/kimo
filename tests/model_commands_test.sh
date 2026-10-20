@@ -59,5 +59,33 @@ got=$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(" ".joi
 check "argv carries --json, the chosen remote and the subcommand" \
     "--json --remote ${REMOTE_URL} --status | ${KIMO_TUNINGS_FILE}" "${got}"
 
+echo "[*] bench measures first-token latency from the client, load included"
+# The fixture's first generate for a model pays a 0.5s cold load, and every
+# reply waits 0.1s before its first token; prefill reports 20ms.
+harness_fake_ollama --models "bench-model:latest"
+BENCH_URL="${FAKE_OLLAMA_URL}" BENCH_LOG="${FAKE_OLLAMA_LOG}"
+bench=$("${KIMO}" --host "${BENCH_URL}" --json bench bench-model:latest -n 3 2>/dev/null)
+field() { jq -r "$1" <<<"${bench}"; }
+check "a cold run reports the model load" "500" "$(field '.load_ms | floor')"
+check "TTFT covers the cold load, not just the 20ms prefill" "yes" \
+    "$(field 'if .time_to_first_token_ms >= 550 then "yes" else "no (\(.time_to_first_token_ms))" end')"
+check "prefill keeps its own figure" "20" "$(field '.prompt_eval.duration_ms | floor')"
+
+bench=$("${KIMO}" --host "${BENCH_URL}" --json bench bench-model:latest -n 3 --runs 3 --warmup 2>/dev/null)
+check "--runs keeps one result per timed run" "3" "$(field '.results | length')"
+check "--warmup is untimed and the timed runs load nothing" "0" "$(field '[.results[].load_ms] | max | floor')"
+check "a warm TTFT is the reply latency" "yes" \
+    "$(field 'if .stats.time_to_first_token_ms.max < 550 then "yes" else "no" end')"
+prompts=$(grep '^POST /api/generate ' "${BENCH_LOG}" | tail -n 4 | sed 's/^POST \/api\/generate //' | jq -r '.prompt | split("\n")[0]' | sort -u | wc -l)
+check "every request gets a distinct prompt, so no prefix cache is reused" "4" "$(tr -d ' ' <<<"${prompts}")"
+
+rc=0
+out=$("${KIMO}" --host "${BENCH_URL}" bench --runs 0 2>&1) || rc=$?
+check "--runs rejects non-positive counts" "1" "${rc}"
+rc=0
+out=$(KIMO_DEFAULT_MODEL="" "${KIMO}" --host "${BENCH_URL}" bench 2>&1) || rc=$?
+check "no model and none loaded is an error, not a hardcoded default" "1" "${rc}"
+check_contains "the error says how to pick a model" "config set default_model" "${out}"
+
 echo
 harness_summary "model commands"

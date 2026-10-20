@@ -3828,11 +3828,26 @@ cmd_bench() {
     local temperature=0.2
     local custom_prompt=""
     local opt_json=false
+    local runs=1
+    local warmup=false
 
     ${OPT_JSON} && opt_json=true
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
+            -r|--runs)
+                require_value "$@"
+                runs="$2"
+                shift 2
+                ;;
+            --runs=*)
+                runs="${1#*=}"
+                shift
+                ;;
+            --warmup)
+                warmup=true
+                shift
+                ;;
             -p|--prompt)
                 require_value "$@"
                 custom_prompt="$2"
@@ -3891,6 +3906,8 @@ cmd_bench() {
                 echo "  -p, --prompt <text>     Custom evaluation prompt string"
                 echo "  -n, --predict <tokens>  Number of tokens to generate (default: 60)"
                 echo "  --temp <val>            Sampling temperature (default: 0.2)"
+                echo "  -r, --runs <n>          Timed runs; reports min/median/max (default: 1)"
+                echo "  --warmup                Load the model with one untimed request first"
                 echo "  --json                  Output benchmark results in structured JSON"
                 echo "  --remote                Run benchmark on remote GPU server"
                 echo "  --local                 Run benchmark on local Ollama daemon"
@@ -3911,8 +3928,13 @@ cmd_bench() {
         esac
     done
 
+    if [[ ! "${runs}" =~ ^[1-9][0-9]*$ ]]; then
+        echo "${C_RED}Error: --runs expects a positive integer (got '${runs}').${C_RESET}" >&2
+        return 1
+    fi
+
     local active_host=""
-    local resolved_model="${target_model}"
+    local resolved_model="${target_model:-${KIMO_DEFAULT_MODEL:-}}"
 
     if [[ -n "${TARGET_HOST}" ]]; then
         active_host="${TARGET_HOST}"
@@ -3923,11 +3945,12 @@ cmd_bench() {
     if [[ -z "${resolved_model}" ]]; then
         local vram_model
         vram_model=$(curl -s --connect-timeout 2 -m 3 "${active_host}/api/ps" 2>/dev/null | jq -r '.models[0].name // empty' 2>/dev/null || true)
-        if [[ -n "${vram_model}" ]]; then
-            resolved_model="${vram_model}"
-        else
-            resolved_model="kalidroid-27b:latest"
+        if [[ -z "${vram_model}" ]]; then
+            echo "${C_RED}Error: no model given and none is loaded on ${active_host}.${C_RESET}" >&2
+            echo "Usage: ${0##*/} bench <model> (or set one: ${0##*/} config set default_model <model>)" >&2
+            return 1
         fi
+        resolved_model="${vram_model}"
     fi
 
     local res
@@ -3935,14 +3958,15 @@ cmd_bench() {
     [[ -n "${res}" ]] && resolved_model="${res}"
 
     if ! ${opt_json}; then
-        echo "${C_CYAN}[*] Benchmarking '${resolved_model}' on ${active_host} (generating ${predict_tokens} tokens)...${C_RESET}"
+        echo "${C_CYAN}[*] Benchmarking '${resolved_model}' on ${active_host} (generating ${predict_tokens} tokens, ${runs} run(s))...${C_RESET}"
     fi
 
+    OM_RUNS="${runs}" OM_WARMUP="${warmup}" \
     OM_ACTIVE_HOST="${active_host}" OM_RESOLVED_MODEL="${resolved_model}" OM_PREDICT_TOKENS="${predict_tokens}" \
     OM_TEMPERATURE="${temperature}" OM_CUSTOM_PROMPT="${custom_prompt}" OM_OPT_JSON="${opt_json}" \
     OM_C_RESET="${C_RESET}" OM_C_BOLD="${C_BOLD}" OM_C_GREEN="${C_GREEN}" OM_C_YELLOW="${C_YELLOW}" OM_C_CYAN="${C_CYAN}" OM_C_MAGENTA="${C_MAGENTA}" OM_C_RED="${C_RED}" OM_C_DIM="${C_DIM}" \
         python3 - <<'PYEOF'
-import os, sys, json, time, urllib.request, urllib.error
+import os, sys, json, statistics, time, urllib.request, urllib.error
 
 host = os.environ.get("OM_ACTIVE_HOST", "http://127.0.0.1:11434")
 model = os.environ.get("OM_RESOLVED_MODEL", "")
@@ -3961,71 +3985,84 @@ C_RED = os.environ.get("OM_C_RED", "")
 C_DIM = os.environ.get("OM_C_DIM", "")
 
 prompt = custom_prompt if custom_prompt else "Explain the fundamental architecture differences between CPU and GPU memory bandwidth in 3 concise paragraphs."
+runs = int(os.environ.get("OM_RUNS", "1"))
+warmup = os.environ.get("OM_WARMUP", "false").lower() == "true"
 
-payload = {
-    "model": model,
-    "prompt": prompt,
-    "stream": True,
-    "options": {
-        "num_predict": tokens_to_predict,
-        "temperature": temp
+
+def fail(message):
+    if as_json:
+        print(json.dumps({"error": message}, indent=2))
+    else:
+        if sys.stdout.isatty():
+            sys.stdout.write("\r\033[2K")
+        sys.stderr.write(f"\n{C_RED}[!] Benchmark failed: {message}{C_RESET}\n")
+    sys.exit(1)
+
+
+def run_once(text, label):
+    """One streamed generation; timings from the client clock and the server."""
+    payload = {"model": model, "prompt": text, "stream": True,
+               "options": {"num_predict": tokens_to_predict, "temperature": temp}}
+    req = urllib.request.Request(f"{host.rstrip('/')}/api/generate",
+                                 data=json.dumps(payload).encode("utf-8"),
+                                 headers={"Content-Type": "application/json"})
+    start = time.time()
+    first = None
+    chunks = 0
+    final = {}
+    try:
+        with urllib.request.urlopen(req, timeout=300) as resp:
+            for raw_line in resp:
+                line = raw_line.decode("utf-8", errors="replace").strip()
+                if not line:
+                    continue
+                try:
+                    chunk = json.loads(line)
+                except Exception:
+                    continue
+                if "error" in chunk:
+                    fail(chunk["error"])
+                if chunk.get("response"):
+                    if first is None:
+                        first = time.time() - start
+                    chunks += 1
+                    if not as_json and sys.stdout.isatty():
+                        sys.stdout.write(f"\r\033[2K  {C_DIM}[*] {label}: {chunks}/{tokens_to_predict} tokens...{C_RESET}")
+                        sys.stdout.flush()
+                if chunk.get("done"):
+                    final = chunk
+    except urllib.error.HTTPError as e:
+        fail(f"HTTP {e.code}: {e.read().decode('utf-8', errors='replace') or e.reason}")
+    except Exception as e:
+        fail(str(e))
+    elapsed = time.time() - start
+    p_count = final.get("prompt_eval_count", 0)
+    p_dur_ns = final.get("prompt_eval_duration", 0)
+    e_count = final.get("eval_count", chunks)
+    e_dur_ns = final.get("eval_duration", 0)
+    return {
+        # What a caller waits for: request sent -> first token, model load,
+        # prefill and transport included. Ollama's own durations are kept apart.
+        "time_to_first_token_ms": round(first * 1000.0, 2) if first is not None else None,
+        "load_ms": round(final.get("load_duration", 0) / 1e6, 2),
+        "prompt_tokens": p_count,
+        "prompt_eval_ms": round(p_dur_ns / 1e6, 2),
+        "prompt_tokens_per_second": round(p_count / (p_dur_ns / 1e9), 2) if p_dur_ns > 0 else 0.0,
+        "generated_tokens": e_count,
+        "eval_ms": round(e_dur_ns / 1e6, 2),
+        "tokens_per_second": round(e_count / (e_dur_ns / 1e9), 2) if e_dur_ns > 0 else 0.0,
+        "elapsed_sec": round(elapsed, 3),
     }
-}
 
-req = urllib.request.Request(
-    f"{host.rstrip('/')}/api/generate",
-    data=json.dumps(payload).encode("utf-8"),
-    headers={"Content-Type": "application/json"}
-)
 
-start_wall = time.time()
-ttft_wall = None
-gen_tokens = 0
-final_data = {}
+def varied(index):
+    # Ollama reuses a cached prompt prefix; a distinct first line per request
+    # keeps every timed run paying the full prefill.
+    return prompt if runs == 1 and not warmup else f"[benchmark run {index}]\n{prompt}"
 
-try:
-    with urllib.request.urlopen(req, timeout=300) as resp:
-        for raw_line in resp:
-            line = raw_line.decode("utf-8", errors="replace").strip()
-            if not line:
-                continue
-            try:
-                chunk = json.loads(line)
-            except Exception:
-                continue
 
-            if "error" in chunk:
-                if not as_json and sys.stdout.isatty():
-                    sys.stdout.write("\n")
-                sys.stderr.write(f"{C_RED}[!] Benchmark error: {chunk['error']}{C_RESET}\n")
-                sys.exit(1)
-
-            if chunk.get("response"):
-                if ttft_wall is None:
-                    ttft_wall = time.time() - start_wall
-                gen_tokens += 1
-                if not as_json and sys.stdout.isatty():
-                    sys.stdout.write(f"\r\033[2K  {C_DIM}[*] Generating tokens: {gen_tokens}/{tokens_to_predict}...{C_RESET}")
-                    sys.stdout.flush()
-
-            if chunk.get("done"):
-                final_data = chunk
-
-except urllib.error.HTTPError as e:
-    err_body = e.read().decode("utf-8", errors="replace")
-    if as_json:
-        print(json.dumps({"error": f"HTTP {e.code}: {err_body or e.reason}"}, indent=2))
-    else:
-        sys.stderr.write(f"\n{C_RED}[!] Benchmark failed (HTTP {e.code}): {err_body or e.reason}{C_RESET}\n")
-    sys.exit(1)
-except Exception as e:
-    if as_json:
-        print(json.dumps({"error": str(e)}, indent=2))
-    else:
-        sys.stderr.write(f"\n{C_RED}[!] Benchmark failed: {e}{C_RESET}\n")
-    sys.exit(1)
-
-end_wall = time.time()
+warmup_result = run_once(varied(0), "warm-up") if warmup else None
+results = [run_once(varied(i), f"run {i}/{runs}") for i in range(1, runs + 1)]
 if not as_json and sys.stdout.isatty():
     sys.stdout.write("\r\033[2K")
     sys.stdout.flush()
@@ -4052,54 +4089,78 @@ try:
 except Exception:
     pass
 
-p_count = final_data.get("prompt_eval_count", 0)
-p_dur_ns = final_data.get("prompt_eval_duration", 0)
-e_count = final_data.get("eval_count", gen_tokens)
-e_dur_ns = final_data.get("eval_duration", 0)
 
-prompt_tps = (p_count / (p_dur_ns / 1e9)) if p_dur_ns > 0 else 0.0
-eval_tps = (e_count / (e_dur_ns / 1e9)) if e_dur_ns > 0 else 0.0
-ttft_ms = (p_dur_ns / 1e6) if p_dur_ns > 0 else ((ttft_wall * 1000.0) if ttft_wall else 0.0)
+def spread(key):
+    values = sorted(r[key] for r in results if r[key] is not None)
+    if not values:
+        return None
+    return {"min": values[0], "median": round(statistics.median(values), 2), "max": values[-1]}
+
+
+stats = {key: spread(key) for key in ("time_to_first_token_ms", "load_ms", "prompt_eval_ms",
+                                       "prompt_tokens_per_second", "tokens_per_second")}
+med = {key: (value["median"] if value else None) for key, value in stats.items()}
+cold = results[0]["load_ms"] > 0
 
 if as_json:
     out = {
         "model": model,
         "host": host,
         "prompt": prompt,
+        "runs": len(results),
+        "warmup": warmup_result,
         "vram": {
             "used_bytes": vram_used_bytes,
             "used_gb": round(vram_used_bytes / (1024**3), 2),
             "total_bytes": total_model_bytes,
             "percent_gpu": round(gpu_pct, 1)
         },
+        # Medians across the timed runs; per-run detail is in "results".
+        "time_to_first_token_ms": med["time_to_first_token_ms"],
+        "load_ms": med["load_ms"],
         "prompt_eval": {
-            "tokens": p_count,
-            "duration_ms": round(p_dur_ns / 1e6, 2),
-            "tokens_per_second": round(prompt_tps, 2)
+            "tokens": results[-1]["prompt_tokens"],
+            "duration_ms": med["prompt_eval_ms"],
+            "tokens_per_second": med["prompt_tokens_per_second"]
         },
         "generation": {
-            "tokens": e_count,
-            "duration_ms": round(e_dur_ns / 1e6, 2),
-            "tokens_per_second": round(eval_tps, 2)
+            "tokens": results[-1]["generated_tokens"],
+            "duration_ms": round(statistics.median(r["eval_ms"] for r in results), 2),
+            "tokens_per_second": med["tokens_per_second"]
         },
-        "time_to_first_token_ms": round(ttft_ms, 2),
-        "total_elapsed_sec": round(end_wall - start_wall, 2)
+        "stats": stats,
+        "results": results,
+        "total_elapsed_sec": round(sum(r["elapsed_sec"] for r in results), 2)
     }
     print(json.dumps(out, indent=2))
     sys.exit(0)
 
+
+def fmt(key, unit, digits=1):
+    s = stats[key]
+    if not s:
+        return "N/A"
+    if len(results) == 1:
+        return f"{s['median']:.{digits}f} {unit}"
+    return f"{s['median']:.{digits}f} {unit} (min {s['min']:.{digits}f}, max {s['max']:.{digits}f})"
+
+
 print()
-print(f"{C_BOLD}BENCHMARK RESULTS: {model}{C_RESET}")
+print(f"{C_BOLD}BENCHMARK RESULTS: {model}{C_RESET}" + (f" ({len(results)} runs, medians)" if len(results) > 1 else ""))
 print("═" * 60)
 print(f"  Target Host:           {host}")
 print(f"  Memory Allocation:     {C_MAGENTA}{vram_used_str} ({gpu_pct_str}){C_RESET}")
-print(f"  Prompt Prefill Tokens: {p_count} tokens")
-print(f"  Time To First Token:   {C_YELLOW}{ttft_ms:.1f} ms{C_RESET}")
-print(f"  Prompt Prefill Speed:  {C_GREEN}{prompt_tps:.2f} tokens/sec{C_RESET}")
-print(f"  Generated Tokens:      {e_count} tokens")
-print(f"  Generation Speed:      {C_GREEN}{eval_tps:.2f} tokens/sec{C_RESET}")
-print(f"  Total Elapsed Time:    {end_wall - start_wall:.2f}s")
+print(f"  Prompt Prefill Tokens: {results[-1]['prompt_tokens']} tokens")
+print(f"  Time To First Token:   {C_YELLOW}{fmt('time_to_first_token_ms', 'ms')}{C_RESET}")
+print(f"    model load:          {fmt('load_ms', 'ms')}")
+print(f"    prompt prefill:      {fmt('prompt_eval_ms', 'ms')}")
+print(f"  Prompt Prefill Speed:  {C_GREEN}{fmt('prompt_tokens_per_second', 'tokens/sec', 2)}{C_RESET}")
+print(f"  Generated Tokens:      {results[-1]['generated_tokens']} tokens")
+print(f"  Generation Speed:      {C_GREEN}{fmt('tokens_per_second', 'tokens/sec', 2)}{C_RESET}")
+print(f"  Total Elapsed Time:    {sum(r['elapsed_sec'] for r in results):.2f}s")
 print("═" * 60)
+if cold and not warmup:
+    print(f"  {C_DIM}The first run included a {results[0]['load_ms']:.0f} ms model load; --warmup measures a resident model.{C_RESET}")
 PYEOF
 }
 

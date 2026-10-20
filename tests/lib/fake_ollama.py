@@ -26,6 +26,7 @@ import re
 import signal
 import sys
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 DEFAULT_PULL = [
@@ -183,12 +184,36 @@ class Handler(BaseHTTPRequestHandler):
                 self.server.models[name] = digest
                 self.server.created[name] = body
             self._json(200, {"status": "success"})
+        elif self.path == "/api/generate" and body.get("stream") is True:
+            self._stream_generate(body)
         elif self.path in ("/api/generate", "/api/chat"):
             self._json(200, {"model": body.get("model", ""), "done": True, "response": ""})
         elif self.path in ("/api/copy", "/api/delete"):
             self._json(200, {})
         else:
             self._json(404, {"error": "not found"})
+
+    def _stream_generate(self, body: dict) -> None:
+        """NDJSON like the real server: the first request for a model pays a
+        0.5s cold load, and every reply waits 0.1s before its first token."""
+        model = body.get("model", "")
+        with self.server.lock:
+            cold = model not in self.server.warm
+            self.server.warm.add(model)
+        tokens = int((body.get("options") or {}).get("num_predict") or 3)
+        self.send_response(200)
+        self.send_header("Content-Type", "application/x-ndjson")
+        self.end_headers()
+        time.sleep(0.6 if cold else 0.1)
+        for _ in range(tokens):
+            self.wfile.write(json.dumps({"model": model, "response": "x", "done": False}).encode() + b"\n")
+        self.wfile.write(json.dumps({
+            "model": model, "response": "", "done": True,
+            "load_duration": 500_000_000 if cold else 0,
+            "prompt_eval_count": len(str(body.get("prompt", "")).split()),
+            "prompt_eval_duration": 20_000_000,
+            "eval_count": tokens, "eval_duration": 50_000_000,
+        }).encode() + b"\n")
 
     def do_DELETE(self) -> None:
         self.do_POST()
@@ -213,6 +238,7 @@ def main() -> None:
     server.lock = threading.Lock()
     server.models = parse_models(args.models)
     server.created = {}
+    server.warm = set()
     server.loaded = [name for name in args.loaded.split(",") if name]
     server.blob_dir = args.blob_dir or args.log + ".blobs"
     os.makedirs(server.blob_dir, exist_ok=True)
