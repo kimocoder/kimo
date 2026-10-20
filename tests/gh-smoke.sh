@@ -11,7 +11,7 @@
 #   * Install status contract:
 #       - 'kimo install gh' reports existing binary when already installed.
 #       - 'kimo install --force gh' refuses to replace/shadow an external system binary.
-#       - named 'kimo update gh' updates an owned standalone gh in place (no flag needed).
+#       - 'kimo update gh' and 'kimo update all' update an owned standalone gh in place.
 #   * Update flag contract:
 #       - rejects combining --check and --apply
 #       - restricts --allow-system-path strictly to named 'update gh' (not batch 'update all')
@@ -195,6 +195,17 @@ FAKE
     check_contains "update reports the installed version" "Installed GitHub CLI 2.100.0 at ${UPGRADE_DIR}/gh." "${UPGRADE_OUT}"
     check "standalone gh now runs the new release" "gh version 2.100.0 (2026-02-01)" "$("${UPGRADE_DIR}/gh" --version)"
     check "verified update leaves no backup or staging dir" "" "$(find "${UPGRADE_DIR}" -name '.gh-*')"
+
+    # 'update all' updates the standalone gh too. KIMO_ENFORCE_PATH=0 keeps
+    # /usr/local/bin and ~/ tool dirs off PATH, and the fake curl/npm fail every
+    # other lookup, so no real CLI on the host is ever updated.
+    cp "${STANDALONE_DIR}/gh" "${UPGRADE_DIR}/gh"
+    printf '#!/usr/bin/env bash\nexit 1\n' > "${UPGRADE_DIR}/npm"
+    chmod +x "${UPGRADE_DIR}/npm"
+    BATCH_OUT="$(HOME="${STANDALONE_HOME}" PATH="${UPGRADE_DIR}:/usr/bin:/bin" GH_FAKE_RELEASE="${RELEASE_DIR}" \
+        KIMO_ENFORCE_PATH=0 "${KIMO}" update all 2>&1 || true)"
+    check_contains "update all updates a standalone gh" "Installed GitHub CLI 2.100.0 at ${UPGRADE_DIR}/gh." "${BATCH_OUT}"
+    check "update all leaves the new gh release in place" "gh version 2.100.0 (2026-02-01)" "$("${UPGRADE_DIR}/gh" --version)"
 fi
 
 UPDATE_HELP="$("${KIMO}" update --help)"

@@ -8669,7 +8669,7 @@ ${C_YELLOW}Arguments:${C_RESET}
 ${C_YELLOW}Options:${C_RESET}
   ${C_CYAN}-y, --apply${C_RESET}   Apply available updates to all installed CLIs
   ${C_CYAN}-c, --check${C_RESET}   Check for updates without installing (default behavior when no CLI is specified)
-  ${C_CYAN}--allow-system-path${C_RESET}  Only with named gh: implied by 'update gh'; validates the PATH executable up front
+  ${C_CYAN}--allow-system-path${C_RESET}  Only with named gh: implied by 'update gh' and 'update all'; validates the PATH executable up front
   ${C_CYAN}-h, --help${C_RESET}    Show this help message
   GitHub CLI rejects package-owned files, symlinks (including parents), and unowned/unwritable directories.
   No sudo or shadowing; keeps a backup until the new version verifies, and rolls back if it fails.
@@ -8680,7 +8680,7 @@ ${C_YELLOW}Examples:${C_RESET}
   ${0##*/} update all --check  # Read-only check; cannot combine --check and --apply
   ${0##*/} update qwen        # Update only Qwen Code CLI when confirmed newer
   ${0##*/} update agy         # Update Antigravity CLI with its native updater
-  ${0##*/} update gh          # Update gh in place (~/.local/bin or an owned standalone like /usr/local/bin/gh)
+  ${0##*/} update gh          # Update gh in place (~/.local/bin or an owned standalone like /usr/local/bin/gh; also done by 'update all')
   ${0##*/} update gh --allow-system-path --check # Read-only eligibility and release check
   ${0##*/} update --apply     # Update all installed CLIs with available updates
 EOF
@@ -8733,11 +8733,10 @@ cmd_update() {
             echo "GitHub CLI at ${gh_path} is eligible for an in-place update (--check: no files changed)."
         fi
     fi
-    # Naming gh is the opt-in to update the gh found in PATH in place (e.g. a
+    # 'update gh' and batch updates replace the gh found in PATH in place (e.g. a
     # standalone /usr/local/bin/gh). _install_gh still runs _gh_check_destination,
-    # which refuses package-owned, symlinked and unowned paths. Batch updates
-    # never touch a gh outside ~/.local/bin.
-    [[ "${target}" != gh ]] || gh_allow_system_path=true
+    # which refuses package-owned, symlinked and unowned paths.
+    case "${target}" in ''|all|gh) gh_allow_system_path=true ;; esac
     if ${opt_check} || { [[ -z "${target}" ]] && ! ${opt_apply}; }; then
         _check_updates_for_present_clis "${target:-all}"
     else
