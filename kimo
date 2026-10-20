@@ -518,6 +518,7 @@ ${C_YELLOW}Maintenance, Config & Completion:${C_RESET}
   ${C_CYAN}freetier [opts]${C_RESET}              Sync Kimi config with Model Studio free-tier quotas (bl usage free)
   ${C_CYAN}gemini [opts]${C_RESET}                Register Gemini API models (real token limits) in Kimi config
   ${C_CYAN}codex [opts]${C_RESET}                 Inspect/renew Codex auth tokens & sync ChatGPT/OpenAI models in Kimi config
+  ${C_CYAN}kimi provider [subcmd]${C_RESET}       Enable/disable LLM providers in Kimi Code's config (list/disable/enable)
   ${C_CYAN}quota, quotas, quote${C_RESET}         Quota & usage dashboard for providers and every supported CLI
 
 ${C_YELLOW}Web & Quota-Free Research:${C_RESET}
@@ -821,7 +822,7 @@ command_needs_remote() {
                     ;;
             esac
             return 0 ;;
-        version|help|-h|--help|completion|config|cfg|quota|quotas|quote|web|gemini|gemini-sync|kimi-gemini|codex|codex-sync|kimi-codex|freetier|free-tier|kimi-sync|install|setup|update|upgrade|rotate-token|rotate|logs|log|scan|discover|init) return 1 ;;
+        version|help|-h|--help|completion|config|cfg|quota|quotas|quote|web|gemini|gemini-sync|kimi-gemini|codex|codex-sync|kimi-codex|kimi-provider|kimi-providers|provider|providers|freetier|free-tier|kimi-sync|install|setup|update|upgrade|rotate-token|rotate|logs|log|scan|discover|init) return 1 ;;
         *) return 0 ;;
     esac
 }
@@ -9504,7 +9505,7 @@ _kimo() {
         cword=$COMP_CWORD
     fi
 
-    local commands="list ls search find ps top warm preload stop unload tune set-ctx param bench eval benchmark info show tag alias rm delete pull download sync run launch install setup update upgrade doctor diagnose diag config cfg completion freetier free-tier kimi-sync quota quotas quote tunnel gemini gemini-sync kimi-gemini codex codex-sync kimi-codex version status health hosts init scan discover check ping stream logs status-report report rotate-token web help"
+    local commands="list ls search find ps top warm preload stop unload tune set-ctx param bench eval benchmark info show tag alias rm delete pull download sync run launch install setup update upgrade doctor diagnose diag config cfg completion freetier free-tier kimi-sync quota quotas quote tunnel gemini gemini-sync kimi-gemini codex codex-sync kimi-codex kimi-provider kimi-providers provider providers version status health hosts init scan discover check ping stream logs status-report report rotate-token web help"
     local global_opts="--remote --local --host --json --no-color -v --version -h --help"
     local supported_clis="claude grok kimi agy codex qwen cursor opencode cyberstrike openclaw hermes gh"
     local config_subcmds="get set unset list show path validate help"
@@ -11287,6 +11288,244 @@ _openai_sync_kimi() (
     _codex_helper sync-openai "$@"
 )
 
+# -----------------------------------------------------------------------------
+# Kimi provider management: list / disable / enable
+# Soft-disable moves [providers.<name>] and its [models."<name>/*"] aliases into
+# top-level [disabled_providers] / [disabled_models] tables that kimi never
+# reads, so the provider vanishes from the picker but every credential, model
+# spec and alias is preserved for a later enable.
+# -----------------------------------------------------------------------------
+_kimi_provider_manage() {
+    python3 - "$@" <<'PY'
+import json, sys, os, shutil, tempfile, stat
+
+try:
+    import tomlkit
+except ImportError:
+    print("Error: python3 tomlkit is required for provider management.", file=sys.stderr)
+    sys.exit(3)
+
+action = sys.argv[1]
+config_path = sys.argv[2]
+target = sys.argv[3] if len(sys.argv) > 3 else ""
+as_json = "--json" in sys.argv
+
+def load(path):
+    if not os.path.exists(path):
+        return tomlkit.document()
+    with open(path, "r", encoding="utf-8") as fh:
+        return tomlkit.parse(fh.read())
+
+def save(doc, path):
+    content = tomlkit.dumps(doc)
+    tomlkit.parse(content)  # validate round-trip
+    mode = stat.S_IMODE(os.stat(path).st_mode) if os.path.exists(path) else 0o600
+    fd, temp = tempfile.mkstemp(prefix=".kimi-provider-", dir=os.path.dirname(path))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(content)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.chmod(temp, mode)
+        os.replace(temp, path)
+    finally:
+        if os.path.exists(temp):
+            os.unlink(temp)
+
+def provider_models(doc, pid):
+    """Return list of model alias keys belonging to provider pid."""
+    models = doc.get("models", {})
+    return [k for k, v in models.items()
+            if isinstance(v, dict) and v.get("provider") == pid]
+
+def do_list(doc):
+    providers = doc.get("providers", {})
+    disabled = doc.get("disabled_providers", {})
+    models = doc.get("models", {})
+    dis_models = doc.get("disabled_models", {})
+    default = doc.get("default_model", "")
+    result = {"providers": [], "disabled_providers": [], "default_model": default}
+    for pid, prov in providers.items():
+        if not isinstance(prov, dict):
+            continue
+        mcount = len(provider_models(doc, pid))
+        result["providers"].append({
+            "id": pid, "type": prov.get("type", "?"),
+            "models": mcount, "enabled": True,
+            "is_default": default.startswith(pid + "/")
+        })
+    for pid, prov in disabled.items():
+        if not isinstance(prov, dict):
+            continue
+        mcount = len([k for k in dis_models if k.startswith(pid + "/")])
+        result["disabled_providers"].append({
+            "id": pid, "type": prov.get("type", "?"),
+            "models": mcount, "enabled": False
+        })
+    if as_json:
+        print(json.dumps(result, indent=2))
+    else:
+        print(f"{'PROVIDER':<32} {'TYPE':<18} {'MODELS':>7}  STATUS")
+        print("-" * 72)
+        for p in result["providers"]:
+            mark = " *" if p["is_default"] else ""
+            print(f"{p['id'] + mark:<32} {p['type']:<18} {p['models']:>7}  enabled")
+        for p in result["disabled_providers"]:
+            print(f"{p['id']:<32} {p['type']:<18} {p['models']:>7}  DISABLED")
+        if default:
+            print(f"\nDefault model: {default}")
+        print(f"\n  * = default provider")
+    return 0
+
+def do_disable(doc, pid):
+    providers = doc.get("providers", {})
+    if pid not in providers:
+        disabled = doc.get("disabled_providers", {})
+        if pid in disabled:
+            print(f"Provider '{pid}' is already disabled.", file=sys.stderr)
+            return 1
+        print(f"Error: provider '{pid}' not found in config.", file=sys.stderr)
+        return 1
+    # Move provider block
+    disabled = doc.setdefault("disabled_providers", tomlkit.table())
+    disabled[pid] = providers[pid]
+    del providers[pid]
+    # Move model aliases
+    models = doc.get("models", {})
+    dis_models = doc.setdefault("disabled_models", tomlkit.table())
+    moved = 0
+    for alias in provider_models(doc, pid):
+        dis_models[alias] = models[alias]
+        del models[alias]
+        moved += 1
+    # Also move any aliases prefixed with pid/ that were missed
+    for alias in list(models.keys()):
+        if alias.startswith(pid + "/"):
+            dis_models[alias] = models[alias]
+            del models[alias]
+            moved += 1
+    # Clear default_model if it pointed at this provider
+    default = doc.get("default_model", "")
+    if default.startswith(pid + "/"):
+        del doc["default_model"]
+        print(f"  [!] default_model '{default}' cleared (was on '{pid}')", file=sys.stderr)
+    if as_json:
+        print(json.dumps({"action": "disable", "provider": pid, "models_moved": moved}))
+    else:
+        print(f"  [✓] Disabled provider '{pid}' ({moved} model aliases hidden)")
+    return 0
+
+def do_enable(doc, pid):
+    disabled = doc.get("disabled_providers", {})
+    if pid not in disabled:
+        providers = doc.get("providers", {})
+        if pid in providers:
+            print(f"Provider '{pid}' is already enabled.", file=sys.stderr)
+            return 1
+        print(f"Error: disabled provider '{pid}' not found.", file=sys.stderr)
+        return 1
+    providers = doc.setdefault("providers", tomlkit.table())
+    providers[pid] = disabled[pid]
+    del disabled[pid]
+    # Move model aliases back
+    dis_models = doc.get("disabled_models", {})
+    models = doc.setdefault("models", tomlkit.table())
+    moved = 0
+    for alias in list(dis_models.keys()):
+        if alias.startswith(pid + "/"):
+            models[alias] = dis_models[alias]
+            del dis_models[alias]
+            moved += 1
+    if as_json:
+        print(json.dumps({"action": "enable", "provider": pid, "models_restored": moved}))
+    else:
+        print(f"  [✓] Enabled provider '{pid}' ({moved} model aliases restored)")
+    return 0
+
+doc = load(config_path)
+if action == "list":
+    sys.exit(do_list(doc))
+elif action == "disable":
+    if not target:
+        print("Error: 'disable' requires a provider name.", file=sys.stderr)
+        sys.exit(1)
+    rc = do_disable(doc, target)
+    if rc == 0:
+        save(doc, config_path)
+    sys.exit(rc)
+elif action == "enable":
+    if not target:
+        print("Error: 'enable' requires a provider name.", file=sys.stderr)
+        sys.exit(1)
+    rc = do_enable(doc, target)
+    if rc == 0:
+        save(doc, config_path)
+    sys.exit(rc)
+else:
+    print(f"Error: unknown action '{action}'", file=sys.stderr)
+    sys.exit(1)
+PY
+}
+
+cmd_kimi_provider() {
+    local action="" target="" opt_json="${OPT_JSON:-false}"
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            list|ls) action="list"; shift ;;
+            disable|off) action="disable"; shift ;;
+            enable|on) action="enable"; shift ;;
+            --json) opt_json="true"; shift ;;
+            -h|--help|help) _kimi_provider_usage; return 0 ;;
+            -*) echo "${C_RED}Error: unknown option '$1'.${C_RESET}" >&2; return 1 ;;
+            *)
+                if [[ -z "${target}" ]]; then target="$1"; shift
+                else echo "${C_RED}Error: only one provider name allowed.${C_RESET}" >&2; return 1; fi
+                ;;
+        esac
+    done
+    action="${action:-list}"
+    local -a extra=()
+    [[ "${opt_json}" == "true" ]] && extra+=(--json)
+    # Hold the config lock so a concurrent launch/sync cannot interleave.
+    mkdir -p "$(dirname "${KIMI_CONFIG_LOCK}")" 2>/dev/null || true
+    if command -v flock >/dev/null 2>&1; then
+        exec 8>>"${KIMI_CONFIG_LOCK}" 2>/dev/null || true
+        flock -w 15 8 || { echo "${C_RED}Error: Kimi config is busy; retry.${C_RESET}" >&2; return 1; }
+    fi
+    _kimi_provider_manage "${action}" "${KIMI_CONFIG}" "${target}" "${extra[@]}"
+}
+
+_kimi_provider_usage() {
+    cat <<EOF
+${C_BOLD}kimo kimi provider${C_RESET} – Enable/disable LLM providers in Kimi Code's config
+
+${C_YELLOW}Usage:${C_RESET}
+  ${0##*/} kimi provider [list|disable|enable] [provider] [options]
+
+${C_YELLOW}Commands:${C_RESET}
+  ${C_CYAN}list, ls${C_RESET}              Show all providers with enabled/disabled status (default)
+  ${C_CYAN}disable, off <name>${C_RESET}   Hide a provider and its model aliases from Kimi's picker
+  ${C_CYAN}enable, on <name>${C_RESET}     Restore a disabled provider and its model aliases
+
+${C_YELLOW}Options:${C_RESET}
+  ${C_CYAN}--json${C_RESET}                Machine-readable output
+  ${C_CYAN}-h, --help${C_RESET}            Show this help
+
+${C_YELLOW}How it works:${C_RESET}
+  Disable moves [providers.<name>] and its [models."<name>/*"] aliases into
+  [disabled_providers] / [disabled_models] tables that Kimi never reads.
+  Credentials, model specs and aliases are fully preserved; enable moves
+  them back. If the disabled provider held the default_model, that pin is
+  cleared so Kimi falls back to its own default.
+
+${C_YELLOW}Examples:${C_RESET}
+  ${0##*/} kimi provider list                    # Show all providers
+  ${0##*/} kimi provider disable groq             # Hide groq from Kimi's picker
+  ${0##*/} kimi provider enable groq              # Restore groq
+  ${0##*/} kimi provider disable openai --json    # Machine-readable
+EOF
+}
+
 cmd_codex() {
     # Bridge actions are reserved; everything else uses the native CLI with
     # its own config, login/refresh, stdin, stdout and exit status intact.
@@ -12274,6 +12513,16 @@ case "${COMMAND}" in
         ;;
     codex-sync|kimi-codex)
         cmd_codex --sync "${ARGS[@]}"
+        ;;
+    kimi-provider|kimi-providers|provider|providers)
+        cmd_kimi_provider "${ARGS[@]}"
+        ;;
+    kimi)
+        case "${ARGS[0]:-}" in
+            provider|providers) cmd_kimi_provider "${ARGS[@]:1}" ;;
+            *) echo "${C_RED}Error: unknown kimi subcommand '${ARGS[0]:-}'.${C_RESET}" >&2
+               echo "Usage: ${0##*/} kimi provider [list|disable|enable] [name]" >&2; return 1 ;;
+        esac
         ;;
     web)
         cmd_web "${ARGS[@]}"
