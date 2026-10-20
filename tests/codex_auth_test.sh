@@ -365,10 +365,11 @@ FRESH_JWT="${JWT_HEADER}.${FRESH_PAYLOAD}.fresh_signature_bytes"
 # A loopback OAuth token endpoint. The harness proxy only lets loopback through,
 # so KIMO_CODEX_TOKEN_URL is the seam that keeps this test offline.
 cat > "${HARNESS_ROOT}/token_endpoint.py" <<'PY'
-import json, sys
+import json, sys, threading, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 mode, port_file, log, fresh = sys.argv[1:5]
+used, used_lock = set(), threading.Lock()
 
 
 class H(BaseHTTPRequestHandler):
@@ -379,7 +380,15 @@ class H(BaseHTTPRequestHandler):
         body = self.rfile.read(int(self.headers.get("Content-Length") or 0)) or b"{}"
         with open(log, "a") as fh:
             fh.write(body.decode() + "\n")
-        if mode == "refuse":
+        grant = json.loads(body).get("refresh_token")
+        with used_lock:
+            reused = grant in used
+            used.add(grant)
+        if mode == "rotate":
+            # Like the real endpoint: a refresh token is single-use. The slow
+            # first answer leaves a concurrent caller time to race it.
+            time.sleep(1)
+        if mode == "refuse" or (mode == "rotate" and reused):
             status, reply = 400, {"error": "invalid_grant"}
         else:
             status, reply = 200, {"access_token": fresh, "refresh_token": "rotated_refresh_token",
@@ -469,6 +478,21 @@ check "the renewal can be switched off" 1 "${rc}"
 check "a switched-off renewal makes no request" 0 "$(wc -l < "${TOKEN_LOG}" | tr -d ' ')"
 check_contains "the failure names the token state" expired "${offline}"
 check_contains "the failure says how to sign in" "codex login" "${offline}"
+
+start_token_endpoint rotate
+write_auth "${STALE_JWT}"
+KIMO_CODEX_TOKEN_URL="${TOKEN_URL}" "${KIMO}" codex --token >"${HARNESS_ROOT}/race-a" 2>/dev/null &
+race_a=$!
+KIMO_CODEX_TOKEN_URL="${TOKEN_URL}" "${KIMO}" codex --token >"${HARNESS_ROOT}/race-b" 2>/dev/null &
+race_b=$!
+rc_a=0 rc_b=0
+wait "${race_a}" || rc_a=$?
+wait "${race_b}" || rc_b=$?
+check "concurrent renewals both succeed" "0 0" "${rc_a} ${rc_b}"
+check "concurrent renewals send the single-use refresh token once" 1 "$(wc -l < "${TOKEN_LOG}" | tr -d ' ')"
+check "both concurrent callers get the renewed token" "${FRESH_JWT} ${FRESH_JWT}" \
+    "$(cat "${HARNESS_ROOT}/race-a") $(cat "${HARNESS_ROOT}/race-b")"
+check "the refresh lock stays out of CODEX_HOME" 2 "$(codex_dir_entries)"
 
 start_token_endpoint refuse
 write_auth "${STALE_JWT}"

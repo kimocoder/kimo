@@ -3,6 +3,8 @@
 
 import base64
 import datetime
+import fcntl
+import hashlib
 import json
 import math
 import os
@@ -165,13 +167,46 @@ def auth_mode(home):
 
 
 def refresh(home):
-    """Renew the ChatGPT OAuth access token from auth.json's refresh_token."""
+    """Renew the ChatGPT OAuth access token from auth.json's refresh_token.
+
+    Refresh tokens rotate: two launches renewing at once would send the same
+    one, and the loser is refused (or the whole grant revoked as reuse). So
+    renewals are serialized on a lock file, and a caller that waited re-reads
+    auth.json and keeps a token another process already renewed.
+    """
+    home.mkdir(parents=True, exist_ok=True)
+    timeout = float(os.environ.get("KIMO_CODEX_REFRESH_TIMEOUT") or 30)
+    # kimo's private runtime dir keeps the lock out of ~/.codex; one lock per
+    # Codex home. O_NOFOLLOW so a planted symlink is never opened.
+    runtime = os.environ.get("KIMO_RUNTIME_DIR") or ""
+    key = hashlib.sha256(str(home.resolve()).encode()).hexdigest()[:16]
+    lock_path = (Path(runtime) if os.path.isdir(runtime) else home) / f".codex-auth-{key}.lock"
+    fd = os.open(lock_path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, "r+") as lock:
+        deadline = time.monotonic() + timeout + 5
+        while True:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() > deadline:
+                    raise ValueError("Another kimo process is renewing the ChatGPT OAuth token; retry.") from None
+                time.sleep(0.1)
+        _, tokens = auth_tokens(home)
+        current = file_access_token(tokens)
+        expiry = token_expiry(current) if current and not current.startswith("sk-") else None
+        if expiry is not None and expiry > time.time() + EXPIRY_SKEW_SECONDS:
+            print(f"  [✓] The ChatGPT OAuth token in {home / 'auth.json'} was already renewed.", file=sys.stderr)
+            return
+        _refresh_locked(home, timeout)
+
+
+def _refresh_locked(home, timeout):
     auth, tokens = auth_tokens(home)
     refresh_token = tokens.get("refresh_token")
     if not isinstance(refresh_token, str) or not refresh_token:
         raise ValueError(f"No refresh_token in {home / 'auth.json'}; sign in again with 'kimo codex login'.")
     url = os.environ.get("KIMO_CODEX_TOKEN_URL") or CODEX_TOKEN_URL
-    timeout = float(os.environ.get("KIMO_CODEX_REFRESH_TIMEOUT") or 30)
     body = json.dumps({
         "client_id": CODEX_CLIENT_ID,
         "grant_type": "refresh_token",

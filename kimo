@@ -10866,7 +10866,11 @@ _codex_helper() {
         echo "Error: kimo-codex.py is missing; reinstall kimo." >&2
         return 1
     fi
-    CODEX_HOME="${CODEX_HOME}" KIMI_CONFIG="${KIMI_CONFIG}" python3 "${helper}" "$@"
+    # The refresh lock lives in the private runtime dir; without one the helper
+    # falls back to CODEX_HOME.
+    local runtime=""
+    ensure_private_dir "${KIMO_RUNTIME_DIR}" 2>/dev/null && runtime="${KIMO_RUNTIME_DIR}"
+    CODEX_HOME="${CODEX_HOME}" KIMI_CONFIG="${KIMI_CONFIG}" KIMO_RUNTIME_DIR="${runtime}" python3 "${helper}" "$@"
 }
 
 _codex_show_status() {
