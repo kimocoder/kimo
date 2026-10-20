@@ -2339,7 +2339,7 @@ if not instances:
     print(f"\n{C_YELLOW}[!] Scan complete in {scan_duration}s: No Ollama instances found across {len(endpoints)} scanned endpoint(s).{C_RESET}")
     print("  Troubleshooting suggestions:")
     print("    • Ensure Ollama is running and bound to all interfaces (OLLAMA_HOST=0.0.0.0:11434).")
-    print("    • Use -p / --ports to check non-standard ports (e.g. kimo scan --all-ports).")
+    print("    • Use -p/--ports to check non-standard ports (e.g. kimo scan --all-ports).")
     print("    • Check firewall / security group permissions between hosts.")
     sys.exit(0)
 
@@ -11538,14 +11538,23 @@ def resolve_key(prov):
         return "ollama", "ollama-placeholder"
     return None, "no-credential"
 
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    # Never forward a provider key to another origin through a redirect;
+    # urllib would otherwise resend Authorization/x-api-key to the new host.
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+def get_json(url, headers, tmo):
+    """GET url with the key in headers only, over http(s), without redirects."""
+    if urllib.parse.urlsplit(url).scheme not in ("http", "https"):
+        raise ValueError(f"not an http(s) URL: {url}")
+    req = urllib.request.Request(url, headers={**headers, "User-Agent": "kimo-provider-sync/1.0"})
+    with urllib.request.build_opener(NoRedirect()).open(req, timeout=tmo) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
 def fetch_models_openai(base_url, key, tmo):
     url = base_url.rstrip("/") + "/models"
-    req = urllib.request.Request(url, headers={
-        "Authorization": f"Bearer {key}",
-        "User-Agent": "kimo-provider-sync/1.0"
-    })
-    with urllib.request.urlopen(req, timeout=tmo) as resp:
-        data = json.loads(resp.read().decode("utf-8"))
+    data = get_json(url, {"Authorization": f"Bearer {key}"}, tmo)
     models = []
     for item in data.get("data", []):
         mid = item.get("id", "")
@@ -11558,15 +11567,13 @@ def fetch_models_openai(base_url, key, tmo):
         models.append(spec)
     return models
 
-def fetch_models_anthropic(key, tmo):
-    url = "https://api.anthropic.com/v1/models"
-    req = urllib.request.Request(url, headers={
-        "x-api-key": key,
-        "anthropic-version": "2023-06-01",
-        "User-Agent": "kimo-provider-sync/1.0"
-    })
-    with urllib.request.urlopen(req, timeout=tmo) as resp:
-        data = json.loads(resp.read().decode("utf-8"))
+def fetch_models_anthropic(base_url, key, tmo):
+    # The key belongs to the provider's own base_url (a proxy or compatible
+    # gateway); only a provider without one talks to api.anthropic.com.
+    # Anthropic base URLs conventionally omit /v1 (the SDK appends it).
+    base = (base_url or "https://api.anthropic.com").rstrip("/")
+    url = base + ("/models" if base.endswith("/v1") else "/v1/models")
+    data = get_json(url, {"x-api-key": key, "anthropic-version": "2023-06-01"}, tmo)
     models = []
     for item in data.get("data", []):
         mid = item.get("id", "")
@@ -11577,11 +11584,9 @@ def fetch_models_anthropic(key, tmo):
     return models
 
 def fetch_models_google(base_url, key, tmo):
-    sep = "&" if "?" in base_url else "?"
-    url = base_url.rstrip("/") + f"/models{sep}key={urllib.parse.quote(key)}"
-    req = urllib.request.Request(url, headers={"User-Agent": "kimo-provider-sync/1.0"})
-    with urllib.request.urlopen(req, timeout=tmo) as resp:
-        data = json.loads(resp.read().decode("utf-8"))
+    # x-goog-api-key header, not ?key=: a URL ends up in logs and error text.
+    base = (base_url or "https://generativelanguage.googleapis.com/v1beta").rstrip("/")
+    data = get_json(base + "/models", {"x-goog-api-key": key}, tmo)
     models = []
     for item in data.get("models", []):
         name = item.get("name", "")
@@ -11653,7 +11658,7 @@ def validate_one(pid, prov, tmo):
 
     try:
         if ptype == "anthropic":
-            models = fetch_models_anthropic(key, effective_tmo)
+            models = fetch_models_anthropic(base_url, key, effective_tmo)
         elif ptype == "google-genai":
             models = fetch_models_google(base_url, key, effective_tmo)
         else:
@@ -11672,6 +11677,9 @@ def validate_one(pid, prov, tmo):
         elif e.code == 404:
             result["status"] = "no-models-endpoint"
             result["error"] = "HTTP 404 (provider has no /models)"
+        elif 300 <= e.code < 400:
+            result["status"] = "redirected"
+            result["error"] = f"HTTP {e.code} redirect not followed; set base_url to the final URL"
         else:
             result["status"] = "http-error"
             result["error"] = f"HTTP {e.code}"
@@ -11872,7 +11880,9 @@ ${C_YELLOW}How sync works:${C_RESET}
   hits the provider's /models endpoint, and upserts [models."<pid>/*"]
   aliases into config.toml. Provider types handled: openai, openai_responses,
   anthropic, google-genai. Kimi-managed (OAuth) providers are skipped.
-  Statuses: ok, bad-key, rate-limited, unreachable, no-credential, skipped.
+  Statuses: ok, bad-key, rate-limited, redirected, unreachable, no-credential,
+  skipped. Keys go only to the provider's base_url, in headers; redirects are
+  never followed.
 
 ${C_YELLOW}How disable/enable works:${C_RESET}
   Disable moves [providers.<name>] and its [models."<name>/*"] aliases into

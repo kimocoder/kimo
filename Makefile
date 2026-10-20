@@ -13,7 +13,7 @@ export KIMO_NO_AUTOSCAN := 1
 
 SCRIPT  := kimo
 
-.PHONY: all help install uninstall link unlink check lint test test-check test-web test-qwen test-claude test-agy test-opencode test-kimi test-codex test-codex-auth test-dashscope test-cursor test-grok test-gh test-thinking-tools test-gemini test-scan test-quota test-tunnel test-config-validate test-rotate-token test-jq-guard test-pull-json test-backup-prune test-web-url-esc test-gh-guard test-model-args test-launch-contract test-sync test-model-commands test-shim test-install-packages test-config-rules test-hardening test-extra clean install-completion uninstall-completion update update-% test-host-url test-web-bridge test-option-values test-update-lookup test-codex-update test-qwen-update test-cli-health
+.PHONY: all help install uninstall link unlink check lint test test-check test-web test-qwen test-claude test-agy test-opencode test-kimi test-codex test-codex-auth test-dashscope test-cursor test-grok test-gh test-thinking-tools test-gemini test-scan test-quota test-tunnel test-config-validate test-rotate-token test-jq-guard test-pull-json test-backup-prune test-web-url-esc test-gh-guard test-model-args test-launch-contract test-sync test-model-commands test-shim test-install-packages test-config-rules test-hardening test-extra clean install-completion uninstall-completion update update-% test-host-url test-web-bridge test-option-values test-update-lookup test-codex-update test-qwen-update test-cli-health test-provider-sync
 
 all: help
 
@@ -68,6 +68,8 @@ help:
 	@echo "  make test-host-url           Host URL normalization (https, proxied paths, IPv6)"
 	@echo "  make test-web-bridge         kimo web against fake WebBridge daemons (errors, quoting, --results)"
 	@echo "  make test-option-values      Missing option values fail loudly instead of exiting silently"
+	@echo "  make test-provider-sync      kimi provider sync keeps keys on base_url: no redirects, header-only"
+	@echo "  make      kimi provider disable/enable round trip, sync refresh/filter/prune, CLI errors"
 	@echo "  make clean                 Remove temporary and backup files"
 	@echo "  make help                  Display this help message"
 	@echo ""
@@ -171,7 +173,7 @@ lint:
 	@python3 tests/check_buffer_splits.py
 	@echo "[✓] Lint check passed."
 
-test: test-check test-web test-scan test-gh test-thinking-tools test-gemini test-qwen test-claude test-agy test-opencode test-kimi test-abliteration test-codex test-codex-auth test-dashscope test-cursor test-grok test-quota test-tunnel test-config-validate test-rotate-token test-jq-guard test-pull-json test-backup-prune test-web-url-esc test-gh-guard test-model-args test-launch-contract test-sync test-model-commands test-shim test-install-packages test-config-rules test-hardening test-host-url test-web-bridge test-option-values test-update-lookup test-codex-update test-qwen-update test-cli-health
+test: test-check test-web test-scan test-gh test-thinking-tools test-gemini test-qwen test-claude test-agy test-opencode test-kimi test-abliteration test-codex test-codex-auth test-dashscope test-cursor test-grok test-quota test-tunnel test-config-validate test-rotate-token test-jq-guard test-pull-json test-backup-prune test-web-url-esc test-gh-guard test-model-args test-launch-contract test-sync test-model-commands test-shim test-install-packages test-config-rules test-hardening test-host-url test-web-bridge test-option-values test-update-lookup test-codex-update test-qwen-update test-cli-health test-provider-sync
 	@echo ""
 	@echo "[✓] All test suites completed successfully."
 
@@ -317,7 +319,7 @@ clean:
 	@rm -f *~ *.tmp *.bak
 	@echo "[✓] Clean."
 
-test-extra: test-config-validate test-rotate-token test-jq-guard test-pull-json test-backup-prune test-web-url-esc test-gh-guard test-model-args test-launch-contract test-sync test-model-commands test-shim test-install-packages test-config-rules test-hardening test-host-url test-web-bridge test-option-values test-update-lookup test-codex-update test-qwen-update test-cli-health
+test-extra: test-config-validate test-rotate-token test-jq-guard test-pull-json test-backup-prune test-web-url-esc test-gh-guard test-model-args test-launch-contract test-sync test-model-commands test-shim test-install-packages test-config-rules test-hardening test-host-url test-web-bridge test-option-values test-update-lookup test-codex-update test-qwen-update test-cli-health test-provider-sync
 
 test-host-url:
 	@echo "[*] Running host-url tests..."
@@ -346,3 +348,7 @@ test-qwen-update:
 test-cli-health:
 	@echo "[*] Running post-install CLI health tests..."
 	@tests/cli_health_test.sh
+
+test-provider-sync:
+	@echo "[*] Running provider sync credential tests..."
+	@tests/provider_sync_test.sh
