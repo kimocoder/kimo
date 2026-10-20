@@ -1,0 +1,16 @@
+# Read by Codacy's Pylint (pylintpython3). `make lint` runs ruff, and ruff.toml
+# is the project's style policy, so pylint is kept to its bug-finding checks.
+[MESSAGES CONTROL]
+disable=
+    # Conventions and design metrics (naming, docstrings, line length, size
+    # and complexity counts) are style, which ruff.toml owns.
+    C,
+    R,
+    # The cli_* dispatch table and signal handlers share fixed signatures.
+    unused-argument,
+    # Best-effort probes report the failure and carry on by design.
+    broad-exception-caught,
+    # kimo-stream.py caches one HTTP session at module level.
+    global-statement,
+    # Codacy loads pylint_django; this is not a Django project.
+    django-not-configured,

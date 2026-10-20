@@ -28,7 +28,7 @@ class Upstream(BaseHTTPRequestHandler):
     requests: list = []
     reply: object = None  # dict -> JSON body; list -> NDJSON stream
 
-    def log_message(self, format, *args):  # noqa: A002
+    def log_message(self, format, *args):  # noqa: A002  # pylint: disable=redefined-builtin
         pass
 
     def do_GET(self):
@@ -47,9 +47,9 @@ class Upstream(BaseHTTPRequestHandler):
             self.send_header("Content-Type", "application/x-ndjson")
             self.send_header("Connection", "close")
             self.end_headers()
-            for chunk in reply:
+            for chunk in reply:  # pylint: disable=not-an-iterable
                 self.wfile.write((json.dumps(chunk) + "\n").encode())
-            self.close_connection = True
+            self.close_connection = True  # pylint: disable=attribute-defined-outside-init
         else:
             body = json.dumps(reply).encode()
             self.send_response(200)

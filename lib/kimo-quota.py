@@ -99,7 +99,7 @@ def read_dotenv(path):
     """Read plain KEY=value lines without evaluating shell code."""
     result = {}
     try:
-        for line in Path(path).read_text().splitlines():
+        for line in Path(path).read_text(encoding="utf-8").splitlines():
             key, sep, value = line.strip().removeprefix("export ").partition("=")
             if sep and key and not key.startswith("#"):
                 result[key.strip()] = value.strip().strip("\"'")
@@ -142,7 +142,7 @@ def fetch_json(url, timeout, headers=None, body=None, form=False):
                 # Bound the whole response, including servers that slowly drip
                 # bytes and never trigger an ordinary per-read socket timeout.
                 try:
-                    response.fp.raw._sock.settimeout(remaining)
+                    response.fp.raw._sock.settimeout(remaining)  # pylint: disable=protected-access
                 except AttributeError:
                     pass
                 chunk = response.read1(65536)

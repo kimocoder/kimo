@@ -54,7 +54,7 @@ def parse_models(spec: str) -> dict[str, str]:
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
-    def log_message(self, format: str, *args: object) -> None:  # noqa: A002
+    def log_message(self, format: str, *args: object) -> None:  # noqa: A002  # pylint: disable=redefined-builtin
         pass
 
     def _record(self, body: object = None) -> None:
@@ -149,7 +149,7 @@ class Handler(BaseHTTPRequestHandler):
             for event in self.server.pull_events:
                 self.wfile.write((json.dumps(event) + "\n").encode())
                 self.wfile.flush()
-            self.close_connection = True
+            self.close_connection = True  # pylint: disable=attribute-defined-outside-init
         elif self.path == "/api/show":
             name = body.get("model") or body.get("name") or ""
             name = name if ":" in name.split("/")[-1] else name + ":latest"

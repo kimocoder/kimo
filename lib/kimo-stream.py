@@ -50,6 +50,7 @@ import threading
 import time
 import socket
 import datetime
+import re
 import urllib.parse
 import urllib.request
 import urllib.error
@@ -164,6 +165,14 @@ def get_http_session():
     return _shared_session
 
 
+def _urlopen_http(req, timeout):
+    """urlopen for http(s) only: URLs come from --remote and the environment,
+    and urllib would otherwise also open file:// and custom schemes."""
+    if urllib.parse.urlsplit(req.full_url).scheme not in ("http", "https"):
+        raise ValueError(f"not an http(s) URL: {req.full_url}")
+    return urllib.request.urlopen(req, timeout=timeout)  # nosec B310 - scheme checked above
+
+
 def url_ok(url, timeout=2):
     session = get_http_session()
     if session is not None:
@@ -174,7 +183,7 @@ def url_ok(url, timeout=2):
             return False
     try:
         req = urllib.request.Request(url + "/api/version", headers=_remote_headers())
-        with urllib.request.urlopen(req, timeout=timeout) as r:
+        with _urlopen_http(req, timeout) as r:
             return r.status == 200
     except Exception:
         return False
@@ -225,7 +234,7 @@ def get_json(url, data=None, timeout=5):
         except RuntimeError:
             raise
         except Exception as e:
-            raise RuntimeError(f"Connection failed: {e}")
+            raise RuntimeError(f"Connection failed: {e}") from e
 
     req_data = None
     extra = {}
@@ -234,13 +243,13 @@ def get_json(url, data=None, timeout=5):
         extra["Content-Type"] = "application/json"
     req = urllib.request.Request(url, data=req_data, headers=_remote_headers(extra))
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with _urlopen_http(req, timeout) as resp:
             return json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
         body = e.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"HTTP {e.code}: {body}")
+        raise RuntimeError(f"HTTP {e.code}: {body}") from e
     except Exception as e:
-        raise RuntimeError(f"Connection failed: {e}")
+        raise RuntimeError(f"Connection failed: {e}") from e
 
 
 def get_remote_tags(remote_url, force_refresh=False):
@@ -322,7 +331,7 @@ def warm_remote_model(remote_url, full_name, keepalive="24h", timeout=120, optio
     try:
         data = get_json(f"{remote_url}/api/generate", payload, timeout=timeout)
     except Exception as e:
-        raise RuntimeError(f"warm request failed: {e}")
+        raise RuntimeError(f"warm request failed: {e}") from e
     txt = json.dumps(data)
     if '"done_reason":"load"' in txt.replace(" ", "") or data.get("done") is True:
         return True, "loaded into VRAM"
@@ -443,9 +452,9 @@ def state_file_lock(mode=fcntl.LOCK_EX, timeout=10.0):
                 fcntl.flock(fd, mode | fcntl.LOCK_NB)
                 acquired = True
                 break
-            except (BlockingIOError, OSError):
+            except (BlockingIOError, OSError) as e:
                 if time.time() - start >= timeout:
-                    raise TimeoutError(f"Could not acquire state lock {lock_path} within {timeout}s")
+                    raise TimeoutError(f"Could not acquire state lock {lock_path} within {timeout}s") from e
                 time.sleep(0.05)
         yield
     finally:
@@ -590,6 +599,24 @@ def reconcile_pins(remote_url, keepalive="24h", warm_new=True, dry_run=False):
     return pins_copy, added, removed, state_path
 
 
+def _blob_path(blobs_dir, digest):
+    """Blob file for a well-formed sha256 digest; None for anything else.
+
+    The digest comes from the manifest, and cleanup deletes the blob, so a
+    crafted digest must not be able to name a file outside blobs_dir.
+    """
+    if not isinstance(digest, str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", digest):
+        return None
+    root = os.path.realpath(blobs_dir)
+    path = os.path.realpath(os.path.join(root, digest.replace(":", "-")))
+    return path if path.startswith(root + os.sep) else None
+
+
+def _within(path, root):
+    root = os.path.realpath(root)
+    return os.path.realpath(path).startswith(root + os.sep)
+
+
 def _check_manifest_broken(mpath, manifests_root, blobs_dir):
     try:
         with open(mpath, encoding="utf-8") as f:
@@ -599,9 +626,8 @@ def _check_manifest_broken(mpath, manifests_root, blobs_dir):
     layers = man.get("layers") or []
     for layer in layers:
         digest = layer.get("digest", "")
-        hexd = digest.split(":", 1)[1] if ":" in digest else digest
-        bpath = os.path.join(blobs_dir, f"sha256-{hexd}")
-        if os.path.exists(bpath) and os.path.getsize(bpath) == 0:
+        bpath = _blob_path(blobs_dir, digest)
+        if bpath and os.path.exists(bpath) and os.path.getsize(bpath) == 0:
             rel = os.path.relpath(mpath, manifests_root)
             return {"manifest": mpath, "name": rel, "blob": bpath, "digest": digest}
     return None
@@ -625,7 +651,9 @@ def find_broken_local_entries(model_filter=None):
             os.path.join(manifests_root, "registry.ollama.ai", "library", filter_q),
             os.path.join(manifests_root, "registry.ollama.ai", filter_q),
         ]
-        existing = [c for c in candidates if os.path.exists(c)]
+        # The filter is joined into the path: keep "../" out of the walk,
+        # since cleanup removes what the walk finds.
+        existing = [c for c in candidates if os.path.exists(c) and _within(c, manifests_root)]
         if existing:
             search_roots = existing
 
@@ -713,7 +741,6 @@ def _is_model_resident(m):
     if not exp:
         return True
     try:
-        import datetime
         clean_exp = exp
         if "." in clean_exp:
             main_part, rest = clean_exp.split(".", 1)

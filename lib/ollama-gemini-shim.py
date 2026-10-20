@@ -281,7 +281,7 @@ def candidate(parts: list, finish: str | None) -> dict:
 class GeminiShimHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
-    def log_message(self, format: str, *args: object) -> None:  # noqa: A002
+    def log_message(self, format: str, *args: object) -> None:  # noqa: A002  # pylint: disable=redefined-builtin
         # Suppress routine access log noise on stdout
         pass
 
@@ -471,7 +471,7 @@ class GeminiShimServer(ThreadingHTTPServer):
     daemon_threads = True
 
     def __init__(self, server_address: tuple[str, int], upstream: str, default_model: str,
-                 upstream_token: str = ""):
+                 upstream_token: str = ""):  # nosec B107 - empty means no upstream auth
         # The upstream is opened with urllib, which would also follow file:// or
         # custom schemes; only an Ollama HTTP(S) endpoint is acceptable.
         if urllib.parse.urlparse(upstream).scheme not in ("http", "https"):

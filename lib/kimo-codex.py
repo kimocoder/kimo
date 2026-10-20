@@ -15,12 +15,13 @@ import sys
 import tempfile
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 # Codex CLI's own public OAuth client id, so a refresh here is the same renewal
 # 'codex' performs itself and needs no extra registration.
 CODEX_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
-CODEX_TOKEN_URL = "https://auth.openai.com/oauth/token"
+CODEX_TOKEN_URL = "https://auth.openai.com/oauth/token"  # nosec B105 - an endpoint, not a secret
 # A token this close to expiry counts as expired: launching on it would 401
 # partway through a session, which is far harder to diagnose than refreshing.
 EXPIRY_SKEW_SECONDS = 60
@@ -207,6 +208,11 @@ def _refresh_locked(home, timeout):
     if not isinstance(refresh_token, str) or not refresh_token:
         raise ValueError(f"No refresh_token in {home / 'auth.json'}; sign in again with 'kimo codex login'.")
     url = os.environ.get("KIMO_CODEX_TOKEN_URL") or CODEX_TOKEN_URL
+    # The refresh token goes in the body: https only, or http to loopback (the
+    # offline test seam). This also keeps file:// and other schemes out.
+    parts = urllib.parse.urlsplit(url)
+    if not (parts.scheme == "https" or (parts.scheme == "http" and parts.hostname in ("127.0.0.1", "::1", "localhost"))):
+        raise ValueError(f"Refusing to send the refresh token to {url!r}: use an https:// URL.")
     body = json.dumps({
         "client_id": CODEX_CLIENT_ID,
         "grant_type": "refresh_token",
@@ -217,7 +223,7 @@ def _refresh_locked(home, timeout):
         url, data=body, method="POST",
         headers={"Content-Type": "application/json", "Accept": "application/json"})
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
+        with urllib.request.urlopen(request, timeout=timeout) as response:  # nosec B310 - scheme checked above
             payload = json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as error:
         # The response body is not surfaced: it echoes the grant it rejected.
