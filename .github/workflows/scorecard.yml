@@ -1,0 +1,55 @@
+# OpenSSF Scorecard rates the repository's supply-chain hygiene (pinned
+# dependencies, token permissions, branch protection, code review, signed
+# releases, ...). Results go to code scanning under "scorecard" and, with
+# publish_results, to the public Scorecard API for the badge.
+# Docs: https://github.com/ossf/scorecard-action
+
+name: Scorecard supply-chain security
+
+on:
+  # Branch-Protection is only rechecked on its own events and the schedule.
+  branch_protection_rule:
+  schedule:
+    - cron: '41 4 * * 2'
+  push:
+    branches: [ "master" ]
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  analysis:
+    name: Scorecard analysis
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # publish_results requires the job to run as written in the starter
+    # workflow: read-only token, no extra steps that could tamper with results.
+    permissions:
+      contents: read
+      actions: read
+      security-events: write # to upload SARIF results
+      id-token: write # to sign the published results (OIDC)
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Run analysis
+        uses: ossf/scorecard-action@2d1146689b8cda280b9bc96326124645441f03bc # v2.4.4
+        with:
+          results_file: results.sarif
+          results_format: sarif
+          publish_results: true
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: SARIF file
+          path: results.sarif
+          retention-days: 5
+
+      - name: Upload to code scanning
+        uses: github/codeql-action/upload-sarif@6f2ac81f5cd81fe351a197ba0b00d91d03cd2aee # v4.39.0
+        with:
+          sarif_file: results.sarif
