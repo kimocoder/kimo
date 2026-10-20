@@ -164,6 +164,8 @@ lint:
 	@shellcheck -x -S warning $(SCRIPT) tests/*.sh tests/lib/*.sh
 	@echo "[*] Running ruff on lib/ and tests/..."
 	@ruff check --no-cache lib tests
+	@echo "[*] Checking for UTF-8 characters split across 8 KiB boundaries (Codacy CLI hang)..."
+	@python3 tests/check_buffer_splits.py
 	@echo "[✓] Lint check passed."
 
 test: test-check test-web test-scan test-gh test-thinking-tools test-gemini test-qwen test-claude test-agy test-opencode test-kimi test-abliteration test-codex test-codex-auth test-dashscope test-cursor test-grok test-quota test-tunnel test-config-validate test-rotate-token test-jq-guard test-pull-json test-backup-prune test-web-url-esc test-gh-guard test-model-args test-launch-contract test-sync test-shim test-install-packages test-config-rules test-hardening test-host-url test-web-bridge test-option-values test-update-lookup test-codex-update test-qwen-update test-cli-health
