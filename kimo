@@ -26,10 +26,12 @@ KIMO_VERSION="1.1.0"
 
 # Inspect /proc/*/cmdline to detect if an active SSH tunnel forwards a local port
 _detect_tunnel_target() {
-    local lport="${1:-11438}" target=""
-    for cmd in /proc/[0-9]*/cmdline; do
-        [[ -f "${cmd}" ]] || continue
-        if grep -a -q ":${lport}:" "${cmd}" 2>/dev/null; then
+    local lport="${1:-11438}" target="" matches=()
+    # One grep over every cmdline: a grep per process cost ~0.5s of startup on
+    # every command, growing with the process count.
+    mapfile -t matches < <(grep -l -a -F ":${lport}:" /proc/[0-9]*/cmdline 2>/dev/null || true)
+    for cmd in "${matches[@]}"; do
+        if [[ -f "${cmd}" ]]; then
             local words=()
             while IFS= read -r -d '' arg; do
                 words+=("${arg}")
