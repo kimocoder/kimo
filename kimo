@@ -9991,6 +9991,9 @@ _freetier_write_config() {
     if [[ -f "${KIMI_FT_CONFIG}" ]]; then
         local backup
         backup="${KIMI_FT_CONFIG}.before-freetier-$(date -u +%Y%m%dT%H%M%S%z)"
+        # two runs in the same second must not clobber the earlier backup
+        local n=1 base="${backup}"
+        while [[ -e "${backup}" ]]; do backup="${base}-$((n++))"; done
         cp -p "${KIMI_FT_CONFIG}" "${backup}"
         chmod 600 "${backup}"
         echo "${C_DIM}backup: ${backup}${C_RESET}" >&2
@@ -10538,6 +10541,9 @@ _gemini_write_config() {
     if [[ -f "${KIMI_GM_CONFIG}" ]]; then
         local backup
         backup="${KIMI_GM_CONFIG}.before-gemini-$(date -u +%Y%m%dT%H%M%S%z)"
+        # two runs in the same second must not clobber the earlier backup
+        local n=1 base="${backup}"
+        while [[ -e "${backup}" ]]; do backup="${base}-$((n++))"; done
         cp -p "${KIMI_GM_CONFIG}" "${backup}"
         chmod 600 "${backup}"
         echo "${C_DIM}backup: ${backup}${C_RESET}" >&2

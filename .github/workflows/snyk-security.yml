@@ -55,7 +55,9 @@ jobs:
         # stdlib-only Python with no dependency manifest for 'snyk monitor'.
       - name: Snyk Code test
         if: env.SNYK_TOKEN != ''
-        run: snyk code test --sarif > snyk-code.sarif
+        # Exit 1 only means issues were found; they land in Code Scanning, which
+        # owns PR gating (as with Codacy). Exit 2/3 are real errors.
+        run: snyk code test --sarif > snyk-code.sarif || [ $? -eq 1 ]
 
         # Push the Snyk Code results into GitHub Code Scanning tab
       - name: Upload result to GitHub Code Scanning

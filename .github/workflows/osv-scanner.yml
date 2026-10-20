@@ -26,6 +26,9 @@ permissions:
   security-events: write
   # Read commit contents
   contents: read
+  # The reusable workflow's job requests actions: read for upload-sarif; a
+  # caller that grants less makes the run fail at startup.
+  actions: read
 
 jobs:
   scan-scheduled:
