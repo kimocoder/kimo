@@ -10,7 +10,8 @@
 #     --provider rejection. 'kimo run gh' still rejects gh as a model name.
 #   * Install status contract:
 #       - 'kimo install gh' reports existing binary when already installed.
-#       - 'kimo install --force gh' refuses to replace/shadow an external system binary without --allow-system-path.
+#       - 'kimo install --force gh' refuses to replace/shadow an external system binary.
+#       - named 'kimo update gh' updates an owned standalone gh in place (no flag needed).
 #   * Update flag contract:
 #       - rejects combining --check and --apply
 #       - restricts --allow-system-path strictly to named 'update gh' (not batch 'update all')
@@ -134,6 +135,27 @@ UPDATE_CHECK_APPLY_RC=0
 
 check "update gh --check --apply exits with status 1" "1" "${UPDATE_CHECK_APPLY_RC}"
 check_contains "cannot combine --check and --apply" "Error: --check and --apply cannot be combined." "${UPDATE_CHECK_APPLY_OUT}"
+
+# Named 'update gh' is the opt-in for a standalone gh outside ~/.local/bin: it
+# must get past the shadowing guard to the download (fake curl fails it there)
+# and leave the existing binary untouched.
+STANDALONE_DIR="${TMPDIR_GH}/standalone_bin"
+STANDALONE_HOME="${TMPDIR_GH}/standalone_home"
+mkdir -p "${STANDALONE_DIR}" "${STANDALONE_HOME}"
+printf '#!/usr/bin/env bash\necho "gh version 2.99.0 (2026-01-01)"\n' > "${STANDALONE_DIR}/gh"
+cat > "${STANDALONE_DIR}/curl" <<'FAKE'
+#!/usr/bin/env bash
+[[ " $* " == *" https://api.github.com/repos/cli/cli/releases/latest "* ]] || exit 22
+echo '{"tag_name":"v2.100.0"}'
+FAKE
+chmod +x "${STANDALONE_DIR}/gh" "${STANDALONE_DIR}/curl"
+STANDALONE_SUM="$(sha256sum "${STANDALONE_DIR}/gh")"
+STANDALONE_RC=0
+STANDALONE_OUT="$(HOME="${STANDALONE_HOME}" PATH="${STANDALONE_DIR}:/usr/bin:/bin" "${KIMO}" update gh 2>&1)" || STANDALONE_RC=$?
+check_not_contains "named update gh does not refuse a standalone gh" "refusing to replace or shadow" "${STANDALONE_OUT}"
+check_contains "named update gh reaches the release download" "Error: GitHub CLI download failed." "${STANDALONE_OUT}"
+check "named update gh exits 1 when the download fails" "1" "${STANDALONE_RC}"
+check "failed update leaves the standalone gh untouched" "${STANDALONE_SUM}" "$(sha256sum "${STANDALONE_DIR}/gh")"
 
 UPDATE_HELP="$("${KIMO}" update --help)"
 check_contains "update help documents --allow-system-path" "--allow-system-path" "${UPDATE_HELP}"
