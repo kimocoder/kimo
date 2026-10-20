@@ -22,6 +22,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import signal
 import sys
 import threading
@@ -80,14 +81,23 @@ class Handler(BaseHTTPRequestHandler):
     def _json(self, status: int, payload: object) -> None:
         self._send(status, json.dumps(payload).encode(), "application/json")
 
-    def _blob_path(self, digest: str) -> str:
-        return os.path.join(self.server.blob_dir, digest.replace(":", "-"))
+    def _blob_path(self, digest: str) -> str | None:
+        """Blob file for a well-formed sha256 digest; None for anything else."""
+        if not re.fullmatch(r"sha256:[0-9a-f]{64}", digest):
+            return None
+        root = os.path.realpath(self.server.blob_dir)
+        path = os.path.realpath(os.path.join(root, digest.replace(":", "-")))
+        return path if path.startswith(root + os.sep) else None
+
+    def _has_blob(self, digest: str) -> bool:
+        path = self._blob_path(digest)
+        return path is not None and os.path.exists(path)
 
     def do_HEAD(self) -> None:
         self._record()
         if self.path.startswith("/api/blobs/"):
             digest = self.path.rsplit("/", 1)[1]
-            self._send(200 if os.path.exists(self._blob_path(digest)) else 404, b"", "text/plain")
+            self._send(200 if self._has_blob(digest) else 404, b"", "text/plain")
         else:
             self._send(200, b"", "text/plain")
 
@@ -116,10 +126,11 @@ class Handler(BaseHTTPRequestHandler):
         if self.path.startswith("/api/blobs/"):
             self._record()
             digest = self.path.rsplit("/", 1)[1]
-            if "sha256:" + hashlib.sha256(raw).hexdigest() != digest:
+            path = self._blob_path(digest)
+            if path is None or "sha256:" + hashlib.sha256(raw).hexdigest() != digest:
                 self._json(400, {"error": "digest mismatch"})
                 return
-            with open(self._blob_path(digest), "wb") as fh:
+            with open(path, "wb") as fh:
                 fh.write(raw)
             self._send(201, b"", "text/plain")
             return
@@ -162,7 +173,7 @@ class Handler(BaseHTTPRequestHandler):
             name = body.get("model") or body.get("name") or ""
             missing = [d for d in list((body.get("files") or {}).values())
                        + list((body.get("adapters") or {}).values())
-                       if not os.path.exists(self._blob_path(d))]
+                       if not self._has_blob(d)]
             if not name or missing:
                 self._json(400, {"error": f"missing blobs: {missing}" if missing else "model name required"})
                 return
