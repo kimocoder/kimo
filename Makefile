@@ -90,6 +90,7 @@ install:
 	@install -d -m 755 $(DESTDIR)$(SHAREDIR)
 	@install -m 644 lib/kimo-quota.py $(DESTDIR)$(SHAREDIR)/kimo-quota.py
 	@install -m 644 lib/kimo-codex.py $(DESTDIR)$(SHAREDIR)/kimo-codex.py
+	@install -m 644 lib/kimo-stream.py $(DESTDIR)$(SHAREDIR)/kimo-stream.py
 
 uninstall: uninstall-completion
 	@echo "[*] Removing $(SCRIPT) from $(DESTDIR)$(BINDIR)..."
@@ -97,6 +98,7 @@ uninstall: uninstall-completion
 	@rm -f $(DESTDIR)$(SHAREDIR)/ollama-gemini-shim.py
 	@rm -f $(DESTDIR)$(SHAREDIR)/kimo-quota.py
 	@rm -f $(DESTDIR)$(SHAREDIR)/kimo-codex.py
+	@rm -f $(DESTDIR)$(SHAREDIR)/kimo-stream.py
 	@rmdir $(DESTDIR)$(SHAREDIR) 2>/dev/null || true
 	@echo "[✓] $(SCRIPT) and assets removed from $(DESTDIR)$(PREFIX)"
 

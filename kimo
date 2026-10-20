@@ -6,10 +6,21 @@
 set -euo pipefail
 
 # Directory of the real script, not of a `make link` symlink in $BINDIR, so a
-# development link still finds lib/ in the checkout (as find_quota_helper does).
+# development link still finds lib/ in the checkout (see _find_lib_helper).
 _kimo_self="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "${BASH_SOURCE[0]}")"
 SCRIPT_DIR="$(cd "$(dirname "${_kimo_self}")" && pwd)"
 unset _kimo_self
+
+# _find_lib_helper NAME [OVERRIDE]: print the path of lib/NAME from the
+# checkout (or a development link to it), the installed share dir, or OVERRIDE.
+_find_lib_helper() {
+    local candidate
+    for candidate in "${2:-}" "${SCRIPT_DIR}/lib/$1" "${SCRIPT_DIR}/../share/kimo/$1" \
+        "${PREFIX:-/usr/local}/share/kimo/$1" "/usr/local/share/kimo/$1"; do
+        [[ -n "${candidate}" && -f "${candidate}" ]] && { printf '%s\n' "${candidate}"; return 0; }
+    done
+    return 1
+}
 
 # Remote server configuration
 # Dynamic resolution order:
@@ -4126,10 +4137,16 @@ cmd_stream() {
     if [[ -n "${stream_remote}" && -z "${OPT_HOST}" && -z "${OLLAMA_REMOTE_URL:-}" ]]; then
         stream_remote="${REMOTE_TUNNEL_URL}"
     fi
-    if [[ -n "${stream_remote}" ]]; then
-        exec python3 /root/stream_model.py --remote "${stream_remote}" "${extra_flags[@]}" "$@"
+    [[ -n "${stream_remote}" ]] && extra_flags+=(--remote "${stream_remote}")
+    local helper
+    if ! helper=$(_find_lib_helper kimo-stream.py "${KIMO_STREAM_HELPER:-}"); then
+        echo "${C_RED}Error: kimo-stream.py is missing; reinstall kimo or set KIMO_STREAM_HELPER.${C_RESET}" >&2
+        return 1
     fi
-    exec python3 /root/stream_model.py "${extra_flags[@]}" "$@"
+    # The helper resolves the remote itself when no --remote is forwarded, from
+    # the same tunnel/direct URLs kimo resolved.
+    KIMO_REMOTE_TUNNEL_URL="${REMOTE_TUNNEL_URL}" KIMO_REMOTE_DIRECT_URL="${REMOTE_DIRECT_URL}" \
+        KIMO_TUNINGS_FILE="${TUNINGS_FILE}" exec python3 "${helper}" "${extra_flags[@]}" "$@"
 }
 
 # -----------------------------------------------------------------------------
@@ -10844,18 +10861,12 @@ EOF
 # Resolve helpers from a checkout, development symlink, or installed share dir.
 # Credential values stay in the environment, never in argv.
 _codex_helper() {
-    local source_dir candidate
-    source_dir=$(python3 -c 'import os,sys; print(os.path.dirname(os.path.realpath(sys.argv[1])))' "${BASH_SOURCE[0]}") || return 1
-    for candidate in "${KIMO_CODEX_HELPER:-}" "${source_dir}/lib/kimo-codex.py" \
-        "${SCRIPT_DIR}/../share/kimo/kimo-codex.py" \
-        "${PREFIX:-/usr/local}/share/kimo/kimo-codex.py"; do
-        if [[ -n "${candidate}" && -f "${candidate}" ]]; then
-            CODEX_HOME="${CODEX_HOME}" KIMI_CONFIG="${KIMI_CONFIG}" python3 "${candidate}" "$@"
-            return $?
-        fi
-    done
-    echo "Error: kimo-codex.py is missing; reinstall kimo." >&2
-    return 1
+    local helper
+    if ! helper=$(_find_lib_helper kimo-codex.py "${KIMO_CODEX_HELPER:-}"); then
+        echo "Error: kimo-codex.py is missing; reinstall kimo." >&2
+        return 1
+    fi
+    CODEX_HOME="${CODEX_HOME}" KIMI_CONFIG="${KIMI_CONFIG}" python3 "${helper}" "$@"
 }
 
 _codex_show_status() {
@@ -11631,14 +11642,7 @@ EOF
 }
 
 find_quota_helper() {
-    local source_dir candidate
-    source_dir=$(python3 -c 'import os,sys; print(os.path.dirname(os.path.realpath(sys.argv[1])))' "${BASH_SOURCE[0]}") || return 1
-    for candidate in "${KIMO_QUOTA_HELPER:-}" "${source_dir}/lib/kimo-quota.py" \
-        "${SCRIPT_DIR}/../share/kimo/kimo-quota.py" \
-        "${PREFIX:-/usr/local}/share/kimo/kimo-quota.py" "/usr/local/share/kimo/kimo-quota.py"; do
-        [[ -n "${candidate}" && -f "${candidate}" ]] && { printf '%s\n' "${candidate}"; return 0; }
-    done
-    return 1
+    _find_lib_helper kimo-quota.py "${KIMO_QUOTA_HELPER:-}"
 }
 
 cmd_quota() {

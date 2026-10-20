@@ -90,7 +90,7 @@ make check
 | `make test-gh-guard` | Headless smoke test of GitHub CLI (`gh`) management-only guard |
 | `make test-launch-contract` | Launch contract for every CLI: credential scrub for non-local hosts, child-flag passthrough and `--`, opt-in `--evict` |
 | `make test-sync` | Blob-level `sync` between two fake daemons (upload, create, weight verification, `--force`), plus the digest-verified registry fallback |
-| `make test-model-commands` | Core model commands against fake local and remote daemons: `search` honors `--local`/`--remote` and reports VRAM residency per host |
+| `make test-model-commands` | Core model commands against fake local and remote daemons: `search` honors `--local`/`--remote` and reports VRAM residency per host; `stream` runs the shipped helper with kimo's remote resolution |
 | `make test-shim` | Gemini shim contract: `model:tag` paths, JSON-array/SSE streaming, mid-stream errors, tools, images, `countTokens`, request validation |
 | `make test-install-packages` | Installers request only official npm/PyPI packages and never fall back to look-alike names |
 | `make clean` | Removes temporary and backup files (`*~`, `*.tmp`, `*.bak`) |
@@ -142,7 +142,7 @@ kimo [options] <command> [arguments...]
 | `sync <model>` | Replicate and synchronize models across cluster hosts | `kimo sync kalidroid-27b --to local` |
 | `tag <src> <dst>` | Create model tag/alias on target host | `kimo tag model:33b model:latest` |
 | `rm <model>... [-y]` | Delete one or more models (exact names; all are checked before any is deleted; asks first, `--yes` to skip) | `kimo rm old-a old-b` |
-| `stream <model>` | Pin model for durable availability via keepalive daemon | `kimo stream model --status` |
+| `stream <model>` | Pin model for durable availability via keepalive daemon (helper: `lib/kimo-stream.py`, override with `KIMO_STREAM_HELPER`) | `kimo stream model --status` |
 | `run <model> [args]`| Run model directly with auto-routing to remote GPU | `kimo run kalidroid-27b` |
 | `launch <cli> [opts]`| Launch external CLI with automatic Ollama routing | `kimo launch grok --model 27b` |
 | `install [cli\|all]` | Install/update external CLIs (`kimi`, `claude`, `grok`, `codex`, `qwen`, etc.) | `kimo install kimi` |
