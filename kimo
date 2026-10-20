@@ -518,7 +518,7 @@ ${C_YELLOW}Maintenance, Config & Completion:${C_RESET}
   ${C_CYAN}freetier [opts]${C_RESET}              Sync Kimi config with Model Studio free-tier quotas (bl usage free)
   ${C_CYAN}gemini [opts]${C_RESET}                Register Gemini API models (real token limits) in Kimi config
   ${C_CYAN}codex [opts]${C_RESET}                 Inspect/renew Codex auth tokens & sync ChatGPT/OpenAI models in Kimi config
-  ${C_CYAN}kimi provider [subcmd]${C_RESET}       Enable/disable LLM providers in Kimi Code's config (list/disable/enable)
+  ${C_CYAN}kimi provider [subcmd]${C_RESET}       Manage LLM providers in Kimi Code's config (list/disable/enable/sync)
   ${C_CYAN}quota, quotas, quote${C_RESET}         Quota & usage dashboard for providers and every supported CLI
 
 ${C_YELLOW}Web & Quota-Free Research:${C_RESET}
@@ -11332,17 +11332,29 @@ def save(doc, path):
         if os.path.exists(temp):
             os.unlink(temp)
 
-def provider_models(doc, pid):
-    """Return list of model alias keys belonging to provider pid."""
-    models = doc.get("models", {})
+def provider_models(doc, pid, table="models"):
+    """Alias keys in table that belong to provider pid: its provider field, or
+    the "<pid>/" prefix. disable and enable must agree on this, or an alias
+    hidden by one is never brought back by the other."""
+    models = doc.get(table, {})
     return [k for k, v in models.items()
-            if isinstance(v, dict) and v.get("provider") == pid]
+            if (isinstance(v, dict) and v.get("provider") == pid) or k.startswith(pid + "/")]
+
+def move_aliases(doc, pid, src, dst):
+    """Move pid's aliases from table src to table dst; return how many moved."""
+    aliases = provider_models(doc, pid, src)
+    if not aliases:
+        return 0
+    source = doc[src]
+    target = doc.setdefault(dst, tomlkit.table())
+    for alias in aliases:
+        target[alias] = source[alias]
+        del source[alias]
+    return len(aliases)
 
 def do_list(doc):
     providers = doc.get("providers", {})
     disabled = doc.get("disabled_providers", {})
-    models = doc.get("models", {})
-    dis_models = doc.get("disabled_models", {})
     default = doc.get("default_model", "")
     result = {"providers": [], "disabled_providers": [], "default_model": default}
     for pid, prov in providers.items():
@@ -11357,7 +11369,7 @@ def do_list(doc):
     for pid, prov in disabled.items():
         if not isinstance(prov, dict):
             continue
-        mcount = len([k for k in dis_models if k.startswith(pid + "/")])
+        mcount = len(provider_models(doc, pid, "disabled_models"))
         result["disabled_providers"].append({
             "id": pid, "type": prov.get("type", "?"),
             "models": mcount, "enabled": False
@@ -11386,40 +11398,57 @@ def do_disable(doc, pid):
             return 1
         print(f"Error: provider '{pid}' not found in config.", file=sys.stderr)
         return 1
+    default = doc.get("default_model", "")
+    hidden = provider_models(doc, pid)
     # Move provider block
     disabled = doc.setdefault("disabled_providers", tomlkit.table())
     disabled[pid] = providers[pid]
     del providers[pid]
-    # Move model aliases
-    models = doc.get("models", {})
-    dis_models = doc.setdefault("disabled_models", tomlkit.table())
-    moved = 0
-    for alias in provider_models(doc, pid):
-        dis_models[alias] = models[alias]
-        del models[alias]
-        moved += 1
-    # Also move any aliases prefixed with pid/ that were missed
-    for alias in list(models.keys()):
-        if alias.startswith(pid + "/"):
-            dis_models[alias] = models[alias]
-            del models[alias]
-            moved += 1
-    # Clear default_model if it pointed at this provider
-    default = doc.get("default_model", "")
-    if default.startswith(pid + "/"):
+    moved = move_aliases(doc, pid, "models", "disabled_models")
+    # A default_model on this provider would point at a hidden alias: clear it,
+    # and remember it in [disabled_defaults] so enable can put it back.
+    if default and (default in hidden or default.startswith(pid + "/")):
         del doc["default_model"]
-        print(f"  [!] default_model '{default}' cleared (was on '{pid}')", file=sys.stderr)
+        doc.setdefault("disabled_defaults", tomlkit.table())[pid] = default
+        print(f"  [!] default_model '{default}' cleared (was on '{pid}'); enable restores it", file=sys.stderr)
     if as_json:
         print(json.dumps({"action": "disable", "provider": pid, "models_moved": moved}))
     else:
         print(f"  [✓] Disabled provider '{pid}' ({moved} model aliases hidden)")
     return 0
 
+def restore_default(doc, pid):
+    """Put back the default_model that disable cleared, unless one was set since."""
+    saved = doc.get("disabled_defaults", {})
+    if pid not in saved:
+        return None
+    default = str(saved[pid])
+    del saved[pid]
+    if not saved:
+        del doc["disabled_defaults"]
+    if doc.get("default_model"):
+        print(f"  [!] default_model not restored to '{default}': "
+              f"'{doc['default_model']}' was set since", file=sys.stderr)
+        return None
+    doc["default_model"] = default
+    return default
+
 def do_enable(doc, pid):
     disabled = doc.get("disabled_providers", {})
     if pid not in disabled:
         providers = doc.get("providers", {})
         if pid in providers:
+            # An older kimo restored only "<pid>/" aliases on enable, leaving
+            # aliases tied by their provider field hidden: rescue those.
+            moved = move_aliases(doc, pid, "disabled_models", "models")
+            if moved:
+                restored = restore_default(doc, pid)
+                if as_json:
+                    print(json.dumps({"action": "enable", "provider": pid, "models_restored": moved,
+                                      "default_model_restored": restored}))
+                else:
+                    print(f"  [✓] Provider '{pid}' was enabled; restored {moved} model aliases left hidden")
+                return 0
             print(f"Provider '{pid}' is already enabled.", file=sys.stderr)
             return 1
         print(f"Error: disabled provider '{pid}' not found.", file=sys.stderr)
@@ -11427,19 +11456,15 @@ def do_enable(doc, pid):
     providers = doc.setdefault("providers", tomlkit.table())
     providers[pid] = disabled[pid]
     del disabled[pid]
-    # Move model aliases back
-    dis_models = doc.get("disabled_models", {})
-    models = doc.setdefault("models", tomlkit.table())
-    moved = 0
-    for alias in list(dis_models.keys()):
-        if alias.startswith(pid + "/"):
-            models[alias] = dis_models[alias]
-            del dis_models[alias]
-            moved += 1
+    moved = move_aliases(doc, pid, "disabled_models", "models")
+    restored = restore_default(doc, pid)
     if as_json:
-        print(json.dumps({"action": "enable", "provider": pid, "models_restored": moved}))
+        print(json.dumps({"action": "enable", "provider": pid, "models_restored": moved,
+                          "default_model_restored": restored}))
     else:
         print(f"  [✓] Enabled provider '{pid}' ({moved} model aliases restored)")
+        if restored:
+            print(f"  [✓] default_model restored to '{restored}'")
     return 0
 
 doc = load(config_path)
@@ -11473,7 +11498,7 @@ PY
 # ThreadPoolExecutor; atomic config write under the kimi config lock.
 _kimi_provider_sync_py() {
     python3 - "$@" <<'PY'
-import json, os, sys, tempfile, stat, urllib.request, urllib.error, urllib.parse
+import json, os, re, sys, tempfile, stat, urllib.request, urllib.error, urllib.parse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 try:
@@ -11487,6 +11512,12 @@ target = sys.argv[2] if len(sys.argv) > 2 else ""
 flags = sys.argv[3:]
 prune = "--prune" in flags
 dry_run = "--dry-run" in flags
+include_nonchat = "--include-nonchat" in flags
+# Embedding, speech, image/video and moderation models answer /models too, but
+# are not chat models: listing them in Kimi's picker (with tool_use) only gives
+# aliases that fail when chosen. Same idea as KIMI_GM_NONCHAT_RE for Gemini.
+NONCHAT_RE = re.compile(r"embed|rerank|moderation|whisper|tts|transcribe|dall-e|imagen|image|"
+                        r"veo|sora|lyria|native-audio|realtime|aqa|babbage|davinci", re.I)
 as_json = "--json" in flags
 timeout = 8
 jobs = 4
@@ -11608,7 +11639,8 @@ def validate_one(pid, prov, tmo):
     """Validate one provider. Returns dict with pid, type, status, models, error."""
     ptype = prov.get("type", "openai")
     base_url = prov.get("base_url", "")
-    result = {"id": pid, "type": ptype, "status": "unknown", "models": [], "error": "", "added": 0, "removed": 0}
+    result = {"id": pid, "type": ptype, "status": "unknown", "models": [], "error": "", "added": 0, "updated": 0,
+              "removed": 0, "filtered": 0}
 
     if ptype == "kimi":
         result["status"] = "skipped"
@@ -11719,6 +11751,7 @@ results.sort(key=lambda r: order.index(r["id"]) if r["id"] in order else 999)
 
 # Upsert models for ok providers
 total_added = 0
+total_updated = 0
 total_removed = 0
 changed = False
 
@@ -11727,6 +11760,12 @@ for r in results:
         continue
     pid = r["id"]
     prefix = pid + "/"
+    if not include_nonchat:
+        chat = [m for m in r["models"] if not NONCHAT_RE.search(m["model"])]
+        r["filtered"] = len(r["models"]) - len(chat)
+        r["models"] = chat
+    # Filtered ids count as gone, so --prune also clears non-chat aliases an
+    # earlier sync added.
     fetched_ids = {m["model"] for m in r["models"]}
 
     if not dry_run:
@@ -11734,24 +11773,32 @@ for r in results:
 
     for spec in r["models"]:
         alias = prefix + spec["model"]
-        is_new = alias not in models_table
-        if is_new:
+        want = {"provider": pid, "model": spec["model"],
+                "display_name": spec.get("display_name") or spec["model"]}
+        if spec.get("ctx"):
+            want["max_context_size"] = int(spec["ctx"])
+        if spec.get("maxout"):
+            want["max_output_size"] = int(spec["maxout"])
+        existing = models_table.get(alias)
+        if not isinstance(existing, dict):
             r["added"] += 1
             total_added += 1
-        if not dry_run:
-            if alias not in models_table:
-                models_table[alias] = tomlkit.table()
-            mdl = models_table[alias]
-            mdl["provider"] = pid
-            mdl["model"] = spec["model"]
-            if spec.get("ctx"):
-                mdl["max_context_size"] = int(spec["ctx"])
-            if spec.get("maxout"):
-                mdl["max_output_size"] = int(spec["maxout"])
-            mdl["display_name"] = spec.get("display_name") or spec["model"]
-            if is_new:
+            changed = True
+            if not dry_run:
+                mdl = tomlkit.table()
+                mdl.update(want)
                 mdl["capabilities"] = ["tool_use"]
-        changed = changed or is_new
+                models_table[alias] = mdl
+            continue
+        # Refreshed metadata (context size, display name) is a change too,
+        # or it would only be saved when some other model happened to be new.
+        diff = {k: v for k, v in want.items() if existing.get(k) != v}
+        if diff:
+            r["updated"] += 1
+            total_updated += 1
+            changed = True
+            if not dry_run:
+                existing.update(diff)
 
     # Prune dead aliases
     if prune and r["status"] == "ok":
@@ -11780,8 +11827,8 @@ if changed and not dry_run:
 
 # Output
 if as_json:
-    print(json.dumps({"results": results, "added": total_added, "removed": total_removed,
-                      "dry_run": dry_run, "changed": changed}, indent=2))
+    print(json.dumps({"results": results, "added": total_added, "updated": total_updated,
+                      "removed": total_removed, "dry_run": dry_run, "changed": changed}, indent=2))
 else:
     if dry_run:
         print("[dry-run] No changes written.\n")
@@ -11799,21 +11846,27 @@ else:
         print(f"{r['id'] + mark:<32} {r['type']:<18} {r['status']:<14} {str(mcount):>7} {added:>6} {removed:>8}{err}")
     parts = [f"{v} {k}" for k, v in sorted(counts.items())]
     summary = f"Summary: {', '.join(parts)}"
-    if total_added or total_removed:
-        summary += f", {total_added} models added, {total_removed} removed"
+    if total_added or total_updated or total_removed:
+        summary += f", {total_added} models added, {total_updated} updated, {total_removed} removed"
+    total_filtered = sum(r["filtered"] for r in results)
+    if total_filtered:
+        summary += f", {total_filtered} non-chat skipped (--include-nonchat keeps them)"
     if changed and not dry_run:
         summary += " (config written)"
     print(f"\n{summary}")
 
-# Exit code: 0 if all ok/skipped, 1 if any failed
-failed = [r for r in results if r["status"] not in ("ok", "skipped", "empty")]
+# Exit 1 only when a provider is actually broken (bad key, unreachable, ...).
+# No credential, no /models endpoint or no Codex cache yet are normal states
+# for a config: reported in the table, but not failures for scripts.
+INFORMATIONAL = ("ok", "skipped", "empty", "no-credential", "no-models-endpoint", "no-cache")
+failed = [r for r in results if r["status"] not in INFORMATIONAL]
 sys.exit(1 if failed else 0)
 PY
 }
 
 cmd_kimi_provider() {
     local action="" target="" opt_json="${OPT_JSON:-false}"
-    local opt_prune=false opt_dryrun=false sync_timeout=8 sync_jobs=4
+    local opt_prune=false opt_dryrun=false opt_all=false opt_nonchat=false sync_timeout=8 sync_jobs=4
     while [[ $# -gt 0 ]]; do
         case "$1" in
             list|ls) action="list"; shift ;;
@@ -11823,8 +11876,15 @@ cmd_kimi_provider() {
             --json) opt_json="true"; shift ;;
             --prune) opt_prune=true; shift ;;
             --dry-run) opt_dryrun=true; shift ;;
-            --timeout) sync_timeout="${2:-8}"; shift 2 ;;
-            --jobs) sync_jobs="${2:-4}"; shift 2 ;;
+            --all) opt_all=true; shift ;;
+            --include-nonchat) opt_nonchat=true; shift ;;
+            --timeout|--jobs)
+                require_value "$@"
+                if [[ ! "$2" =~ ^[1-9][0-9]*$ ]]; then
+                    echo "${C_RED}Error: $1 needs a positive whole number, got '$2'.${C_RESET}" >&2; return 1
+                fi
+                if [[ "$1" == --timeout ]]; then sync_timeout="$2"; else sync_jobs="$2"; fi
+                shift 2 ;;
             -h|--help|help) _kimi_provider_usage; return 0 ;;
             -*) echo "${C_RED}Error: unknown option '$1'.${C_RESET}" >&2; return 1 ;;
             *)
@@ -11834,16 +11894,25 @@ cmd_kimi_provider() {
         esac
     done
     action="${action:-list}"
+    if ${opt_all} && [[ -n "${target}" ]]; then
+        echo "${C_RED}Error: give a provider name or --all, not both.${C_RESET}" >&2; return 1
+    fi
+    if [[ "${action}" != sync ]] && { ${opt_all} || ${opt_nonchat} || ${opt_prune} || ${opt_dryrun}; }; then
+        echo "${C_RED}Error: --all, --include-nonchat, --prune and --dry-run apply to 'sync' only.${C_RESET}" >&2; return 1
+    fi
     # Hold the config lock so a concurrent launch/sync cannot interleave.
     mkdir -p "$(dirname "${KIMI_CONFIG_LOCK}")" 2>/dev/null || true
     if command -v flock >/dev/null 2>&1; then
-        exec 8>>"${KIMI_CONFIG_LOCK}" 2>/dev/null || true
+        # No 2>/dev/null here: on a bare exec it would silence stderr for the
+        # rest of the run, hiding every error and warning below.
+        exec 8>>"${KIMI_CONFIG_LOCK}" || return 1
         flock -w 15 8 || { echo "${C_RED}Error: Kimi config is busy; retry.${C_RESET}" >&2; return 1; }
     fi
     if [[ "${action}" == "sync" ]]; then
         local -a sync_flags=()
         ${opt_prune} && sync_flags+=(--prune)
         ${opt_dryrun} && sync_flags+=(--dry-run)
+        ${opt_nonchat} && sync_flags+=(--include-nonchat)
         [[ "${opt_json}" == "true" ]] && sync_flags+=(--json)
         sync_flags+=(--timeout "${sync_timeout}" --jobs "${sync_jobs}")
         _kimi_provider_sync_py "${KIMI_CONFIG}" "${target}" "${sync_flags[@]}"
@@ -11870,6 +11939,8 @@ ${C_YELLOW}Commands:${C_RESET}
 ${C_YELLOW}Sync Options:${C_RESET}
   ${C_CYAN}--prune${C_RESET}               Remove model aliases the provider no longer serves
   ${C_CYAN}--dry-run${C_RESET}             Show what would change without writing config
+  ${C_CYAN}--all${C_RESET}                 Sync every provider (the default without a name)
+  ${C_CYAN}--include-nonchat${C_RESET}     Keep embedding/speech/image/moderation models (skipped by default)
   ${C_CYAN}--timeout <sec>${C_RESET}       Per-provider HTTP timeout (default: 8)
   ${C_CYAN}--jobs <n>${C_RESET}            Parallel validation workers (default: 4)
   ${C_CYAN}--json${C_RESET}                Machine-readable output
@@ -11889,7 +11960,8 @@ ${C_YELLOW}How disable/enable works:${C_RESET}
   [disabled_providers] / [disabled_models] tables that Kimi never reads.
   Credentials, model specs and aliases are fully preserved; enable moves
   them back. If the disabled provider held the default_model, that pin is
-  cleared so Kimi falls back to its own default.
+  cleared so Kimi falls back to its own default, and enable restores it
+  (unless another default_model was chosen in the meantime).
 
 ${C_YELLOW}Examples:${C_RESET}
   ${0##*/} kimi provider list                    # Show all providers
@@ -12897,7 +12969,7 @@ case "${COMMAND}" in
         case "${ARGS[0]:-}" in
             provider|providers) cmd_kimi_provider "${ARGS[@]:1}" ;;
             *) echo "${C_RED}Error: unknown kimi subcommand '${ARGS[0]:-}'.${C_RESET}" >&2
-               echo "Usage: ${0##*/} kimi provider [list|disable|enable] [name]" >&2; return 1 ;;
+               echo "Usage: ${0##*/} kimi provider [list|disable|enable|sync] [name]" >&2; exit 1 ;;
         esac
         ;;
     web)
