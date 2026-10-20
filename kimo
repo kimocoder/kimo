@@ -11467,14 +11467,356 @@ else:
 PY
 }
 
+# Validate every provider in Kimi's config.toml by hitting its /models endpoint,
+# fetch the live model catalogue, and upsert [models."<pid>/*"] aliases so Kimi's
+# picker reflects what each provider actually serves. Parallel validation via
+# ThreadPoolExecutor; atomic config write under the kimi config lock.
+_kimi_provider_sync_py() {
+    python3 - "$@" <<'PY'
+import json, os, sys, tempfile, stat, urllib.request, urllib.error, urllib.parse
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+try:
+    import tomlkit
+except ImportError:
+    print("Error: python3 tomlkit is required for provider sync.", file=sys.stderr)
+    sys.exit(3)
+
+config_path = sys.argv[1]
+target = sys.argv[2] if len(sys.argv) > 2 else ""
+flags = sys.argv[3:]
+prune = "--prune" in flags
+dry_run = "--dry-run" in flags
+as_json = "--json" in flags
+timeout = 8
+jobs = 4
+for i, f in enumerate(flags):
+    if f == "--timeout" and i + 1 < len(flags):
+        try: timeout = int(flags[i + 1])
+        except ValueError: pass
+    if f == "--jobs" and i + 1 < len(flags):
+        try: jobs = int(flags[i + 1])
+        except ValueError: pass
+
+def load(path):
+    if not os.path.exists(path):
+        return tomlkit.document()
+    with open(path, "r", encoding="utf-8") as fh:
+        return tomlkit.parse(fh.read())
+
+def save(doc, path):
+    content = tomlkit.dumps(doc)
+    tomlkit.parse(content)
+    mode = stat.S_IMODE(os.stat(path).st_mode) if os.path.exists(path) else 0o600
+    fd, temp = tempfile.mkstemp(prefix=".kimi-sync-", dir=os.path.dirname(path) or ".")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(content)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.chmod(temp, mode)
+        os.replace(temp, path)
+    finally:
+        if os.path.exists(temp):
+            os.unlink(temp)
+
+def resolve_key(prov):
+    """Resolve the API key for a provider. Returns (key, source) or (None, reason)."""
+    env_name = prov.get("api_key_env", "")
+    inline = prov.get("api_key", "")
+    # api_key_env sometimes holds the actual key (quirk in existing configs)
+    if env_name and (env_name.startswith("sk-") or env_name.startswith("gsk_") or len(env_name) > 40):
+        return env_name, "inline-via-env-field"
+    if env_name:
+        val = os.environ.get(env_name, "")
+        if val:
+            return val, f"env:{env_name}"
+        return None, f"env-var-unset:{env_name}"
+    if inline and not inline.startswith("http") and inline != "ollama" and len(inline) > 1:
+        return inline, "inline"
+    if inline == "ollama":
+        return "ollama", "ollama-placeholder"
+    return None, "no-credential"
+
+def fetch_models_openai(base_url, key, tmo):
+    url = base_url.rstrip("/") + "/models"
+    req = urllib.request.Request(url, headers={
+        "Authorization": f"Bearer {key}",
+        "User-Agent": "kimo-provider-sync/1.0"
+    })
+    with urllib.request.urlopen(req, timeout=tmo) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+    models = []
+    for item in data.get("data", []):
+        mid = item.get("id", "")
+        if not mid:
+            continue
+        spec = {"model": mid, "display_name": item.get("display_name") or mid}
+        ctx = item.get("context_length") or item.get("context_window")
+        if isinstance(ctx, int) and ctx > 0:
+            spec["ctx"] = ctx
+        models.append(spec)
+    return models
+
+def fetch_models_anthropic(key, tmo):
+    url = "https://api.anthropic.com/v1/models"
+    req = urllib.request.Request(url, headers={
+        "x-api-key": key,
+        "anthropic-version": "2023-06-01",
+        "User-Agent": "kimo-provider-sync/1.0"
+    })
+    with urllib.request.urlopen(req, timeout=tmo) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+    models = []
+    for item in data.get("data", []):
+        mid = item.get("id", "")
+        if not mid:
+            continue
+        spec = {"model": mid, "display_name": item.get("display_name") or mid}
+        models.append(spec)
+    return models
+
+def fetch_models_google(base_url, key, tmo):
+    sep = "&" if "?" in base_url else "?"
+    url = base_url.rstrip("/") + f"/models{sep}key={urllib.parse.quote(key)}"
+    req = urllib.request.Request(url, headers={"User-Agent": "kimo-provider-sync/1.0"})
+    with urllib.request.urlopen(req, timeout=tmo) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+    models = []
+    for item in data.get("models", []):
+        name = item.get("name", "")
+        if name.startswith("models/"):
+            name = name[7:]
+        if not name:
+            continue
+        spec = {"model": name, "display_name": item.get("displayName") or name}
+        inp = item.get("inputTokenLimit")
+        out = item.get("outputTokenLimit")
+        if isinstance(inp, int) and inp > 0:
+            spec["ctx"] = inp
+        if isinstance(out, int) and out > 0:
+            spec["maxout"] = out
+        models.append(spec)
+    return models
+
+def validate_one(pid, prov, tmo):
+    """Validate one provider. Returns dict with pid, type, status, models, error."""
+    ptype = prov.get("type", "openai")
+    base_url = prov.get("base_url", "")
+    result = {"id": pid, "type": ptype, "status": "unknown", "models": [], "error": "", "added": 0, "removed": 0}
+
+    if ptype == "kimi":
+        result["status"] = "skipped"
+        result["error"] = "OAuth-managed by kimi"
+        return result
+
+    # Codex (openai_responses): models come from ~/.codex/models_cache.json,
+    # not a /models endpoint. The ChatGPT backend has no public model list.
+    if ptype == "openai_responses":
+        cache = os.path.join(os.environ.get("CODEX_HOME", os.path.expanduser("~/.codex")), "models_cache.json")
+        if os.path.exists(cache):
+            try:
+                with open(cache, "r", encoding="utf-8") as fh:
+                    cdata = json.load(fh)
+                models = []
+                for item in cdata.get("models", []):
+                    slug = item.get("slug", "")
+                    if not slug:
+                        continue
+                    spec = {"model": slug, "display_name": item.get("display_name") or slug}
+                    ctx = item.get("context_window")
+                    if isinstance(ctx, int) and ctx > 0:
+                        spec["ctx"] = ctx
+                    models.append(spec)
+                result["status"] = "ok" if models else "empty"
+                result["models"] = models
+                result["error"] = "from models_cache.json"
+                return result
+            except (ValueError, OSError) as e:
+                result["status"] = "parse-error"
+                result["error"] = f"cache: {e}"
+                return result
+        result["status"] = "no-cache"
+        result["error"] = "no models_cache.json (run codex once)"
+        return result
+
+    key, source = resolve_key(prov)
+    if key is None:
+        result["status"] = "no-credential"
+        result["error"] = source
+        return result
+
+    # Local ollama: shorter timeout
+    effective_tmo = tmo
+    if "127.0.0.1" in base_url or "localhost" in base_url or key == "ollama":
+        effective_tmo = min(tmo, 4)
+
+    try:
+        if ptype == "anthropic":
+            models = fetch_models_anthropic(key, effective_tmo)
+        elif ptype == "google-genai":
+            models = fetch_models_google(base_url, key, effective_tmo)
+        else:
+            if not base_url:
+                result["status"] = "no-base-url"
+                result["error"] = "provider has no base_url"
+                return result
+            models = fetch_models_openai(base_url, key, effective_tmo)
+        result["status"] = "ok" if models else "empty"
+        result["models"] = models
+    except urllib.error.HTTPError as e:
+        if e.code in (401, 403):
+            result["status"] = "bad-key"
+        elif e.code == 429:
+            result["status"] = "rate-limited"
+        elif e.code == 404:
+            result["status"] = "no-models-endpoint"
+            result["error"] = "HTTP 404 (provider has no /models)"
+        else:
+            result["status"] = "http-error"
+            result["error"] = f"HTTP {e.code}"
+    except (urllib.error.URLError, OSError, TimeoutError) as e:
+        result["status"] = "unreachable"
+        result["error"] = str(getattr(e, "reason", e))[:80]
+    except (ValueError, KeyError) as e:
+        result["status"] = "parse-error"
+        result["error"] = str(e)[:80]
+    return result
+
+# --- Main ---
+doc = load(config_path)
+providers = doc.get("providers", {})
+models_table = doc.get("models", {})
+default_model = doc.get("default_model", "")
+
+# Filter to target if given
+if target:
+    if target not in providers:
+        print(f"Error: provider '{target}' not found in config.", file=sys.stderr)
+        sys.exit(1)
+    to_sync = {target: providers[target]}
+else:
+    to_sync = dict(providers)
+
+# Parallel validation
+results = []
+with ThreadPoolExecutor(max_workers=max(1, min(jobs, len(to_sync) or 1))) as pool:
+    futures = {pool.submit(validate_one, pid, prov, timeout): pid for pid, prov in to_sync.items()}
+    for fut in as_completed(futures):
+        results.append(fut.result())
+
+# Sort by original provider order
+order = list(to_sync.keys())
+results.sort(key=lambda r: order.index(r["id"]) if r["id"] in order else 999)
+
+# Upsert models for ok providers
+total_added = 0
+total_removed = 0
+changed = False
+
+for r in results:
+    if r["status"] != "ok":
+        continue
+    pid = r["id"]
+    prefix = pid + "/"
+    fetched_ids = {m["model"] for m in r["models"]}
+
+    if not dry_run:
+        models_table = doc.setdefault("models", tomlkit.table())
+
+    for spec in r["models"]:
+        alias = prefix + spec["model"]
+        is_new = alias not in models_table
+        if is_new:
+            r["added"] += 1
+            total_added += 1
+        if not dry_run:
+            if alias not in models_table:
+                models_table[alias] = tomlkit.table()
+            mdl = models_table[alias]
+            mdl["provider"] = pid
+            mdl["model"] = spec["model"]
+            if spec.get("ctx"):
+                mdl["max_context_size"] = int(spec["ctx"])
+            if spec.get("maxout"):
+                mdl["max_output_size"] = int(spec["maxout"])
+            mdl["display_name"] = spec.get("display_name") or spec["model"]
+            if is_new:
+                mdl["capabilities"] = ["tool_use"]
+        changed = changed or is_new
+
+    # Prune dead aliases
+    if prune and r["status"] == "ok":
+        for alias in list(models_table.keys()):
+            if not alias.startswith(prefix):
+                continue
+            entry = models_table[alias]
+            if not isinstance(entry, dict):
+                continue
+            if entry.get("provider") != pid:
+                continue
+            model_id = entry.get("model", alias[len(prefix):])
+            if model_id not in fetched_ids:
+                if alias == default_model:
+                    print(f"  [!] --prune: skipping '{alias}' (is default_model)", file=sys.stderr)
+                    continue
+                r["removed"] += 1
+                total_removed += 1
+                if not dry_run:
+                    del models_table[alias]
+                changed = True
+
+# Write config
+if changed and not dry_run:
+    save(doc, config_path)
+
+# Output
+if as_json:
+    print(json.dumps({"results": results, "added": total_added, "removed": total_removed,
+                      "dry_run": dry_run, "changed": changed}, indent=2))
+else:
+    if dry_run:
+        print("[dry-run] No changes written.\n")
+    hdr = f"{'PROVIDER':<32} {'TYPE':<18} {'STATUS':<14} {'MODELS':>7} {'ADDED':>6} {'REMOVED':>8}"
+    print(hdr)
+    print("-" * len(hdr))
+    counts = {}
+    for r in results:
+        counts[r["status"]] = counts.get(r["status"], 0) + 1
+        mark = " *" if default_model.startswith(r["id"] + "/") else ""
+        mcount = len(r["models"]) if r["status"] == "ok" else "-"
+        added = str(r["added"]) if r["status"] == "ok" else "-"
+        removed = str(r["removed"]) if r["status"] == "ok" and prune else "-"
+        err = f"  ({r['error']})" if r["error"] and r["status"] not in ("ok", "skipped") else ""
+        print(f"{r['id'] + mark:<32} {r['type']:<18} {r['status']:<14} {str(mcount):>7} {added:>6} {removed:>8}{err}")
+    parts = [f"{v} {k}" for k, v in sorted(counts.items())]
+    summary = f"Summary: {', '.join(parts)}"
+    if total_added or total_removed:
+        summary += f", {total_added} models added, {total_removed} removed"
+    if changed and not dry_run:
+        summary += " (config written)"
+    print(f"\n{summary}")
+
+# Exit code: 0 if all ok/skipped, 1 if any failed
+failed = [r for r in results if r["status"] not in ("ok", "skipped", "empty")]
+sys.exit(1 if failed else 0)
+PY
+}
+
 cmd_kimi_provider() {
     local action="" target="" opt_json="${OPT_JSON:-false}"
+    local opt_prune=false opt_dryrun=false sync_timeout=8 sync_jobs=4
     while [[ $# -gt 0 ]]; do
         case "$1" in
             list|ls) action="list"; shift ;;
             disable|off) action="disable"; shift ;;
             enable|on) action="enable"; shift ;;
+            sync) action="sync"; shift ;;
             --json) opt_json="true"; shift ;;
+            --prune) opt_prune=true; shift ;;
+            --dry-run) opt_dryrun=true; shift ;;
+            --timeout) sync_timeout="${2:-8}"; shift 2 ;;
+            --jobs) sync_jobs="${2:-4}"; shift 2 ;;
             -h|--help|help) _kimi_provider_usage; return 0 ;;
             -*) echo "${C_RED}Error: unknown option '$1'.${C_RESET}" >&2; return 1 ;;
             *)
@@ -11484,34 +11826,55 @@ cmd_kimi_provider() {
         esac
     done
     action="${action:-list}"
-    local -a extra=()
-    [[ "${opt_json}" == "true" ]] && extra+=(--json)
     # Hold the config lock so a concurrent launch/sync cannot interleave.
     mkdir -p "$(dirname "${KIMI_CONFIG_LOCK}")" 2>/dev/null || true
     if command -v flock >/dev/null 2>&1; then
         exec 8>>"${KIMI_CONFIG_LOCK}" 2>/dev/null || true
         flock -w 15 8 || { echo "${C_RED}Error: Kimi config is busy; retry.${C_RESET}" >&2; return 1; }
     fi
-    _kimi_provider_manage "${action}" "${KIMI_CONFIG}" "${target}" "${extra[@]}"
+    if [[ "${action}" == "sync" ]]; then
+        local -a sync_flags=()
+        ${opt_prune} && sync_flags+=(--prune)
+        ${opt_dryrun} && sync_flags+=(--dry-run)
+        [[ "${opt_json}" == "true" ]] && sync_flags+=(--json)
+        sync_flags+=(--timeout "${sync_timeout}" --jobs "${sync_jobs}")
+        _kimi_provider_sync_py "${KIMI_CONFIG}" "${target}" "${sync_flags[@]}"
+    else
+        local -a extra=()
+        [[ "${opt_json}" == "true" ]] && extra+=(--json)
+        _kimi_provider_manage "${action}" "${KIMI_CONFIG}" "${target}" "${extra[@]}"
+    fi
 }
 
 _kimi_provider_usage() {
     cat <<EOF
-${C_BOLD}kimo kimi provider${C_RESET} – Enable/disable LLM providers in Kimi Code's config
+${C_BOLD}kimo kimi provider${C_RESET} – Manage LLM providers in Kimi Code's config
 
 ${C_YELLOW}Usage:${C_RESET}
-  ${0##*/} kimi provider [list|disable|enable] [provider] [options]
+  ${0##*/} kimi provider [list|disable|enable|sync] [provider] [options]
 
 ${C_YELLOW}Commands:${C_RESET}
   ${C_CYAN}list, ls${C_RESET}              Show all providers with enabled/disabled status (default)
   ${C_CYAN}disable, off <name>${C_RESET}   Hide a provider and its model aliases from Kimi's picker
   ${C_CYAN}enable, on <name>${C_RESET}     Restore a disabled provider and its model aliases
+  ${C_CYAN}sync [name|--all]${C_RESET}     Validate provider keys, fetch live model lists, populate aliases
 
-${C_YELLOW}Options:${C_RESET}
+${C_YELLOW}Sync Options:${C_RESET}
+  ${C_CYAN}--prune${C_RESET}               Remove model aliases the provider no longer serves
+  ${C_CYAN}--dry-run${C_RESET}             Show what would change without writing config
+  ${C_CYAN}--timeout <sec>${C_RESET}       Per-provider HTTP timeout (default: 8)
+  ${C_CYAN}--jobs <n>${C_RESET}            Parallel validation workers (default: 4)
   ${C_CYAN}--json${C_RESET}                Machine-readable output
   ${C_CYAN}-h, --help${C_RESET}            Show this help
 
-${C_YELLOW}How it works:${C_RESET}
+${C_YELLOW}How sync works:${C_RESET}
+  For each provider, resolves the API key (api_key_env or inline api_key),
+  hits the provider's /models endpoint, and upserts [models."<pid>/*"]
+  aliases into config.toml. Provider types handled: openai, openai_responses,
+  anthropic, google-genai. Kimi-managed (OAuth) providers are skipped.
+  Statuses: ok, bad-key, rate-limited, unreachable, no-credential, skipped.
+
+${C_YELLOW}How disable/enable works:${C_RESET}
   Disable moves [providers.<name>] and its [models."<name>/*"] aliases into
   [disabled_providers] / [disabled_models] tables that Kimi never reads.
   Credentials, model specs and aliases are fully preserved; enable moves
@@ -11520,9 +11883,12 @@ ${C_YELLOW}How it works:${C_RESET}
 
 ${C_YELLOW}Examples:${C_RESET}
   ${0##*/} kimi provider list                    # Show all providers
-  ${0##*/} kimi provider disable groq             # Hide groq from Kimi's picker
-  ${0##*/} kimi provider enable groq              # Restore groq
-  ${0##*/} kimi provider disable openai --json    # Machine-readable
+  ${0##*/} kimi provider sync                      # Validate all, populate models
+  ${0##*/} kimi provider sync groq                 # Sync one provider
+  ${0##*/} kimi provider sync --prune --dry-run    # Preview pruning dead models
+  ${0##*/} kimi provider sync --json               # Machine-readable results
+  ${0##*/} kimi provider disable groq              # Hide groq from Kimi's picker
+  ${0##*/} kimi provider enable groq               # Restore groq
 EOF
 }
 
