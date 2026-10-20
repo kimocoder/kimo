@@ -95,13 +95,22 @@ NON_TEXT_MODEL_PREFIXES = ("comfyui/",)
 
 
 def normalize_url(url):
+    """Same rules as kimo's normalize_host_url (tests/host_url_test.sh):
+    Ollama's :11434 goes only on a bare http host. https:// and proxied paths
+    keep their own port, a port never lands after the path, and an IPv6
+    literal's colons are not mistaken for one."""
     url = (url or "").strip()
-    if not url.startswith("http://") and not url.startswith("https://"):
-        url = f"http://{url}"
-    host_part = url.split("//", 1)[1]
-    if ":" not in host_part.split("/", 1)[0]:
-        url = f"{url}:11434"
-    return url.rstrip("/")
+    url = url[:-1] if url.endswith("/") else url
+    scheme, rest = "http", url
+    match = re.match(r"([A-Za-z][A-Za-z0-9+.-]*)://(.*)$", url)
+    if match:
+        scheme, rest = match.group(1).lower(), match.group(2)
+    authority, slash, path = rest.partition("/")
+    path = slash + path
+    hostport = authority.rsplit("@", 1)[-1]
+    if scheme == "http" and not path and not re.fullmatch(r"(\[[^]]*\]|[^:]+):[0-9]+", hostport):
+        authority += ":11434"
+    return f"{scheme}://{authority}{path}"
 
 
 def _get_remote_bridge_token():

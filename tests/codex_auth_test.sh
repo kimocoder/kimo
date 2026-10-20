@@ -305,6 +305,25 @@ printf '# keep this comment\ndefault_model = "unrelated/model"\n' > "${CUSTOM_CO
 custom=$(KIMI_CONFIG="${CUSTOM_CONFIG}" "${KIMO}" codex --sync --json)
 check_contains "sync preserves unrelated comments" '# keep this comment' "$(cat "${CUSTOM_CONFIG}")"
 assert_ok "sync backs up original config" test -f "$(jq -r '.backup' <<<"${custom}")"
+# Backups hold the whole config, keys included, and a sync can run per launch:
+# only the newest few survive, and a symlink planted under the name is ignored.
+for i in 1 2 3 4 5 6 7; do
+    printf 'old %s\n' "${i}" > "${CUSTOM_CONFIG}.before-codex-old${i}"
+    touch -d "-${i} hours" "${CUSTOM_CONFIG}.before-codex-old${i}"
+done
+printf 'decoy\n' > "${HARNESS_ROOT}/decoy"
+ln -s "${HARNESS_ROOT}/decoy" "${CUSTOM_CONFIG}.before-codex-link"
+touch -h -d "-30 days" "${CUSTOM_CONFIG}.before-codex-link"
+python3 -c "import tomlkit; p = '${CUSTOM_CONFIG}'; doc = tomlkit.parse(open(p).read()); doc['providers']['codex']['api_key'] = 'stale-static'; open(p, 'w').write(tomlkit.dumps(doc))"
+pruned=$(KIMI_CONFIG="${CUSTOM_CONFIG}" "${KIMO}" codex --sync --json)
+check "a changed sync makes a new backup" true "$(jq -r '.changed' <<<"${pruned}")"
+assert_ok "the new backup survives pruning" test -f "$(jq -r '.backup' <<<"${pruned}")"
+check "only the 5 newest backups are kept" 5 \
+    "$(find "$(dirname "${CUSTOM_CONFIG}")" -maxdepth 1 -type f -name 'config.toml.before-codex-*' | wc -l)"
+assert_ok "the oldest backup is pruned" test ! -e "${CUSTOM_CONFIG}.before-codex-old7"
+assert_ok "a symlink named like a backup is left alone" test -L "${CUSTOM_CONFIG}.before-codex-link"
+check "the symlink target is untouched" decoy "$(cat "${HARNESS_ROOT}/decoy")"
+rm -f "${CUSTOM_CONFIG}".before-codex-*
 custom_status=$(KIMI_CONFIG="${CUSTOM_CONFIG}" "${KIMO}" codex --json)
 check "status respects custom config path" "${CUSTOM_CONFIG}" "$(jq -r '.kimi.config_file' <<<"${custom_status}")"
 check "sync keeps unrelated default model" unrelated/model "$(jq -r '.kimi.default_model' <<<"${custom_status}")"
