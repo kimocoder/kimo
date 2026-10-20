@@ -7652,7 +7652,9 @@ _install_gh() (
         return 1
     fi
     echo "Installed GitHub CLI ${version} at ${dest}."
-    [[ -z "${backup}" ]] || echo "Original GitHub CLI backup retained at ${backup}."
+    if [[ -n "${backup}" ]] && ! rm -f "${backup}"; then
+        echo "Warning: could not remove GitHub CLI backup at ${backup}." >&2
+    fi
     if [[ ":${PATH}:" != *":${dir}:"* ]]; then
         echo "Add ${dir} to PATH to use gh."
     fi
@@ -8670,7 +8672,7 @@ ${C_YELLOW}Options:${C_RESET}
   ${C_CYAN}--allow-system-path${C_RESET}  Only with named gh: implied by 'update gh'; validates the PATH executable up front
   ${C_CYAN}-h, --help${C_RESET}    Show this help message
   GitHub CLI rejects package-owned files, symlinks (including parents), and unowned/unwritable directories.
-  No sudo or shadowing; keeps a backup and rolls back if installed-version verification fails.
+  No sudo or shadowing; keeps a backup until the new version verifies, and rolls back if it fails.
 
 ${C_YELLOW}Examples:${C_RESET}
   ${0##*/} update             # Check updates for all present CLIs

@@ -157,6 +157,46 @@ check_contains "named update gh reaches the release download" "Error: GitHub CLI
 check "named update gh exits 1 when the download fails" "1" "${STANDALONE_RC}"
 check "failed update leaves the standalone gh untouched" "${STANDALONE_SUM}" "$(sha256sum "${STANDALONE_DIR}/gh")"
 
+# Successful in-place update from a fake release: the new binary is installed,
+# and the backup and staging dir are removed once the new version verifies.
+if [[ "$(uname -s)" == Linux ]]; then
+    case "$(uname -m)" in
+        x86_64|amd64) GH_ARCH=amd64 ;; aarch64|arm64) GH_ARCH=arm64 ;;
+        i386|i686) GH_ARCH=386 ;; *) GH_ARCH=armv6 ;;
+    esac
+    RELEASE_DIR="${TMPDIR_GH}/release"
+    UPGRADE_DIR="${TMPDIR_GH}/upgrade_bin"
+    GH_ASSET="gh_2.100.0_linux_${GH_ARCH}.tar.gz"
+    mkdir -p "${RELEASE_DIR}/gh_2.100.0_linux_${GH_ARCH}/bin" "${UPGRADE_DIR}"
+    printf '#!/usr/bin/env bash\necho "gh version 2.100.0 (2026-02-01)"\n' > "${RELEASE_DIR}/gh_2.100.0_linux_${GH_ARCH}/bin/gh"
+    chmod +x "${RELEASE_DIR}/gh_2.100.0_linux_${GH_ARCH}/bin/gh"
+    tar -czf "${RELEASE_DIR}/${GH_ASSET}" -C "${RELEASE_DIR}" "gh_2.100.0_linux_${GH_ARCH}"
+    (cd "${RELEASE_DIR}" && sha256sum "${GH_ASSET}" > checksums)
+    cp "${STANDALONE_DIR}/gh" "${UPGRADE_DIR}/gh"
+    cat > "${UPGRADE_DIR}/curl" <<'FAKE'
+#!/usr/bin/env bash
+url="" out=""
+while [[ $# -gt 0 ]]; do
+    case "$1" in -o) out="$2"; shift ;; https://*) url="$1" ;; esac
+    shift
+done
+case "${url}" in
+    https://api.github.com/repos/cli/cli/releases/latest) echo '{"tag_name":"v2.100.0"}' ;;
+    */gh_2.100.0_checksums.txt) cp "${GH_FAKE_RELEASE}/checksums" "${out}" ;;
+    */gh_2.100.0_linux_*.tar.gz) cp "${GH_FAKE_RELEASE}/${url##*/}" "${out}" ;;
+    *) exit 22 ;;
+esac
+FAKE
+    chmod +x "${UPGRADE_DIR}/curl"
+    UPGRADE_RC=0
+    UPGRADE_OUT="$(HOME="${STANDALONE_HOME}" PATH="${UPGRADE_DIR}:/usr/bin:/bin" GH_FAKE_RELEASE="${RELEASE_DIR}" \
+        "${KIMO}" update gh 2>&1)" || UPGRADE_RC=$?
+    check "named update gh succeeds from a valid release" "0" "${UPGRADE_RC}"
+    check_contains "update reports the installed version" "Installed GitHub CLI 2.100.0 at ${UPGRADE_DIR}/gh." "${UPGRADE_OUT}"
+    check "standalone gh now runs the new release" "gh version 2.100.0 (2026-02-01)" "$("${UPGRADE_DIR}/gh" --version)"
+    check "verified update leaves no backup or staging dir" "" "$(find "${UPGRADE_DIR}" -name '.gh-*')"
+fi
+
 UPDATE_HELP="$("${KIMO}" update --help)"
 check_contains "update help documents --allow-system-path" "--allow-system-path" "${UPDATE_HELP}"
 check_contains "update help documents 'update gh'" "update gh" "${UPDATE_HELP}"
