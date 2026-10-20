@@ -12,6 +12,11 @@ Blobs uploaded with POST /api/blobs/<digest> are digest-checked like the real
 server and stored under --blob-dir; /api/create registers the model in
 /api/tags, so a sync can be verified end to end.
 
+With --openai-models it also serves the OpenAI-compatible GET /v1/models that
+hosted providers (e.g. abliteration.ai) expose; --openai-bearer then requires a
+matching "Authorization: Bearer <token>" header and answers 401 without it, so
+credential-validation paths can be exercised on loopback.
+
 Started by harness_fake_ollama in tests/lib/harness.sh; the bound port is
 written to --port-file once the socket is listening.
 """
@@ -119,6 +124,18 @@ class Handler(BaseHTTPRequestHandler):
             self._json(200, {"models": models})
         elif self.path == "/api/ps":
             self._json(200, {"models": [{"name": name, "model": name} for name in self.server.loaded]})
+        elif self.path == "/v1/models":
+            if not self.server.openai_models:
+                self._json(404, {"error": "not found"})
+                return
+            bearer = self.server.openai_bearer
+            if bearer and self.headers.get("Authorization") != f"Bearer {bearer}":
+                self._json(401, {"error": {"message": "invalid api key",
+                                           "type": "invalid_request_error"}})
+                return
+            self._json(200, {"object": "list",
+                             "data": [{"id": name, "object": "model", "owned_by": "fixture"}
+                                      for name in self.server.openai_models]})
         else:
             self._json(404, {"error": "not found"})
 
@@ -230,6 +247,12 @@ def main() -> None:
     parser.add_argument("--pull-events",
                         help="file of NDJSON events streamed by /api/pull (default: a success sequence)")
     parser.add_argument("--blob-dir", help="where uploaded blobs are kept (default: next to --log)")
+    parser.add_argument("--openai-models", default="",
+                        help="comma-separated ids served by the OpenAI-compatible /v1/models "
+                             "(empty: the endpoint 404s)")
+    parser.add_argument("--openai-bearer", default="",
+                        help="token /v1/models requires as 'Authorization: Bearer <token>' "
+                             "(empty: no auth check)")
     args = parser.parse_args()
 
     server = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
@@ -240,6 +263,8 @@ def main() -> None:
     server.created = {}
     server.warm = set()
     server.loaded = [name for name in args.loaded.split(",") if name]
+    server.openai_models = [name for name in args.openai_models.split(",") if name]
+    server.openai_bearer = args.openai_bearer
     server.blob_dir = args.blob_dir or args.log + ".blobs"
     os.makedirs(server.blob_dir, exist_ok=True)
     if args.pull_events:

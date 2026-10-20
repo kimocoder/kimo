@@ -77,7 +77,7 @@ _harness_scrub_env() {
     local name
     while IFS= read -r name; do
         case "${name}" in
-            KIMO_*|OM_*|OLLAMA_*|KIMI_*|GROK_*|AGY_*|CURSOR_*|CYBERSTRIKE_*|CLAUDE_CODE_*|QWEN_*|CODEX_*|OPENCODE_*) ;;
+            KIMO_*|OM_*|OLLAMA_*|KIMI_*|GROK_*|AGY_*|CURSOR_*|CYBERSTRIKE_*|CLAUDE_CODE_*|QWEN_*|CODEX_*|OPENCODE_*|COPILOT_*) ;;
             ANTHROPIC_*|OPENAI_*|GEMINI_*|GOOGLE_*|XAI_*|OPENROUTER_*|DASHSCOPE_*|MOONSHOT_*|ALIBABA_*) ;;
             ABLITERATION_*|ABLIT_*) ;;
             GH_TOKEN|GITHUB_TOKEN|GH_ENTERPRISE_TOKEN|GITHUB_ENTERPRISE_TOKEN|API_TIMEOUT_MS|API_BASE) ;;

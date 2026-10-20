@@ -2,8 +2,12 @@
 # Headless smoke tests for kimo's GitHub CLI ('gh') integration.
 #
 # Asserts the contract for 'gh' in kimo across launch, install, update, doctor, and completions:
-#   * Launch rejection contract: 'kimo launch gh' rejects execution because gh is a
-#     management-only CLI rather than an LLM model runner.
+#   * Launch contract: 'kimo launch gh' execs 'gh copilot -- <args>' with GitHub
+#     Copilot CLI's BYOK env pointed at <host>/v1 (COPILOT_PROVIDER_BASE_URL,
+#     COPILOT_MODEL, COPILOT_PROVIDER_TYPE=openai), --ctx as
+#     COPILOT_PROVIDER_MAX_PROMPT_TOKENS, COPILOT_OFFLINE defaulting to true,
+#     provider keys scrubbed for non-local hosts, --dry-run, and hosted
+#     --provider rejection. 'kimo run gh' still rejects gh as a model name.
 #   * Install status contract:
 #       - 'kimo install gh' reports existing binary when already installed.
 #       - 'kimo install --force gh' refuses to replace/shadow an external system binary without --allow-system-path.
@@ -12,12 +16,13 @@
 #       - restricts --allow-system-path strictly to named 'update gh' (not batch 'update all')
 #       - validates update --help documentation and eligible check behavior
 #   * Inventory & Doctor contract:
-#       - 'kimo install list' includes 'gh' row marked with 'n/a' default model
+#       - 'kimo install list' includes 'gh' row with its default launch model
 #       - 'kimo doctor' detects 'gh' and formats its version and binary location
-#   * Shell completion contract: bash & zsh completions expose 'gh' across install and update.
+#   * Shell completion contract: bash & zsh completions expose 'gh' across launch, install and update.
 #
 # Optional live layer (--live): if a real 'gh' binary is installed on the host, runs
-# a real version verification check.
+# a real version verification check, plus a 'gh copilot' turn against a
+# reachable Ollama host when the Copilot CLI is available.
 #
 # Usage: tests/gh-smoke.sh [--live]
 
@@ -34,14 +39,85 @@ TMPDIR_GH="$(mktemp -d)"
 
 echo "=== Kimo GitHub CLI ('gh') Smoke Tests ==="
 
-# 1. Launch rejection contract
-echo "[1] Launch rejection contract (gh is management-only)"
-LAUNCH_OUT="$("${KIMO}" launch gh --model kalidroid-27b:latest 2>&1 || true)"
-LAUNCH_RC=0
-"${KIMO}" launch gh --model kalidroid-27b:latest >/dev/null 2>&1 || LAUNCH_RC=$?
+# 1. Launch contract: 'launch gh' runs GitHub Copilot CLI in BYOK mode
+echo "[1] Launch contract (gh copilot routed to Ollama)"
+LAUNCH_BIN="${TMPDIR_GH}/launch_bin"
+LAUNCH_HOME="${TMPDIR_GH}/launch_home"
+mkdir -p "${LAUNCH_BIN}" "${LAUNCH_HOME}"
+CAPTURE="${TMPDIR_GH}/launch_call.txt"
+export GH_SMOKE_OUT="${CAPTURE}"
+cat > "${LAUNCH_BIN}/gh" <<'FAKE'
+#!/usr/bin/env bash
+out="${GH_SMOKE_OUT:?GH_SMOKE_OUT unset}"
+{
+    printf 'ARGV\n'
+    printf '%s\n' "$@"
+    printf 'ENV\n'
+    for v in COPILOT_PROVIDER_BASE_URL COPILOT_PROVIDER_TYPE COPILOT_MODEL \
+        COPILOT_PROVIDER_MAX_PROMPT_TOKENS COPILOT_OFFLINE COPILOT_PROVIDER_WIRE_MODEL \
+        COPILOT_PROVIDER_API_KEY COPILOT_PROVIDER_BEARER_TOKEN; do
+        printf '%s=%s\n' "${v}" "${!v-<unset>}"
+    done
+} > "${out}"
+exit 0
+FAKE
+chmod +x "${LAUNCH_BIN}/gh"
 
-check "launch gh exits with status 1" "1" "${LAUNCH_RC}"
-check_contains "launch gh error message" "Error: GitHub CLI is management-only; run gh directly, not through Ollama launch." "${LAUNCH_OUT}"
+# Unassigned port 9 so no real Ollama is contacted or unloaded. PATH puts the
+# fake first; /usr/local/bin stays last because kimo prepends it only when
+# absent, and a real gh there must not shadow the fake.
+LOCAL_HOST="http://127.0.0.1:9"
+REMOTE_HOST="http://192.168.1.131:9"
+run_launch() { # [env assignments...] -- <kimo args...>
+    local -a envs=()
+    while [[ $# -gt 0 && "$1" != -- ]]; do envs+=("$1"); shift; done
+    shift
+    rm -f "${CAPTURE}"
+    env HOME="${LAUNCH_HOME}" PATH="${LAUNCH_BIN}:/usr/bin:/bin:/usr/local/bin" "${envs[@]}" \
+        "${KIMO}" "$@" >/dev/null 2>&1 || true
+}
+argv_lines() { sed -n '/^ARGV$/,/^ENV$/p' "${CAPTURE}" | sed '1d;$d' | paste -sd' ' -; }
+
+run_launch -- --host "${LOCAL_HOST}" launch gh --model kalidroid-27b:latest -p "hi there" --allow-tool 'shell(git)'
+if [[ ! -f "${CAPTURE}" ]]; then
+    bad "fake gh was never exec'd (no capture); cannot assert"
+else
+    check "argv is 'copilot --' plus passthrough" "copilot -- -p hi there --allow-tool shell(git)" "$(argv_lines)"
+    check "COPILOT_PROVIDER_BASE_URL is host/v1" "${LOCAL_HOST}/v1" "$(env_val "${CAPTURE}" COPILOT_PROVIDER_BASE_URL)"
+    check "COPILOT_PROVIDER_TYPE is openai" "openai" "$(env_val "${CAPTURE}" COPILOT_PROVIDER_TYPE)"
+    check "COPILOT_MODEL is resolved model" "kalidroid-27b:latest" "$(env_val "${CAPTURE}" COPILOT_MODEL)"
+    check "COPILOT_OFFLINE defaults to true" "true" "$(env_val "${CAPTURE}" COPILOT_OFFLINE)"
+    check "no prompt cap without --ctx" "<unset>" "$(env_val "${CAPTURE}" COPILOT_PROVIDER_MAX_PROMPT_TOKENS)"
+fi
+
+run_launch COPILOT_OFFLINE=false COPILOT_PROVIDER_WIRE_MODEL=stale -- --host "${LOCAL_HOST}" launch gh --model kalidroid-27b:latest --ctx 65536
+check "--ctx becomes COPILOT_PROVIDER_MAX_PROMPT_TOKENS" "65536" "$(env_val "${CAPTURE}" COPILOT_PROVIDER_MAX_PROMPT_TOKENS)"
+check "user COPILOT_OFFLINE is honoured" "false" "$(env_val "${CAPTURE}" COPILOT_OFFLINE)"
+check "stale COPILOT_PROVIDER_WIRE_MODEL is dropped" "<unset>" "$(env_val "${CAPTURE}" COPILOT_PROVIDER_WIRE_MODEL)"
+check "no args still separates gh flags with --" "copilot --" "$(argv_lines)"
+
+run_launch COPILOT_PROVIDER_API_KEY=sk-local COPILOT_PROVIDER_BEARER_TOKEN=bt-local -- --host "${LOCAL_HOST}" launch gh --model kalidroid-27b:latest
+check "provider key kept for plain local host" "sk-local" "$(env_val "${CAPTURE}" COPILOT_PROVIDER_API_KEY)"
+check "bearer token kept for plain local host" "bt-local" "$(env_val "${CAPTURE}" COPILOT_PROVIDER_BEARER_TOKEN)"
+
+run_launch OLLAMA_REMOTE_URL="${REMOTE_HOST}" COPILOT_PROVIDER_API_KEY=sk-secret COPILOT_PROVIDER_BEARER_TOKEN=bt-secret -- --remote launch gh --model kalidroid-27b:latest
+check "COPILOT_PROVIDER_BASE_URL follows remote host" "${REMOTE_HOST}/v1" "$(env_val "${CAPTURE}" COPILOT_PROVIDER_BASE_URL)"
+check "provider key scrubbed for remote host" "<unset>" "$(env_val "${CAPTURE}" COPILOT_PROVIDER_API_KEY)"
+check "bearer token scrubbed for remote host" "<unset>" "$(env_val "${CAPTURE}" COPILOT_PROVIDER_BEARER_TOKEN)"
+
+rm -f "${CAPTURE}"
+DRY_OUT="$(env HOME="${LAUNCH_HOME}" PATH="${LAUNCH_BIN}:/usr/bin:/bin:/usr/local/bin" COPILOT_PROVIDER_API_KEY=sk-secret \
+    "${KIMO}" --host "${LOCAL_HOST}" launch gh --model kalidroid-27b:latest --dry-run -- -p hi 2>&1 || true)"
+check_contains "dry-run shows gh copilot argv" "argv   : gh copilot -- -p hi" "${DRY_OUT}"
+check_contains "dry-run shows COPILOT_PROVIDER_BASE_URL" "COPILOT_PROVIDER_BASE_URL=${LOCAL_HOST}/v1" "${DRY_OUT}"
+check_contains "dry-run masks provider key" "COPILOT_PROVIDER_API_KEY <kept: real value, plain local host>" "${DRY_OUT}"
+check_not_contains "dry-run never prints the key" "sk-secret" "${DRY_OUT}"
+[[ ! -f "${CAPTURE}" ]] && ok "dry-run does not exec gh" || bad "dry-run exec'd gh"
+
+HOSTED_RC=0
+HOSTED_OUT="$(ABLITERATION_API_KEY=ak_test "${KIMO}" launch gh --provider abliteration 2>&1)" || HOSTED_RC=$?
+check "launch gh --provider abliteration exits 1" "1" "${HOSTED_RC}"
+check_contains "hosted provider names gh as unsupported" "'gh' has no abliteration launch branch" "${HOSTED_OUT}"
 
 # 2. Update flag contract
 echo "[2] Update flag validation and error guards"
@@ -99,7 +175,7 @@ check_contains "refusing to replace or shadow message" "Error: refusing to repla
 echo "[4] Inventory table and Doctor diagnostics"
 INSTALL_LIST="$("${KIMO}" install list)"
 check_match "install list contains gh entry" "gh[[:space:]]+(● INSTALLED|○ MISSING)" "${INSTALL_LIST}"
-check_match "install list marks gh default model as n/a" "gh[[:space:]]+.*n/a" "${INSTALL_LIST}"
+check_match "install list shows gh default launch model" "gh[[:space:]]+.*kalidroid-27b:latest" "${INSTALL_LIST}"
 
 DOCTOR_OUT="$("${KIMO}" doctor)"
 check_match "doctor includes gh in External LLM CLI Hub Inventory" "\[(✓|·)\] gh[[:space:]]+:" "${DOCTOR_OUT}"
@@ -107,14 +183,16 @@ check_match "doctor includes gh in External LLM CLI Hub Inventory" "\[(✓|·)\]
 # 5. Shell completions
 echo "[5] Shell completions (bash & zsh)"
 BASH_COMP="$("${KIMO}" completion bash)"
-check_contains "bash completion allows gh in install target" 'gh all list' "${BASH_COMP}"
-check_contains "bash completion allows gh in update target" 'gh all' "${BASH_COMP}"
+check_match "bash completion lists gh among supported CLIs" 'supported_clis="[^"]* gh"' "${BASH_COMP}"
+check_contains "bash completion offers supported CLIs for install" '${supported_clis} all list' "${BASH_COMP}"
+check_contains "bash completion offers supported CLIs for update" '${supported_clis} all"' "${BASH_COMP}"
 check_contains "bash completion includes --allow-system-path" '--allow-system-path' "${BASH_COMP}"
 
 ZSH_COMP="$("${KIMO}" completion zsh)"
 check_contains "zsh completion includes gh in install args" 'gh all list' "${ZSH_COMP}"
 check_contains "zsh completion includes gh in update args" 'gh all' "${ZSH_COMP}"
 check_contains "zsh completion includes --allow-system-path" '--allow-system-path' "${ZSH_COMP}"
+check_contains "zsh completion includes gh in launch args" "openclaw hermes gh)' \\" "${ZSH_COMP}"
 
 echo
 echo "mocked smoke: ${pass} passed, ${fail} failed"

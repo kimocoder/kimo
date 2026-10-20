@@ -295,6 +295,7 @@ declare -A DEFAULT_MODELS=(
     ["kimi"]="kalidroid-27b:latest"
     ["cyberstrike"]="kalidroid-27b:latest"
     ["cursor"]="kalidroid-27b:latest"
+    ["gh"]="kalidroid-27b:latest"
 )
 
 # Map of external CLI binary names
@@ -310,6 +311,7 @@ declare -A EXTERNAL_CLI_MAP=(
     ["kimi"]="kimi"
     ["cyberstrike"]="cyberstrike"
     ["cursor"]="cursor"
+    ["gh"]="gh"
 )
 
 # abliteration.ai: a hosted Anthropic- and OpenAI-compatible API, not an Ollama
@@ -535,6 +537,7 @@ ${C_YELLOW}Supported CLIs (${0##*/} launch):${C_RESET}
   ${C_BOLD}opencode${C_RESET}    OpenCode AI assistant routed to Ollama models
   ${C_BOLD}cyberstrike${C_RESET} Cyberstrike AI pentesting agent (cyberstrike.io); configures ollama provider
   ${C_BOLD}cursor${C_RESET}      Cursor CLI (Cursor Agent); routes to local/remote Ollama models
+  ${C_BOLD}gh${C_RESET}          GitHub Copilot CLI via 'gh copilot'; BYOK mode routed to Ollama
 
 ${C_YELLOW}Examples:${C_RESET}
   ${C_DIM}# Model & VRAM Control:${C_RESET}
@@ -1139,6 +1142,119 @@ abliteration_efforts() {
         echo "low,medium,high,xhigh,max"
     fi
 }
+
+# Validate an abliteration.ai credential and fetch the catalogue the OpenAI
+# surface actually serves. The key rides curl_bearer, so it never appears in
+# argv. Prints the raw JSON body on success.
+# argv: key openai_url
+# rc: 0 = validated (200 with at least one .data[].id), 2 = key rejected
+#     (401/403), 1 = not usable (offline, timeout, other status, malformed or
+#     empty list)
+abliteration_fetch_models() {
+    local key="$1" url="$2" tmp status rc=0
+    tmp=$(mktemp) || return 1
+    status=$(curl_bearer "${key}" -s --connect-timeout 3 -m 8 \
+        -o "${tmp}" -w '%{http_code}' "${url}/models" 2>/dev/null) || rc=$?
+    if ((rc != 0)); then
+        rm -f "${tmp}"
+        return 1
+    fi
+    case "${status}" in
+        200) ;;
+        401|403)
+            rm -f "${tmp}"
+            return 2
+            ;;
+        *)
+            rm -f "${tmp}"
+            return 1
+            ;;
+    esac
+    if ! jq -e '[.data[]?.id | select(type == "string" and length > 0)] | length > 0' \
+        "${tmp}" >/dev/null 2>&1; then
+        rm -f "${tmp}"
+        return 1
+    fi
+    cat "${tmp}"
+    rm -f "${tmp}"
+}
+
+# Register [providers.abliteration] - the credential by environment-variable
+# NAME (ABLITERATION_API_KEY), never its value - plus one alias per model the
+# validated API serves, so kimi's picker shows the provider under its real name
+# and lists the live catalogue. One atomic tomlkit read-modify-write under the
+# kimi config lock (same contract as _openai_sync_kimi). Prints the launched
+# alias on success.
+# argv: resolved_model models_json openai_url ctx caps efforts default_effort
+abliteration_sync_kimi() (
+    local resolved="$1" models_json="$2" url="$3"
+    local tctx="$4" tcaps="$5" tefforts="$6" tdeff="$7"
+    local alias="abliteration/${resolved}"
+    local specs="[]" spec id rctx caps efforts deff n=0 target_seen=false
+
+    while IFS=$'\t' read -r id rctx; do
+        [[ -n "${id}" ]] || continue
+        if [[ "${id}" == "${resolved}" ]]; then
+            target_seen=true
+            rctx="${tctx}"
+            caps="${tcaps}"
+            efforts="${tefforts}"
+            deff="${tdeff}"
+        elif [[ -n "${ABLITERATION_MODELS[${id}]:-}" ]]; then
+            # A known id the API serves: the static table's window and caps win
+            # over an unspecified remote payload.
+            rctx="${rctx:-${ABLITERATION_MODELS[${id}]}}"
+            caps=$(abliteration_capabilities "${id}")
+            efforts=$(abliteration_efforts "${id}")
+            deff="high"
+        else
+            # A model only the API knows: keep a remote context_length when the
+            # payload carries one; capabilities default to the abliteration
+            # baseline (everything streams, thinks and calls tools).
+            caps="tool_use,thinking"
+            efforts="low,medium,high,xhigh"
+            deff="high"
+        fi
+        spec=$(jq -nc \
+            --arg alias "abliteration/${id}" --arg model "${id}" --arg ctx "${rctx}" \
+            --arg caps "${caps}" --arg efforts "${efforts}" --arg deff "${deff}" \
+            --arg off "low" --arg rkey "reasoning_content" --arg dn "${id} (abliteration)" \
+            '{alias: $alias, model: $model, ctx: $ctx, caps: $caps, efforts: $efforts, deff: $deff, off: $off, rkey: $rkey, display_name: $dn}') || spec=""
+        if [[ -n "${spec}" ]] && specs=$(printf '%s' "${specs}" | jq -c --argjson s "${spec}" '. + [$s]'); then
+            n=$((n + 1))
+        fi
+    done < <(printf '%s' "${models_json}" | jq -r '.data[]? | select(.id? | type == "string") | [.id, ((.context_length? // "") | tostring)] | @tsv' 2>/dev/null)
+
+    # The launched model can be missing from the catalogue (rename, transient
+    # API behaviour) - never leave the session without its requested alias.
+    if ! ${target_seen}; then
+        spec=$(jq -nc \
+            --arg alias "${alias}" --arg model "${resolved}" --arg ctx "${tctx}" \
+            --arg caps "${tcaps}" --arg efforts "${tefforts}" --arg deff "${tdeff}" \
+            --arg off "low" --arg rkey "reasoning_content" --arg dn "${resolved} (abliteration)" \
+            '{alias: $alias, model: $model, ctx: $ctx, caps: $caps, efforts: $efforts, deff: $deff, off: $off, rkey: $rkey, display_name: $dn}') || spec=""
+        if [[ -n "${spec}" ]] && specs=$(printf '%s' "${specs}" | jq -c --argjson s "${spec}" '. + [$s]'); then
+            n=$((n + 1))
+        fi
+    fi
+    if ((n < 1)); then
+        return 1
+    fi
+
+    local rc=0
+    ensure_private_dir "${KIMO_RUNTIME_DIR}" 2>/dev/null || true
+    mkdir -p "$(dirname "${KIMI_CONFIG_LOCK}")" "$(dirname "${KIMI_CONFIG}")" || return 1
+    if command -v flock >/dev/null 2>&1; then
+        exec 9>>"${KIMI_CONFIG_LOCK}" || return 1
+        flock -w 15 9 || { echo "Error: Kimi config is busy; retry the abliteration sync." >&2; return 1; }
+    fi
+    _kimi_write_models "${KIMI_CONFIG}" "abliteration" "${url}" "${specs}" "${alias}" "ABLITERATION_API_KEY" || rc=$?
+    if ((rc != 0)); then
+        _kimi_config_error "${rc}"
+        return 1
+    fi
+    printf '%s' "${alias}"
+)
 
 # Unload every model resident on <host> except <keep>, to free VRAM before a
 # large model loads. The other models may belong to other users or sessions
@@ -4226,7 +4342,7 @@ cmd_run() {
         echo "Usage: ${0##*/} run <model> [args...]" >&2
         exit 1
     fi
-    if ! launch_gh_check "${model}"; then
+    if ! run_gh_check "${model}"; then
         return 1
     fi
 
@@ -5593,8 +5709,11 @@ _codex_kimi_model() {
 # heredoc already owns. argv[5], when present, is the launched alias written to
 # default_model (kimi's headless prompt mode requires it). Exits 3 when tomlkit
 # is missing, 4 on unparseable TOML.
-# argv: path pid base_url specs-json [default_alias]
+# argv: path pid base_url specs-json [default_alias] [key_env]
 # specs-json: [{"alias","model","ctx","caps","efforts","deff","off","rkey","display_name"}, ...]
+# key_env, when present, names the environment variable holding the provider's
+# credential: the config then stores api_key_env = <name> (the NAME, never a
+# value) instead of the static Ollama placeholder key.
 _kimi_write_models() {
     python3 - "$@" <<'PY'
 import sys
@@ -5607,6 +5726,7 @@ except ImportError:
 
 path, pid, base_url, specs_raw = sys.argv[1:5]
 default_alias = sys.argv[5] if len(sys.argv) > 5 else ""
+key_env = sys.argv[6] if len(sys.argv) > 6 else ""
 
 try:
     specs = json.loads(specs_raw)
@@ -5632,10 +5752,20 @@ if pid not in providers:
 prov = providers[pid]
 prov["type"] = "openai"
 prov["base_url"] = base_url
-# Static placeholder, never the caller's real key: this provider points at the
-# LAN/tunnel Ollama host and forwarding a real secret there would leak it off
-# this box. Ollama ignores the value.
-prov["api_key"] = "ollama"
+if key_env:
+    # Environment reference, never the credential itself: kimi reads the named
+    # variable at request time, so no secret lands on disk. A static key left
+    # behind by an older write is dropped.
+    prov["api_key_env"] = key_env
+    if "api_key" in prov:
+        del prov["api_key"]
+else:
+    # Static placeholder, never the caller's real key: this provider points at
+    # the LAN/tunnel Ollama host and forwarding a real secret there would leak
+    # it off this box. Ollama ignores the value.
+    prov["api_key"] = "ollama"
+    if "api_key_env" in prov:
+        del prov["api_key_env"]
 
 models = doc.get("models")
 if models is None:
@@ -5873,6 +6003,7 @@ ${C_YELLOW}Supported CLIs:${C_RESET}
   ${C_CYAN}hermes${C_RESET}        Hermes Agent CLI
   ${C_CYAN}cyberstrike${C_RESET}   Cyberstrike AI Penetration Testing Agent (cyberstrike.io)
   ${C_CYAN}cursor${C_RESET}        Cursor Agent CLI (cursor.com)
+  ${C_CYAN}gh${C_RESET}            GitHub Copilot CLI via 'gh copilot' (BYOK mode)
 
 ${C_YELLOW}Cloud Provider: abliteration.ai (--provider abliteration):${C_RESET}
   A hosted Anthropic- and OpenAI-compatible API instead of a self-hosted Ollama
@@ -5894,6 +6025,15 @@ ${C_YELLOW}Cloud Provider: abliteration.ai (--provider abliteration):${C_RESET}
   model table above supplies the window and capabilities instead. The real key is
   forwarded to api.abliteration.ai rather than scrubbed, because that endpoint is
   the provider you selected (the scrub still applies to every Ollama host).
+
+  kimi routing: the launch first validates the key against the API's /v1/models
+  and, when it passes, registers a named [providers.abliteration] in kimi's
+  config plus an alias for every model the API serves - so kimi's picker shows
+  'abliteration' with its live catalogue, and /effort gets the graded range.
+  The config stores only the NAME of the key's env var (api_key_env), never the
+  key. A rejected key (401/403) aborts the launch; if validation cannot complete
+  (offline, upstream error, no tomlkit) kimi falls back to the zero-footprint
+  KIMI_MODEL_* env channel, which kimi displays as '__kimi_env__'.
 
 ${C_YELLOW}Cloud Provider: OpenAI (--provider codex | --provider openai):${C_RESET}
   Two different OpenAI surfaces, and their credentials are NOT interchangeable:
@@ -5983,6 +6123,12 @@ ${C_YELLOW}CLI Integration Mechanics:${C_RESET}
   ${C_BOLD}cursor${C_RESET}       Cursor Agent CLI (cursor.com); routes inference and completions to the target
                  Ollama host via CURSOR_API_ENDPOINT, CURSOR_LOCAL_AGENT_BASE_URL,
                  and OPENAI_BASE_URL with model override (--model <model>).
+  ${C_BOLD}gh${C_RESET}           GitHub Copilot CLI, started as 'gh copilot -- <args>' (gh fetches the Copilot
+                 CLI on first use). Its BYOK mode is pointed at <host>/v1 via
+                 COPILOT_PROVIDER_BASE_URL/COPILOT_MODEL; --ctx or a tuned num_ctx becomes
+                 COPILOT_PROVIDER_MAX_PROMPT_TOKENS. COPILOT_OFFLINE defaults to true so the
+                 session does not contact GitHub. COPILOT_PROVIDER_API_KEY/BEARER_TOKEN reach
+                 only a plain local daemon. The model needs tool calling and streaming.
 
 ${C_YELLOW}Environment Overrides:${C_RESET}
   ABLITERATION_API_KEY      abliteration.ai ak_... key (ABLIT_KEY also accepted); env only
@@ -6025,6 +6171,7 @@ ${C_YELLOW}Examples:${C_RESET}
   ${0##*/} launch cyberstrike --model kalidroid-27b:latest
   ${0##*/} launch cursor --model kalidroid-27b:latest
   ${0##*/} launch agy --model kalidroid-27b:latest
+  ${0##*/} launch gh --model kalidroid-27b:latest -- -p "Summarize this repo"
 
   ${C_DIM}# abliteration.ai (hosted): export ABLITERATION_API_KEY=ak_... first${C_RESET}
   ${0##*/} launch kimi --provider abliteration
@@ -6053,11 +6200,12 @@ ${C_YELLOW}Examples:${C_RESET}
 EOF
 }
 
-# Shared helper: avoid using 'launch' for GitHub CLI management
-launch_gh_check() {
+# 'gh' names a CLI, not a model: 'run gh' would ask Ollama for a model called
+# gh. The Copilot CLI behind it is reached through 'launch gh' instead.
+run_gh_check() {
     local target="${1:-}"
     if [[ "${target}" == "gh" ]]; then
-        echo "Error: GitHub CLI is management-only; run gh directly, not through Ollama launch." >&2
+        echo "Error: 'gh' is the GitHub CLI, not a model; use '${0##*/} launch gh' to run GitHub Copilot CLI on Ollama." >&2
         return 1
     fi
     return 0
@@ -6065,9 +6213,6 @@ launch_gh_check() {
 
 cmd_launch() {
     local provider="${1:-}"
-    if ! launch_gh_check "${provider}"; then
-        return 1
-    fi
     if [[ -z "${provider}" || "${provider}" == "-h" || "${provider}" == "--help" || "${provider}" == "help" ]]; then
         launch_usage
         return 0
@@ -6476,6 +6621,7 @@ cmd_launch() {
         export ANTHROPIC_API_KEY="ollama"
         unset ANTHROPIC_AUTH_TOKEN CURSOR_API_KEY
         unset CODEX_API_KEY CODEX_AUTH_TOKEN CODEX_ACCESS_TOKEN DASHSCOPE_API_KEY MODELSTUDIO_API_KEY
+        unset COPILOT_PROVIDER_API_KEY COPILOT_PROVIDER_BEARER_TOKEN
     fi
 
     local cli_cmd="${EXTERNAL_CLI_MAP[$provider]:-}"
@@ -6547,6 +6693,29 @@ cmd_launch() {
         esac
     fi
 
+    # GitHub Copilot CLI (via 'gh copilot') in BYOK mode: setting
+    # COPILOT_PROVIDER_BASE_URL makes it talk to an OpenAI-compatible endpoint
+    # instead of GitHub's models. Ollama serves that wire under /v1 (the bare
+    # origin 404s), and the model must support tools and streaming. Exported
+    # before --dry-run so the plan shows the same routing env.
+    if [[ "${cli_cmd}" == gh ]]; then
+        export COPILOT_PROVIDER_BASE_URL="${active_host}/v1"
+        export COPILOT_PROVIDER_TYPE="openai"
+        export COPILOT_MODEL="${resolved_model}"
+        # A stale wire-model or Azure setting would override the routed model.
+        unset COPILOT_PROVIDER_WIRE_MODEL COPILOT_PROVIDER_AZURE_API_VERSION
+        # --ctx, else a tuned num_ctx, caps the prompt Copilot builds so it
+        # fits the window the runner actually allocates.
+        local gh_ctx="${opt_launch_ctx}"
+        if [[ -z "${gh_ctx}" && -n "${tp:-}" ]]; then
+            gh_ctx=$(echo "${tp}" | jq -r '.num_ctx? // empty') || gh_ctx=""
+        fi
+        [[ -z "${gh_ctx}" ]] || export COPILOT_PROVIDER_MAX_PROMPT_TOKENS="${gh_ctx}"
+        # Offline mode stops Copilot CLI contacting GitHub (telemetry, model
+        # catalog, auth); inference only needs active_host. Unless overridden.
+        export COPILOT_OFFLINE="${COPILOT_OFFLINE:-true}"
+    fi
+
     # --dry-run: report what would run and stop before anything with side
     # effects (no eviction above, no shim, no CLI config edits, no exec).
     # Credentials are shown only as kept / placeholder / unset.
@@ -6558,6 +6727,7 @@ cmd_launch() {
             qwen) dry_argv=(qwen --openai-base-url "${active_host}/v1" --auth-type openai --model "${resolved_model}") ;;
             kimi) dry_argv=(kimi -m "ollama-${kimi_slug//[^a-zA-Z0-9]/-}/${resolved_model}") ;;
             cyberstrike) dry_argv=(cyberstrike --model "$([[ "${resolved_model}" == */* ]] && echo "${resolved_model}" || echo "ollama/${resolved_model}")") ;;
+            gh) dry_argv=(gh copilot --) ;;
             "") dry_argv=(ollama run "${resolved_model}") ;;
             *) dry_argv=("${cli_cmd}" --model "${resolved_model}") ;;
         esac
@@ -6605,6 +6775,10 @@ cmd_launch() {
         [[ "${cloud_provider}" == "dashscope" ]] && secret_names+=(DASHSCOPE_API_KEY MODELSTUDIO_API_KEY)
         if openai_backend "${cloud_provider}"; then
             env_names+=(CODEX_OSS_BASE_URL)
+        fi
+        if [[ "${cli_cmd}" == gh ]]; then
+            env_names+=(COPILOT_PROVIDER_BASE_URL COPILOT_PROVIDER_TYPE COPILOT_MODEL COPILOT_PROVIDER_MAX_PROMPT_TOKENS COPILOT_OFFLINE)
+            secret_names+=(COPILOT_PROVIDER_API_KEY COPILOT_PROVIDER_BEARER_TOKEN)
         fi
         local n
         if [[ "${OPT_JSON:-false}" == "true" ]]; then
@@ -6659,7 +6833,7 @@ cmd_launch() {
             case "${cli_cmd}" in
                 kimi|grok|agy|cyberstrike)
                     if [[ "${cloud_provider}" == "abliteration" ]]; then
-                        echo "  ${C_DIM}(kimi gets a zero-footprint KIMI_MODEL_* env provider; no config.toml is written)${C_RESET}"
+                        echo "  ${C_DIM}(at launch kimi gets a named [providers.abliteration] + served-model aliases if the key validates, else the zero-footprint KIMI_MODEL_* env channel; this dry run writes no config)${C_RESET}"
                     elif [[ "${cloud_provider}" == "dashscope" ]]; then
                         if [[ "${dashscope_surface}" == freetier ]]; then
                             echo "  ${C_DIM}(kimi rides its freetier-managed [providers.alibaba]; no env key, no config write)${C_RESET}"
@@ -6809,13 +6983,21 @@ cmd_launch() {
                     # env var holding the credential) and an alias for the
                     # launched model. The credential itself stays in the
                     # environment, so nothing secret is written to disk.
+                    local sync_result="" synced_model=""
                     if [[ "${cloud_provider}" == codex ]]; then
                         _resolve_codex_auth
-                        _codex_sync_kimi "${resolved_model}" >&2 || return 1
+                        sync_result=$(_codex_sync_kimi --json "${resolved_model}" 2>&1) || return 1
                         echo "${C_DIM}[*] kimi on codex provider: ${resolved_model} (ChatGPT OAuth, renewed as needed)${C_RESET}" >&2
                     else
-                        _openai_sync_kimi "${resolved_model}" >&2 || return 1
+                        sync_result=$(_openai_sync_kimi --json "${resolved_model}" 2>&1) || return 1
                         echo "${C_DIM}[*] kimi on openai provider: ${resolved_model} (platform API key)${C_RESET}" >&2
+                    fi
+                    # Extract the registered model alias from the sync result to avoid
+                    # kimi falling back to __kimi_env_model__ when the requested model
+                    # name doesn't match the registered alias (e.g., "kimi" vs "codex/kimi")
+                    synced_model=$(echo "${sync_result}" | jq -r '.default_model // empty' 2>/dev/null)
+                    if [[ -n "${synced_model}" ]]; then
+                        resolved_model="${synced_model}"
                     fi
                     unset KIMI_MODEL_NAME KIMI_MODEL_API_KEY KIMI_MODEL_PROVIDER_TYPE \
                         KIMI_MODEL_BASE_URL KIMI_MODEL_MAX_CONTEXT_SIZE KIMI_MODEL_CAPABILITIES \
@@ -6825,14 +7007,61 @@ cmd_launch() {
                     exec "${cli_cmd}" -m "${resolved_model}" "${cli_passthrough_args[@]}"
                 fi
                 if [[ "${cloud_provider}" == "abliteration" ]]; then
-                    # abliteration.ai path: the KIMI_MODEL_* env channel only.
-                    # A config.toml alias would have to store a third-party API
-                    # key in plaintext on disk, and the whole point of routing
-                    # through kimo is that kimi's own config is left alone - so
-                    # this is deliberately the zero-footprint path, not the
-                    # alias-preferred one used for Ollama below. There is no
-                    # /api/show to probe either: capabilities and the context
-                    # window come from the ABLITERATION_MODELS table.
+                    # abliteration.ai path. Two routings, tried in order:
+                    # 1. config alias (preferred, only after the key validates):
+                    #    GET /v1/models both proves the credential works and
+                    #    lists what the API actually serves; kimo registers
+                    #    [providers.abliteration] with the NAME of the env var
+                    #    holding the key (never its value - no secret touches
+                    #    disk) plus one alias per served model. kimi's picker
+                    #    then shows 'abliteration' instead of the synthesized
+                    #    __kimi_env__ of the env channel, and the config alias
+                    #    unlocks the graded /effort picker.
+                    # 2. KIMI_MODEL_* env channel (fallback when validation
+                    #    cannot complete - offline, upstream error, no tomlkit):
+                    #    the original zero-footprint path. A rejected key
+                    #    (401/403) aborts instead of falling back: launching
+                    #    would only fail inside kimi with the same credential.
+                    # Capabilities and context windows still come from the
+                    # ABLITERATION_MODELS table for known ids; there is no
+                    # /api/show upstream to probe.
+                    local kimi_ablit_effort="${KIMO_KIMI_EFFORT:-${OM_KIMI_EFFORT:-high}}"
+                    if [[ ",${ablit_efforts}," != *",${kimi_ablit_effort},"* ]]; then
+                        echo "${C_YELLOW}[!] Warning: thinking effort '${kimi_ablit_effort}' is not offered by ${resolved_model} (${ablit_efforts}); using xhigh.${C_RESET}" >&2
+                        kimi_ablit_effort="xhigh"
+                    fi
+                    # Normalize the ABLIT_KEY alias: the config names
+                    # ABLITERATION_API_KEY, so that variable must exist for
+                    # kimi whatever spelling supplied the key.
+                    export ABLITERATION_API_KEY="${ablit_key}"
+                    local ablit_models_json="" ablit_fetch_rc=0
+                    ablit_models_json=$(abliteration_fetch_models "${ablit_key}" "${ablit_openai_url}") || ablit_fetch_rc=$?
+                    if ((ablit_fetch_rc == 2)); then
+                        echo "${C_RED}Error: abliteration.ai rejected the API key (HTTP 401/403 on ${ablit_openai_url}/models). Check ABLITERATION_API_KEY (ak_... from https://abliteration.ai/console).${C_RESET}" >&2
+                        return 1
+                    fi
+                    if ((ablit_fetch_rc == 0)); then
+                        local ablit_alias=""
+                        ablit_alias=$(abliteration_sync_kimi "${resolved_model}" "${ablit_models_json}" "${ablit_openai_url}" \
+                            "${ablit_ctx}" "${KIMO_KIMI_CAPABILITIES:-${ablit_caps}}" "${ablit_efforts}" "${kimi_ablit_effort}") || ablit_alias=""
+                        if [[ -n "${ablit_alias}" ]]; then
+                            local ablit_n
+                            ablit_n=$(printf '%s' "${ablit_models_json}" | jq -r '[.data[]?.id] | length' 2>/dev/null) || ablit_n="?"
+                            unset KIMI_MODEL_NAME KIMI_MODEL_API_KEY KIMI_MODEL_PROVIDER_TYPE \
+                                KIMI_MODEL_BASE_URL KIMI_MODEL_MAX_CONTEXT_SIZE KIMI_MODEL_CAPABILITIES \
+                                KIMI_MODEL_REASONING_KEY KIMI_MODEL_THINKING_EFFORT
+                            export KIMI_DISABLE_TELEMETRY="${KIMI_DISABLE_TELEMETRY:-1}"
+                            export KIMI_CODE_NO_AUTO_UPDATE="${KIMI_CODE_NO_AUTO_UPDATE:-1}"
+                            if ${opt_launch_webbridge}; then
+                                echo "${C_DIM}[*] -W/--webbridge is a Moonshot-quota fallback; abliteration.ai serves its own server-side web_search tool.${C_RESET}"
+                            fi
+                            echo "${C_DIM}[*] kimi on abliteration.ai '${resolved_model}' via [providers.abliteration] (${ablit_n} served models registered, context ${ablit_ctx}, caps ${KIMO_KIMI_CAPABILITIES:-${ablit_caps}}, effort ${kimi_ablit_effort})${C_RESET}"
+                            exec "${cli_cmd}" -m "${ablit_alias}" "${cli_passthrough_args[@]}"
+                        fi
+                    else
+                        echo "${C_YELLOW}[!] Warning: could not validate the abliteration.ai key against ${ablit_openai_url}/models; falling back to kimi's KIMI_MODEL_* env channel (shows as __kimi_env__, static model list).${C_RESET}" >&2
+                    fi
+                    # --- Fallback: KIMI_MODEL_* env channel (no config footprint) ---
                     unset KIMI_MODEL_NAME KIMI_MODEL_API_KEY KIMI_MODEL_PROVIDER_TYPE \
                         KIMI_MODEL_BASE_URL KIMI_MODEL_MAX_CONTEXT_SIZE KIMI_MODEL_CAPABILITIES \
                         KIMI_MODEL_REASONING_KEY KIMI_MODEL_THINKING_EFFORT
@@ -6848,11 +7077,6 @@ cmd_launch() {
                     # 'reasoning_content' on /v1/chat/completions - the field
                     # kimi auto-detects, unlike Ollama's 'reasoning'.
                     export KIMI_MODEL_REASONING_KEY="${KIMO_KIMI_REASONING_KEY:-reasoning_content}"
-                    local kimi_ablit_effort="${KIMO_KIMI_EFFORT:-${OM_KIMI_EFFORT:-high}}"
-                    if [[ ",${ablit_efforts}," != *",${kimi_ablit_effort},"* ]]; then
-                        echo "${C_YELLOW}[!] Warning: thinking effort '${kimi_ablit_effort}' is not offered by ${resolved_model} (${ablit_efforts}); using xhigh.${C_RESET}" >&2
-                        kimi_ablit_effort="xhigh"
-                    fi
                     export KIMI_MODEL_THINKING_EFFORT="${kimi_ablit_effort}"
                     if ${opt_launch_webbridge}; then
                         echo "${C_DIM}[*] -W/--webbridge is a Moonshot-quota fallback; abliteration.ai serves its own server-side web_search tool.${C_RESET}"
@@ -7143,6 +7367,15 @@ cmd_launch() {
                 export OPENAI_API_BASE="${active_host}/v1"
                 export OPENAI_API_KEY="${OPENAI_API_KEY:-ollama}"
                 exec "${cursor_bin}" --model "${resolved_model}" "${cli_passthrough_args[@]}"
+                ;;
+            gh)
+                # COPILOT_* routing was exported above. Ollama needs no key; a
+                # real COPILOT_PROVIDER_API_KEY/BEARER_TOKEN survives only for a
+                # plain local daemon (scrubbed for every other host above).
+                # 'gh copilot' runs the Copilot CLI on PATH, or downloads it to
+                # gh's data dir on first use; '--' keeps gh from parsing
+                # Copilot's own flags.
+                exec "${cli_cmd}" copilot -- "${cli_passthrough_args[@]}"
                 ;;
             opencode)
                 # opencode routes inference purely through its own provider
@@ -7623,16 +7856,29 @@ _install_single_cli() {
                 return 0
             fi
             if [[ -n "${cur_bin}" && "${update}" == "true" ]]; then
-                echo "${C_CYAN}[*] Updating OpenCode CLI via 'opencode upgrade'...${C_RESET}"
-                local update_status=0
-                opencode upgrade 2>&1 || update_status=$?
-                if [[ "${update_status}" -eq 0 ]]; then
-                    local new_ver
-                    new_ver=$(_get_cli_version opencode)
-                    echo "${C_GREEN}[✓] Successfully updated OpenCode CLI (${new_ver})!${C_RESET}"
-                    return 0
+                local cur_ver_for_upgrade
+                cur_ver_for_upgrade=$(_get_cli_version opencode)
+                # When the binary is already broken (postinstall blocked), skip
+                # 'opencode upgrade' — it will just fail on the broken binary.
+                if [[ ! "${cur_ver_for_upgrade}" =~ ^[0-9] ]]; then
+                    echo "${C_YELLOW}[*] OpenCode binary is broken; skipping 'opencode upgrade' and re-installing...${C_RESET}"
+                else
+                    echo "${C_CYAN}[*] Updating OpenCode CLI via 'opencode upgrade'...${C_RESET}"
+                    local update_status=0
+                    opencode upgrade 2>&1 || update_status=$?
+                    if [[ "${update_status}" -eq 0 ]]; then
+                        local new_ver upgrade_works=false
+                        new_ver=$(_get_cli_version opencode)
+                        [[ "${new_ver}" =~ ^[0-9] ]] && upgrade_works=true
+                        if ${upgrade_works}; then
+                            echo "${C_GREEN}[✓] Successfully updated OpenCode CLI (${new_ver})!${C_RESET}"
+                            return 0
+                        fi
+                        echo "${C_YELLOW}[*] 'opencode upgrade' exited successfully but binary is broken; falling back to installer...${C_RESET}"
+                    else
+                        echo "${C_YELLOW}[*] 'opencode upgrade' exited with error; falling back to installer...${C_RESET}"
+                    fi
                 fi
-                echo "${C_YELLOW}[*] 'opencode upgrade' exited with error; falling back to installer...${C_RESET}"
             fi
             local installed=false
             if [[ "${OPENCODE_CHANNEL:-}" == "v1" ]]; then
@@ -8099,18 +8345,69 @@ _qwen_standalone_dir() {
 # npm install -g that keeps npm's exit status and names any package whose
 # install script npm skipped (npm's allowScripts gate): a CLI whose postinstall
 # links its platform binary is then broken despite a zero exit.
+# When scripts are blocked and the install exited 0, auto-retry with
+# --allow-scripts=<pkg> for each blocked package so the postinstall runs and
+# the binary is functional (a global .npmrc 'allow-scripts=workspace' blocks
+# scripts by default; the CLI flag overrides it).
+# Probe ~/.npmrc for allow-scripts setting and cache whether we need to add
+# --allow-scripts to npm install commands. Called once at startup to avoid
+# double-installs on every npm global install.
+_NPM_ALLOW_SCRIPTS_NEEDED=""
+_NPM_ALLOW_SCRIPTS_PROBED=false
+_probe_npmrc_allow_scripts() {
+    ${_NPM_ALLOW_SCRIPTS_PROBED} && return 0
+    _NPM_ALLOW_SCRIPTS_PROBED=true
+    _NPM_ALLOW_SCRIPTS_NEEDED=false
+    local npmrc="${HOME:-/root}/.npmrc"
+    [[ -f "${npmrc}" ]] || return 0
+    local allow_scripts
+    allow_scripts=$(grep -E '^\s*allow-scripts\s*=' "${npmrc}" 2>/dev/null | tail -1 | sed 's/.*=\s*//;s/\s*$//') || return 0
+    case "${allow_scripts}" in
+        workspace|false)
+            _NPM_ALLOW_SCRIPTS_NEEDED=true
+            ;;
+    esac
+}
+
 _npm_global_install() {
-    local log rc=0 blocked pkg
+    local log rc=0 blocked pkg allow_flags
+    # Lazy probe: check ~/.npmrc on first call so the function definition order
+    # doesn't matter (defined at line ~8350, may be called from installers above).
+    _probe_npmrc_allow_scripts
+    # If we detected that npmrc blocks scripts, preemptively add --allow-scripts
+    # for the package being installed to avoid the double-install.
+    local extra_flags=()
+    if [[ "${_NPM_ALLOW_SCRIPTS_NEEDED}" == "true" ]]; then
+        # Extract package name from args (last non-flag argument)
+        local pkg_name
+        for pkg_name in "$@"; do
+            [[ "${pkg_name}" == -* ]] && continue
+        done
+        [[ -n "${pkg_name}" ]] && extra_flags+=(--allow-scripts="${pkg_name}")
+    fi
     log=$(mktemp) || return 1
-    npm install -g "$@" 2>&1 | tee "${log}" || rc=$?
+    npm install -g "${extra_flags[@]}" "$@" 2>&1 | tee "${log}" || rc=$?
     blocked=$(sed -nE 's/^npm warn install-scripts +(@?[^@ ]+)@[^ ]+ \(.*$/\1/p' "${log}" | sort -u)
     rm -f "${log}"
     if [[ -n "${blocked}" ]]; then
         echo "${C_YELLOW}[!] npm skipped install scripts for: $(tr '\n' ' ' <<<"${blocked}")${C_RESET}" >&2
-        echo "${C_DIM}    Features that need them may not work. To allow them once:${C_RESET}" >&2
-        for pkg in ${blocked}; do
-            echo "${C_DIM}      npm install -g --allow-scripts=${pkg} $*${C_RESET}" >&2
-        done
+        if [[ "${rc}" -eq 0 ]]; then
+            echo "${C_CYAN}[*] Re-running with --allow-scripts to fix postinstall...${C_RESET}"
+            allow_flags=()
+            for pkg in ${blocked}; do
+                allow_flags+=(--allow-scripts="${pkg}")
+            done
+            log=$(mktemp) || return "${rc}"
+            npm install -g "${allow_flags[@]}" "$@" 2>&1 | tee "${log}" || rc=$?
+            blocked=$(sed -nE 's/^npm warn install-scripts +(@?[^@ ]+)@[^ ]+ \(.*$/\1/p' "${log}" | sort -u)
+            rm -f "${log}"
+        fi
+        if [[ -n "${blocked}" ]]; then
+            echo "${C_DIM}    Features that need them may not work. To allow them once:${C_RESET}" >&2
+            for pkg in ${blocked}; do
+                echo "${C_DIM}      npm install -g --allow-scripts=${pkg} $*${C_RESET}" >&2
+            done
+        fi
     fi
     return "${rc}"
 }
@@ -8159,7 +8456,25 @@ _cli_health_check() { # <cli>
 }
 
 _install_cli_checked() { # <cli> <force> <update>
-    _install_single_cli "$@" && _cli_health_check "$1"
+    _install_single_cli "$@" || return $?
+    if _cli_health_check "$1"; then
+        return 0
+    fi
+    # Generic recovery: when the install succeeded but the binary is broken
+    # (postinstall blocked by npmrc allow-scripts), auto-retry via npm with
+    # --allow-scripts. Covers remote installers that use npm internally without
+    # --allow-scripts (e.g., opencode.ai/v2/install) and any npm-installed CLI
+    # whose postinstall links a platform-specific binary.
+    local cli="$1" bin pkg
+    if bin=$(_update_cli_binary "${cli}" 2>/dev/null) && pkg=$(_npm_package_for_bin "$(command -v "${bin}" 2>/dev/null || true)" 2>/dev/null); then
+        if command -v npm >/dev/null 2>&1; then
+            echo "${C_CYAN}[*] Installer left a broken binary; re-installing ${pkg} via npm with --allow-scripts...${C_RESET}"
+            _npm_global_install "${pkg}" || true
+            hash -r
+            _cli_health_check "${cli}" && return 0
+        fi
+    fi
+    return 1
 }
 
 _get_cli_latest_version() {
@@ -8289,8 +8604,14 @@ _process_present_cli_updates() {
         present=$((present + 1))
         current=$(_get_cli_version "${bin}")
         latest=$(_get_cli_latest_version "${c}")
-        state=$(_compare_cli_versions "${c}" "${current}" "${latest}")
-        state="${state:-lookup failed/unknown}"
+        # When current version doesn't look like a valid version (e.g., broken
+        # binary printing an error), treat as "update available" so installer runs.
+        if [[ -n "${latest}" && ! "${current}" =~ ^[0-9] ]]; then
+            state="update available"
+        else
+            state=$(_compare_cli_versions "${c}" "${current}" "${latest}")
+            state="${state:-lookup failed/unknown}"
+        fi
         printf '  %-12s %-24s %-24s %s\n' "${c}" "${current}" "${latest:--}" "${state}"
         if [[ "${state}" != 'update available' ]]; then
             skipped=$((skipped + 1))
@@ -8302,6 +8623,12 @@ _process_present_cli_updates() {
         attempts=$((attempts + 1))
         if _install_cli_checked "${c}" false true; then
             after=$(_get_cli_version "${bin}")
+            # If current was broken (not a valid version) and after is valid, consider it fixed
+            if [[ ! "${current}" =~ ^[0-9] && "${after}" =~ ^[0-9] ]]; then
+                verified=$((verified + 1))
+                echo "${c}: fixed broken installation, now at ${after}"
+                continue
+            fi
             if [[ "$(_compare_cli_versions "${c}" "${current}" "${after}")" == 'update available' ]]; then
                 verified=$((verified + 1))
                 echo "${c}: verified upgrade ${current} -> ${after}"
@@ -9179,7 +9506,7 @@ _kimo() {
 
     local commands="list ls search find ps top warm preload stop unload tune set-ctx param bench eval benchmark info show tag alias rm delete pull download sync run launch install setup update upgrade doctor diagnose diag config cfg completion freetier free-tier kimi-sync quota quotas quote tunnel gemini gemini-sync kimi-gemini codex codex-sync kimi-codex version status health hosts init scan discover check ping stream logs status-report report rotate-token web help"
     local global_opts="--remote --local --host --json --no-color -v --version -h --help"
-    local supported_clis="claude grok kimi agy codex qwen cursor opencode cyberstrike openclaw hermes"
+    local supported_clis="claude grok kimi agy codex qwen cursor opencode cyberstrike openclaw hermes gh"
     local config_subcmds="get set unset list show path validate help"
     local config_keys="default_host default_model remote_url local_url remote_host kimi_effort kimi_context no_color webbridge_url webbridge_port web_engine web_max_results cloud_provider"
     local log_services="tunnel keepalive timer apache all"
@@ -9292,14 +9619,14 @@ _kimo() {
             if [[ "${cur}" == -* ]]; then
                 COMPREPLY=( $(compgen -W "--update --force --list -h --help" -- "${cur}") )
             else
-                COMPREPLY=( $(compgen -W "${supported_clis} gh all list" -- "${cur}") )
+                COMPREPLY=( $(compgen -W "${supported_clis} all list" -- "${cur}") )
             fi
             ;;
         update|upgrade)
             if [[ "${cur}" == -* ]]; then
                 COMPREPLY=( $(compgen -W "--apply --check --allow-system-path -h --help" -- "${cur}") )
             else
-                COMPREPLY=( $(compgen -W "${supported_clis} gh all" -- "${cur}") )
+                COMPREPLY=( $(compgen -W "${supported_clis} all" -- "${cur}") )
             fi
             ;;
         run|info|show|warm|preload|rm|delete|tag|alias|stream)
@@ -9594,7 +9921,7 @@ _kimo() {
                         '(-W --webbridge)'{-W,--webbridge}'[Inject WebBridge skill into session]' \
                         '(--evict --no-evict)'{--evict,--no-evict}'[Unload / keep other models on the host]' \
                         '--dry-run[Show routing plan, start nothing]' \
-                        '1:CLI:(claude grok kimi agy codex qwen cursor opencode cyberstrike openclaw hermes)' \
+                        '1:CLI:(claude grok kimi agy codex qwen cursor opencode cyberstrike openclaw hermes gh)' \
                         '*:arguments:' && return 0
                     ;;
                 install|setup)
@@ -10944,6 +11271,9 @@ _codex_sync_kimi() (
     mkdir -p "$(dirname "${KIMI_CONFIG_LOCK}")" || return 1
     exec 9>>"${KIMI_CONFIG_LOCK}" || return 1
     flock -w 15 9 || { echo "Error: Kimi config is busy; retry the Codex sync." >&2; return 1; }
+    # When called with --json, output the synced model alias so the caller can
+    # pass the registered name (with codex/ prefix) to kimi, avoiding fallback
+    # to __kimi_env_model__.
     _codex_helper sync "$@"
 )
 
@@ -11752,7 +12082,7 @@ cmd_quota() {
         --local-url "${LOCAL_HOST_URL}" --remote-url "${REMOTE_HOST_URL}" \
         --web-url "${WEBBRIDGE_URL}" --host-mode "${HOST_MODE}" \
         --target-host "${TARGET_HOST}" --multi-hosts "${MULTI_HOSTS}" \
-        "${options[@]}" --cli-names "${!EXTERNAL_CLI_MAP[@]}" gh
+        "${options[@]}" --cli-names "${!EXTERNAL_CLI_MAP[@]}"
 }
 
 
