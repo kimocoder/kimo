@@ -35,17 +35,17 @@ jobs:
     if: ${{ github.event_name == 'push' || github.event_name == 'schedule' }}
     uses: "google/osv-scanner-action/.github/workflows/osv-scanner-reusable.yml@b1d267aea5211fa648d9d442fa64b90dbdcbdd36" # v2.7.0
     with:
-      # Example of specifying custom arguments
+      # --skip-git is gone in v2 (git roots are opt-in); the repo has no lockfiles.
       scan-args: |-
         -r
-        --skip-git
+        --allow-no-lockfiles
         ./
   scan-pr:
     if: ${{ github.event_name == 'pull_request' || github.event_name == 'merge_group' }}
     uses: "google/osv-scanner-action/.github/workflows/osv-scanner-reusable-pr.yml@b1d267aea5211fa648d9d442fa64b90dbdcbdd36" # v2.7.0
     with:
-      # Example of specifying custom arguments
+      # --skip-git is gone in v2 (git roots are opt-in); the repo has no lockfiles.
       scan-args: |-
         -r
-        --skip-git
+        --allow-no-lockfiles
         ./
