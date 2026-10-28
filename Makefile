@@ -13,7 +13,7 @@ export KIMO_NO_AUTOSCAN := 1
 
 SCRIPT  := kimo
 
-.PHONY: all help install uninstall link unlink check lint test test-check test-web test-qwen test-claude test-agy test-opencode test-kimi test-codex test-codex-auth test-dashscope test-cursor test-grok test-gh test-thinking-tools test-gemini test-scan test-quota test-tunnel test-config-validate test-rotate-token test-jq-guard test-pull-json test-backup-prune test-web-url-esc test-gh-guard test-model-args test-launch-contract test-sync test-model-commands test-shim test-install-packages test-config-rules test-hardening test-extra clean install-completion uninstall-completion update update-% test-host-url test-web-bridge test-option-values test-update-lookup test-codex-update test-qwen-update test-cli-health test-provider-sync test-kimi-provider
+.PHONY: all help install uninstall link unlink check lint test test-check test-web test-qwen test-claude test-agy test-opencode test-kimi test-abliteration test-codex test-codex-auth test-dashscope test-token-providers test-cursor test-grok test-gh test-thinking-tools test-gemini test-scan test-quota test-tunnel test-config-validate test-rotate-token test-jq-guard test-pull-json test-backup-prune test-web-url-esc test-gh-guard test-model-args test-launch-contract test-sync test-model-commands test-shim test-install-packages test-config-rules test-hardening test-extra clean install-completion uninstall-completion update update-% test-host-url test-web-bridge test-option-values test-update-lookup test-codex-update test-qwen-update test-cli-health test-provider-sync test-kimi-provider
 
 all: help
 
@@ -70,7 +70,12 @@ help:
 	@echo "  make test-option-values      Missing option values fail loudly instead of exiting silently"
 	@echo "  make test-provider-sync      kimi provider sync keeps keys on base_url: no redirects, header-only"
 	@echo "  make test-kimi-provider      kimi provider disable/enable round trip, sync refresh/filter/prune, CLI errors"
-	@echo "  make clean                 Remove temporary and backup files"
+	@echo "  make test-update-lookup      'update' version lookups parse every upstream output, else report unknown"
+	@echo "  make test-codex-update       'update codex' updates the codex on PATH (standalone or npm install)"
+	@echo "  make test-qwen-update        'update qwen' updates the qwen on PATH (standalone or npm install)"
+	@echo "  make test-cli-health         A CLI whose npm install scripts were skipped is not reported as updated"
+	@echo "  make test-extra              Only the focused regression suites (subset of 'make test')"
+	@echo "  make clean                 Remove temporary, backup and Python bytecode files"
 	@echo "  make help                  Display this help message"
 	@echo ""
 	@echo "Variables:"
@@ -92,6 +97,9 @@ install:
 	@install -d -m 755 $(DESTDIR)$(SHAREDIR)
 	@install -m 644 lib/kimo-quota.py $(DESTDIR)$(SHAREDIR)/kimo-quota.py
 	@install -m 644 lib/kimo-codex.py $(DESTDIR)$(SHAREDIR)/kimo-codex.py
+	@install -m 644 lib/kimo-claude.py $(DESTDIR)$(SHAREDIR)/kimo-claude.py
+	@install -m 644 lib/kimo-gemini.py $(DESTDIR)$(SHAREDIR)/kimo-gemini.py
+	@install -m 644 lib/kimo-grok.py $(DESTDIR)$(SHAREDIR)/kimo-grok.py
 	@install -m 644 lib/kimo-stream.py $(DESTDIR)$(SHAREDIR)/kimo-stream.py
 
 uninstall: uninstall-completion
@@ -100,6 +108,9 @@ uninstall: uninstall-completion
 	@rm -f $(DESTDIR)$(SHAREDIR)/ollama-gemini-shim.py
 	@rm -f $(DESTDIR)$(SHAREDIR)/kimo-quota.py
 	@rm -f $(DESTDIR)$(SHAREDIR)/kimo-codex.py
+	@rm -f $(DESTDIR)$(SHAREDIR)/kimo-claude.py
+	@rm -f $(DESTDIR)$(SHAREDIR)/kimo-gemini.py
+	@rm -f $(DESTDIR)$(SHAREDIR)/kimo-grok.py
 	@rm -f $(DESTDIR)$(SHAREDIR)/kimo-stream.py
 	@rmdir $(DESTDIR)$(SHAREDIR) 2>/dev/null || true
 	@echo "[✓] $(SCRIPT) and assets removed from $(DESTDIR)$(PREFIX)"
@@ -173,7 +184,7 @@ lint:
 	@python3 tests/check_buffer_splits.py
 	@echo "[✓] Lint check passed."
 
-test: test-check test-web test-scan test-gh test-thinking-tools test-gemini test-qwen test-claude test-agy test-opencode test-kimi test-abliteration test-codex test-codex-auth test-dashscope test-cursor test-grok test-quota test-tunnel test-config-validate test-rotate-token test-jq-guard test-pull-json test-backup-prune test-web-url-esc test-gh-guard test-model-args test-launch-contract test-sync test-model-commands test-shim test-install-packages test-config-rules test-hardening test-host-url test-web-bridge test-option-values test-update-lookup test-codex-update test-qwen-update test-cli-health test-provider-sync test-kimi-provider
+test: test-check test-web test-scan test-gh test-thinking-tools test-gemini test-qwen test-claude test-agy test-opencode test-kimi test-abliteration test-codex test-codex-auth test-dashscope test-token-providers test-cursor test-grok test-quota test-tunnel test-config-validate test-rotate-token test-jq-guard test-pull-json test-backup-prune test-web-url-esc test-gh-guard test-model-args test-launch-contract test-sync test-model-commands test-shim test-install-packages test-config-rules test-hardening test-host-url test-web-bridge test-option-values test-update-lookup test-codex-update test-qwen-update test-cli-health test-provider-sync test-kimi-provider
 	@echo ""
 	@echo "[✓] All test suites completed successfully."
 
@@ -184,6 +195,10 @@ test-abliteration:
 test-dashscope:
 	@echo "[*] Running DashScope cloud-provider smoke tests..."
 	@tests/dashscope-smoke.sh
+
+test-token-providers:
+	@echo "[*] Running Claude and Gemini token provider tests..."
+	@tests/token_providers_test.sh
 
 test-check:
 	@echo "[*] Running check and ping connectivity smoke tests..."

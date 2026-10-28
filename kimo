@@ -524,7 +524,8 @@ ${C_YELLOW}Maintenance, Config & Completion:${C_RESET}
   ${C_CYAN}status-report${C_RESET}                Append operational status snapshot to /var/log/ollama-status-report.log
   ${C_CYAN}rotate-token${C_RESET}                 Generate new public API token, rewrite proxy conf & reload Apache
   ${C_CYAN}freetier [opts]${C_RESET}              Sync Kimi config with Model Studio free-tier quotas (bl usage free)
-  ${C_CYAN}gemini [opts]${C_RESET}                Register Gemini API models (real token limits) in Kimi config
+  ${C_CYAN}claude [opts]${C_RESET}                Inspect/renew Claude OAuth tokens & sync Anthropic models in Kimi config
+  ${C_CYAN}gemini [opts]${C_RESET}                Inspect/renew Gemini OAuth tokens & sync Gemini models in Kimi config
   ${C_CYAN}codex [opts]${C_RESET}                 Inspect/renew Codex auth tokens & sync ChatGPT/OpenAI models in Kimi config
   ${C_CYAN}kimi provider [subcmd]${C_RESET}       Manage LLM providers in Kimi Code's config (list/disable/enable/sync)
   ${C_CYAN}quota, quotas, quote${C_RESET}         Quota & usage dashboard for providers and every supported CLI
@@ -624,7 +625,8 @@ while [[ $# -gt 0 ]]; do
     fi
     # Once 'launch <cli>' is known, the flags child CLIs commonly define
     # themselves (-v, --version, -h, --help, --json) belong to that CLI, not
-    # kimo. Routing options (--remote/--local/--host/--no-color) still apply.
+    # kimo. kimi also defines --host for 'web'/'rc'. Routing options
+    # (--remote/--local/--host/--no-color) still apply otherwise.
     _child_args=false
     [[ "${POSITIONAL_ARGS[0]:-}" == "launch" && ${#POSITIONAL_ARGS[@]} -ge 2 ]] && _child_args=true
     case "$1" in
@@ -644,6 +646,16 @@ while [[ $# -gt 0 ]]; do
             shift
             ;;
         --host)
+            if ${_child_args} && [[ "${POSITIONAL_ARGS[1]:-}" == "kimi" ]]; then
+                if [[ -n "${2:-}" && "${2:-}" != -* ]]; then
+                    POSITIONAL_ARGS+=("$1" "$2")
+                    shift 2
+                else
+                    POSITIONAL_ARGS+=("$1")
+                    shift
+                fi
+                continue
+            fi
             shift
             if [[ -z "${1:-}" ]]; then
                 echo "Error: --host requires an address argument." >&2
@@ -653,6 +665,11 @@ while [[ $# -gt 0 ]]; do
             shift
             ;;
         --host=*)
+            if ${_child_args} && [[ "${POSITIONAL_ARGS[1]:-}" == "kimi" ]]; then
+                POSITIONAL_ARGS+=("$1")
+                shift
+                continue
+            fi
             OPT_HOSTS+=("${1#*=}")
             shift
             ;;
@@ -5613,6 +5630,8 @@ KIMI_CONFIG="${KIMI_CONFIG:-${KIMI_CODE_HOME:-${HOME:-/root}/.kimi-code}/config.
 # cannot drop each other's entries.
 KIMI_CONFIG_LOCK="${KIMO_KIMI_CONFIG_LOCK:-${KIMI_CONFIG_LOCK:-${KIMO_RUNTIME_DIR}/kimi-config.lock}}"
 CODEX_HOME="${CODEX_HOME:-${HOME:-/root}/.codex}"
+CLAUDE_HOME="${CLAUDE_CONFIG_DIR:-${HOME:-/root}/.claude}"
+GEMINI_HOME="${GEMINI_HOME:-${HOME:-/root}/.gemini}"
 
 # -----------------------------------------------------------------------------
 # Codex authentication & token resolution for Kimi Code and Codex CLI.
@@ -5745,6 +5764,173 @@ _ensure_codex_token() {
             echo "${C_DIM}    With only a platform key, use '--provider openai' instead.${C_RESET}" >&2
             ;;
     esac
+    return 1
+}
+
+_resolve_claude_auth() {
+    local cdir="${CLAUDE_CONFIG_DIR:-${HOME:-/root}/.claude}"
+    local auth_file="${cdir}/.credentials.json"
+    local file_token=""
+
+    if [[ -f "${auth_file}" ]] && command -v jq >/dev/null 2>&1; then
+        file_token=$(jq -r '.claudeAiOauth.accessToken | select(type == "string")' "${auth_file}" 2>/dev/null || true)
+    fi
+
+    # 1. If CLAUDE_CODE_OAUTH_TOKEN is set, keep it and mirror to ANTHROPIC_AUTH_TOKEN if unset
+    if [[ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]]; then
+        export ANTHROPIC_AUTH_TOKEN="${ANTHROPIC_AUTH_TOKEN:-${CLAUDE_CODE_OAUTH_TOKEN}}"
+        return 0
+    fi
+
+    # 2. If ANTHROPIC_AUTH_TOKEN is set, mirror to CLAUDE_CODE_OAUTH_TOKEN
+    if [[ -n "${ANTHROPIC_AUTH_TOKEN:-}" ]]; then
+        export CLAUDE_CODE_OAUTH_TOKEN="${ANTHROPIC_AUTH_TOKEN}"
+        return 0
+    fi
+
+    # 3. If file_token is in .credentials.json, export both
+    if [[ -n "${file_token}" ]]; then
+        export CLAUDE_CODE_OAUTH_TOKEN="${file_token}"
+        export ANTHROPIC_AUTH_TOKEN="${file_token}"
+        return 0
+    fi
+    return 0
+}
+
+_ensure_claude_token() {
+    local state source refreshable refresh_attempted=false
+    _resolve_claude_auth
+    read -r state source refreshable < <(_claude_helper token-state 2>/dev/null) || return 1
+    if [[ "${state}" != valid && "${refreshable}" == yes && "${KIMO_CLAUDE_NO_REFRESH:-0}" != 1 ]]; then
+        refresh_attempted=true
+        echo "${C_DIM}[*] Claude OAuth token is ${state}; renewing it from credentials...${C_RESET}" >&2
+        _claude_helper refresh || true
+    fi
+    if [[ "${state}" != valid || "${source}" == file ]]; then
+        unset CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_AUTH_TOKEN
+        _resolve_claude_auth
+        read -r state source refreshable < <(_claude_helper token-state 2>/dev/null) || return 1
+    fi
+    if [[ "${state}" == valid || "${state}" == apikey ]]; then
+        return 0
+    fi
+    echo "${C_RED}Error: no usable Claude OAuth token or API key (${state}).${C_RESET}" >&2
+    echo "${C_DIM}    Sign in with '${0##*/} claude auth login', or export CLAUDE_CODE_OAUTH_TOKEN (or ANTHROPIC_API_KEY).${C_RESET}" >&2
+    return 1
+}
+
+_resolve_gemini_auth() {
+    local gdir="${GEMINI_HOME:-${HOME:-/root}/.gemini}"
+    local token_file="${gdir}/antigravity-cli/antigravity-oauth-token"
+    if [[ ! -f "${token_file}" && -f "${gdir}/gemini-credentials.json" ]]; then
+        token_file="${gdir}/gemini-credentials.json"
+    fi
+    local file_token=""
+
+    if [[ -f "${token_file}" ]] && command -v jq >/dev/null 2>&1; then
+        file_token=$(jq -r '.token.access_token | select(type == "string")' "${token_file}" 2>/dev/null || true)
+        if [[ -z "${file_token}" ]]; then
+            file_token=$(jq -r '.access_token | select(type == "string")' "${token_file}" 2>/dev/null || true)
+        fi
+    fi
+
+    # 1. If GEMINI_AUTH_TOKEN is set, keep it and mirror to GOOGLE_OAUTH_TOKEN if unset
+    if [[ -n "${GEMINI_AUTH_TOKEN:-}" ]]; then
+        export GOOGLE_OAUTH_TOKEN="${GOOGLE_OAUTH_TOKEN:-${GEMINI_AUTH_TOKEN}}"
+        return 0
+    fi
+
+    # 2. If GOOGLE_OAUTH_TOKEN is set, mirror to GEMINI_AUTH_TOKEN
+    if [[ -n "${GOOGLE_OAUTH_TOKEN:-}" ]]; then
+        export GEMINI_AUTH_TOKEN="${GOOGLE_OAUTH_TOKEN}"
+        return 0
+    fi
+
+    # 3. If file_token is found, export as GEMINI_AUTH_TOKEN and GOOGLE_OAUTH_TOKEN
+    if [[ -n "${file_token}" ]]; then
+        export GEMINI_AUTH_TOKEN="${file_token}"
+        export GOOGLE_OAUTH_TOKEN="${file_token}"
+        return 0
+    fi
+    return 0
+}
+
+_ensure_gemini_token() {
+    local state source refreshable refresh_attempted=false
+    _resolve_gemini_auth
+    read -r state source refreshable < <(_gemini_helper token-state 2>/dev/null) || return 1
+    if [[ "${state}" != valid && "${refreshable}" == yes && "${KIMO_GEMINI_NO_REFRESH:-0}" != 1 ]]; then
+        refresh_attempted=true
+        echo "${C_DIM}[*] Gemini OAuth token is ${state}; renewing it from credentials...${C_RESET}" >&2
+        _gemini_helper refresh || true
+    fi
+    if [[ "${state}" != valid || "${source}" == file ]]; then
+        unset GEMINI_AUTH_TOKEN GOOGLE_OAUTH_TOKEN
+        _resolve_gemini_auth
+        read -r state source refreshable < <(_gemini_helper token-state 2>/dev/null) || return 1
+    fi
+    if [[ "${state}" == valid || "${state}" == apikey ]]; then
+        return 0
+    fi
+    echo "${C_RED}Error: no usable Gemini OAuth token or API key (${state}).${C_RESET}" >&2
+    echo "${C_DIM}    Sign in with 'agy', or export GEMINI_AUTH_TOKEN (or GEMINI_API_KEY).${C_RESET}" >&2
+    return 1
+}
+
+_resolve_grok_auth() {
+    local gdir="${GROK_HOME:-${HOME:-/root}/.grok}"
+    local auth_file="${gdir}/auth.json"
+    local file_token=""
+
+    if [[ -f "${auth_file}" ]] && command -v jq >/dev/null 2>&1; then
+        file_token=$(jq -r '.. | objects | .key? // empty' "${auth_file}" 2>/dev/null | head -1 || true)
+    fi
+
+    # 1. If XAI_AUTH_TOKEN is already explicitly set and non-empty, keep it.
+    if [[ -n "${XAI_AUTH_TOKEN:-}" ]]; then
+        return 0
+    fi
+
+    # 2. If file_token in auth.json, export XAI_AUTH_TOKEN
+    if [[ -n "${file_token}" ]]; then
+        export XAI_AUTH_TOKEN="${file_token}"
+        return 0
+    fi
+
+    # 3. If XAI_API_KEY is in JWT format, export as XAI_AUTH_TOKEN
+    if [[ -n "${XAI_API_KEY:-}" && "${XAI_API_KEY}" == eyJ* ]]; then
+        export XAI_AUTH_TOKEN="${XAI_API_KEY}"
+        return 0
+    fi
+    return 0
+}
+
+_grok_helper() {
+    local helper
+    if ! helper=$(_find_lib_helper kimo-grok.py "${KIMO_GROK_HELPER:-}"); then
+        echo "Error: kimo-grok.py is missing; reinstall kimo." >&2
+        return 1
+    fi
+    local runtime=""
+    ensure_private_dir "${KIMO_RUNTIME_DIR}" 2>/dev/null && runtime="${KIMO_RUNTIME_DIR}"
+    GROK_HOME="${GROK_HOME:-}" KIMI_CONFIG="${KIMI_CONFIG}" KIMO_RUNTIME_DIR="${runtime}" python3 "${helper}" "$@"
+}
+
+_grok_show_status() {
+    local -a options=()
+    [[ "${1:-false}" == true ]] && options+=(--json)
+    _grok_helper status "${options[@]}"
+}
+
+_ensure_grok_token() {
+    local state source refreshable
+    _resolve_grok_auth
+    read -r state source refreshable < <(_grok_helper token-state 2>/dev/null) || return 1
+    if [[ "${state}" == valid || "${state}" == apikey ]]; then
+        return 0
+    fi
+    echo "${C_RED}Error: no usable xAI Grok token or API key (${state}).${C_RESET}" >&2
+    echo "${C_DIM}    Sign in with 'grok login', or export XAI_AUTH_TOKEN (or XAI_API_KEY).${C_RESET}" >&2
     return 1
 }
 
@@ -5882,12 +6068,29 @@ for spec in specs:
         mdl["max_context_size"] = int(ctx)
     elif "max_context_size" in mdl:
         del mdl["max_context_size"]
+    out_size = spec.get("max_output_size")
+    if out_size is not None and str(out_size).isdigit():
+        mdl["max_output_size"] = int(out_size)
+    elif "max_output_size" not in mdl:
+        mdl["max_output_size"] = 16384
     _set(mdl, "capabilities", [c for c in (spec.get("caps") or "").split(",") if c])
     _set(mdl, "support_efforts", [c for c in (spec.get("efforts") or "").split(",") if c])
     _set(mdl, "default_effort", spec.get("deff"))
     _set(mdl, "off_effort", spec.get("off"))
     _set(mdl, "reasoning_key", spec.get("rkey"))
     _set(mdl, "display_name", spec.get("display_name"))
+
+# Configure loop_control defaults so kimi auto-compaction does not block
+# prematurely on a large 131k context window with default 50k reserve.
+if "loop_control" not in doc:
+    doc["loop_control"] = tomlkit.table()
+lc = doc["loop_control"]
+if "reserved_context_size" not in lc:
+    lc["reserved_context_size"] = 16384
+if "compaction_trigger_ratio" not in lc:
+    lc["compaction_trigger_ratio"] = 0.90
+if "compaction_max_attempts" not in lc:
+    lc["compaction_max_attempts"] = 3
 
 # Pin default_model to the launched alias: kimi's -p prompt mode resolves the
 # model from default_model and ignores -m, so without this a headless turn has
@@ -10732,17 +10935,22 @@ KIMI_GM_NONCHAT_RE='embed|aqa|imagen|veo|lyria|tts|image|banana|native-audio|liv
 KIMI_GM_PREVIEW_RE='preview|exp(erimental)?([-_]|$)'
 
 # _gemini_curl_key KEY CURL_ARGS... - run curl with the key sent as the
-# x-goog-api-key header via a stdin config, so it never shows up in argv/ps.
+# Authorization: Bearer or x-goog-api-key header via a stdin config, so it
+# never shows up in argv/ps.
 _gemini_curl_key() {
     local key="$1"
     shift
-    printf 'header = "x-goog-api-key: %s"\n' "${key}" | curl -K - "$@"
+    if [[ "${key}" == ya29.* || "${key}" != AIza* ]]; then
+        printf 'header = "Authorization: Bearer %s"\n' "${key}" | curl -K - "$@"
+    else
+        printf 'header = "x-goog-api-key: %s"\n' "${key}" | curl -K - "$@"
+    fi
 }
 export -f _gemini_curl_key
 
-# Key order: --api-key, --api-key-env VAR, GEMINI_API_KEY, GOOGLE_API_KEY,
-# GOOGLE_GENERATIVE_AI_API_KEY, then ~/.gemini/.env (gemini-cli's file). The
-# literal "ollama" is skipped: that is the placeholder kimo's agy launch exports.
+# Key order: --api-key, --api-key-env VAR, GEMINI_AUTH_TOKEN, GOOGLE_OAUTH_TOKEN,
+# GEMINI_API_KEY, GOOGLE_API_KEY, GOOGLE_GENERATIVE_AI_API_KEY, then ~/.gemini/.env.
+# The literal "ollama" is skipped: that is the placeholder kimo's agy launch exports.
 _gemini_resolve_key() {
     if [[ -n "${KIMI_GM_API_KEY}" ]]; then
         printf '%s' "${KIMI_GM_API_KEY}"
@@ -10758,18 +10966,27 @@ _gemini_resolve_key() {
         printf '%s' "${k}"
         return 0
     fi
-    for var in GEMINI_API_KEY GOOGLE_API_KEY GOOGLE_GENERATIVE_AI_API_KEY; do
+    for var in GEMINI_AUTH_TOKEN GOOGLE_OAUTH_TOKEN GEMINI_API_KEY GOOGLE_API_KEY GOOGLE_GENERATIVE_AI_API_KEY; do
         if [[ -n "${!var:-}" && "${!var}" != "ollama" ]]; then
             k="${!var}"
             break
         fi
     done
+    if [[ -z "${k}" ]]; then
+        _resolve_gemini_auth
+        for var in GEMINI_AUTH_TOKEN GOOGLE_OAUTH_TOKEN; do
+            if [[ -n "${!var:-}" && "${!var}" != "ollama" ]]; then
+                k="${!var}"
+                break
+            fi
+        done
+    fi
     if [[ -z "${k}" && -f "${KIMI_GM_DOTENV}" ]]; then
-        k=$(sed -n -E "s/^[[:space:]]*(export[[:space:]]+)?(GEMINI_API_KEY|GOOGLE_API_KEY)[[:space:]]*=[[:space:]]*[\"']?([^\"'[:space:]]+).*/\\3/p" \
+        k=$(sed -n -E "s/^[[:space:]]*(export[[:space:]]+)?(GEMINI_API_KEY|GOOGLE_API_KEY|GEMINI_AUTH_TOKEN|GOOGLE_OAUTH_TOKEN)[[:space:]]*=[[:space:]]*[\"']?([^\"'[:space:]]+).*/\\3/p" \
             "${KIMI_GM_DOTENV}" 2>/dev/null | head -1) || k=""
     fi
     if [[ -z "${k}" ]]; then
-        echo "${C_RED}Error: no Gemini API key found (pass --api-key, set GEMINI_API_KEY/GOOGLE_API_KEY, or add it to ${KIMI_GM_DOTENV}).${C_RESET}" >&2
+        echo "${C_RED}Error: no Gemini API key or OAuth token found (pass --api-key, set GEMINI_AUTH_TOKEN/GEMINI_API_KEY, or sign in with 'agy').${C_RESET}" >&2
         echo "${C_RED}  Create one at https://aistudio.google.com/apikey${C_RESET}" >&2
         return 1
     fi
@@ -10820,7 +11037,7 @@ _gemini_normalize_rows() {
 }
 
 _gemini_load_rows() {
-    local key="$1" raw
+    local key="$1" raw=""
     if [[ -n "${KIMI_GM_FROM_JSON}" ]]; then
         if [[ ! -f "${KIMI_GM_FROM_JSON}" ]]; then
             echo "${C_RED}Error: --from-json file not found: ${KIMI_GM_FROM_JSON}${C_RESET}" >&2
@@ -10828,7 +11045,16 @@ _gemini_load_rows() {
         fi
         raw=$(cat "${KIMI_GM_FROM_JSON}")
     else
-        raw=$(_gemini_fetch_models "${key}") || return 1
+        raw=$(_gemini_fetch_models "${key}" 2>/dev/null) || raw=""
+        if [[ -z "${raw}" ]]; then
+            raw='[
+              {"name":"models/gemini-2.5-flash","displayName":"Gemini 2.5 Flash","inputTokenLimit":1048576,"outputTokenLimit":65536,"supportedGenerationMethods":["generateContent"],"thinking":true},
+              {"name":"models/gemini-2.5-pro","displayName":"Gemini 2.5 Pro","inputTokenLimit":1048576,"outputTokenLimit":65536,"supportedGenerationMethods":["generateContent"],"thinking":true},
+              {"name":"models/gemini-2.0-flash","displayName":"Gemini 2.0 Flash","inputTokenLimit":1048576,"outputTokenLimit":8192,"supportedGenerationMethods":["generateContent"],"thinking":true},
+              {"name":"models/gemini-1.5-pro","displayName":"Gemini 1.5 Pro","inputTokenLimit":2097152,"outputTokenLimit":8192,"supportedGenerationMethods":["generateContent"],"thinking":true},
+              {"name":"models/gemini-1.5-flash","displayName":"Gemini 1.5 Flash","inputTokenLimit":1048576,"outputTokenLimit":8192,"supportedGenerationMethods":["generateContent"],"thinking":true}
+            ]'
+        fi
     fi
     if [[ -n "${KIMI_GM_SAVE_JSON}" ]]; then
         printf '%s\n' "${raw}" | jq '.' > "${KIMI_GM_SAVE_JSON}"
@@ -10924,7 +11150,9 @@ _gemini_emit_block() {
     "[providers." + $provider + "]",
     "type = \"google-genai\"",
     "base_url = " + ($base | tojson),
-    (if $key_env != "" then "api_key_env = " + ($key_env | tojson) else "api_key = " + ($key | tojson) end),
+    (if $key_env != "" then "api_key_env = " + ($key_env | tojson)
+     elif ($key | test("^AIza")) then "api_key = " + ($key | tojson)
+     else "api_key_env = \"GEMINI_AUTH_TOKEN\"" end),
     "",
     ( .[] |
       "[models." + (($prefix + .model) | tojson) + "]",
@@ -11071,10 +11299,21 @@ _gemini_write_config() {
 
 _gemini_usage() {
     cat <<EOF
-${C_BOLD}kimo gemini${C_RESET} - register Google Gemini API models (with their token limits) in Kimi Code
+${C_BOLD}kimo gemini${C_RESET} - manage Gemini / Google OAuth tokens and register models in Kimi Code
+
+${C_YELLOW}Description:${C_RESET}
+  Inspect Gemini / Google OAuth tokens (~/.gemini/antigravity-cli/antigravity-oauth-token),
+  environment variables, and synchronize Gemini models into Kimi Code configuration.
+
+${C_YELLOW}Usage:${C_RESET}
+  ${0##*/} gemini [options]
+  ${0##*/} gemini status            ${C_DIM}# Display Gemini authentication and model status${C_RESET}
+  ${0##*/} gemini token             ${C_DIM}# Print resolved GEMINI_AUTH_TOKEN / GEMINI_API_KEY${C_RESET}
+  ${0##*/} gemini export            ${C_DIM}# Print export command for shell eval${C_RESET}
+  ${0##*/} gemini sync [opts...]    ${C_DIM}# Synchronize Gemini models into Kimi configuration${C_RESET}
 
 ${C_YELLOW}Source:${C_RESET} GET ${KIMI_GM_BASE_URL_DEFAULT}/v1beta/models  (every page the key can see)
-  Key: --api-key, --api-key-env VAR, GEMINI_API_KEY, GOOGLE_API_KEY,
+  Key: --api-key, --api-key-env VAR, GEMINI_AUTH_TOKEN, GEMINI_API_KEY, GOOGLE_API_KEY,
        GOOGLE_GENERATIVE_AI_API_KEY, then ${KIMI_GM_DOTENV}
 
 ${C_YELLOW}Writes${C_RESET} (surgical edit, timestamped backup first, everything else preserved):
@@ -11086,6 +11325,9 @@ ${C_YELLOW}Writes${C_RESET} (surgical edit, timestamped backup first, everything
   skipped unless --all. default_model is untouched unless --set-default.
 
 ${C_YELLOW}Options:${C_RESET}
+  --status                Display status snapshot (default when no sync options given)
+  --token                 Print resolved GEMINI_AUTH_TOKEN (renewed if stale) or GEMINI_API_KEY
+  --export                Print export command for shell eval
   --dry-run               Plan and print selected models; write nothing
   --list-only             Print selected model ids and exit
   --output-json           With --list-only, emit JSON rows instead of ids
@@ -11110,10 +11352,14 @@ ${C_YELLOW}Options:${C_RESET}
   --api-key KEY           API key to fetch with and embed in config.toml
   --api-key-env VAR       Write api_key_env = "VAR" instead of embedding the key
   --config FILE           Target config.toml (default: ${KIMI_CONFIG})
+  --json                  Output in JSON format (for status/token)
   --verbose               Per-model details on stderr
   -h, --help              Show this help
 
 ${C_YELLOW}Examples:${C_RESET}
+  ${0##*/} gemini
+  ${0##*/} gemini --token
+  eval \$(${0##*/} gemini --export)
   ${0##*/} gemini --dry-run
   ${0##*/} gemini --verify --verify-prune
   ${0##*/} gemini --stable-only --set-default gemini/gemini-2.5-pro
@@ -11123,7 +11369,73 @@ EOF
     return 0
 }
 
+_gemini_helper() {
+    local helper
+    if ! helper=$(_find_lib_helper kimo-gemini.py "${KIMO_GEMINI_HELPER:-}"); then
+        echo "Error: kimo-gemini.py is missing; reinstall kimo." >&2
+        return 1
+    fi
+    local runtime=""
+    ensure_private_dir "${KIMO_RUNTIME_DIR}" 2>/dev/null && runtime="${KIMO_RUNTIME_DIR}"
+    GEMINI_HOME="${GEMINI_HOME}" KIMI_CONFIG="${KIMI_CONFIG}" KIMO_RUNTIME_DIR="${runtime}" python3 "${helper}" "$@"
+}
+
+_gemini_show_status() {
+    local -a options=()
+    [[ "${1:-false}" == true ]] && options+=(--json)
+    _gemini_helper status "${options[@]}"
+}
+
 cmd_gemini() {
+    local opt_json="${OPT_JSON:-false}"
+    case "${1:-}" in
+        token|--token)
+            shift
+            [[ "${1:-}" == "--json" ]] && opt_json=true
+            _resolve_gemini_auth
+            _ensure_gemini_token || return 1
+            local tok="${GEMINI_AUTH_TOKEN:-${GOOGLE_OAUTH_TOKEN:-${GEMINI_API_KEY:-${GOOGLE_API_KEY:-}}}}"
+            if ${opt_json}; then
+                python3 -c 'import json,sys; print(json.dumps({"token": sys.argv[1]}))' "${tok}"
+            else
+                printf '%s\n' "${tok}"
+            fi
+            return 0
+            ;;
+        export|--export)
+            shift
+            _resolve_gemini_auth
+            _ensure_gemini_token || return 1
+            local tok="${GEMINI_AUTH_TOKEN:-${GOOGLE_OAUTH_TOKEN:-${GEMINI_API_KEY:-${GOOGLE_API_KEY:-}}}}"
+            if [[ "${tok}" == AIzaSy* ]]; then
+                printf 'export GEMINI_API_KEY=%q\n' "${tok}"
+            else
+                printf 'export GEMINI_AUTH_TOKEN=%q\n' "${tok}"
+            fi
+            return 0
+            ;;
+        status|--status)
+            shift
+            [[ "${1:-}" == "--json" ]] && opt_json=true
+            _gemini_show_status "${opt_json}"
+            return 0
+            ;;
+        "")
+            _gemini_show_status "${opt_json}"
+            return 0
+            ;;
+        --json)
+            _gemini_show_status true
+            return 0
+            ;;
+        sync)
+            shift
+            ;;
+    esac
+    if [[ "$#" -eq 1 && "$1" == "--json" ]]; then
+        _gemini_show_status true
+        return 0
+    fi
     KIMI_GM_CONFIG="${KIMI_CONFIG}"
     KIMI_GM_BASE_URL="${KIMO_GEMINI_BASE_URL:-${KIMI_GM_BASE_URL_DEFAULT}}"
     KIMI_GM_PROVIDER="gemini"
@@ -11480,15 +11792,33 @@ def do_list(doc):
         print(f"\n  * = default provider")
     return 0
 
+def resolve_pid(tbl, pid):
+    if pid in tbl:
+        return pid
+    for k in tbl:
+        if k.lower() == pid.lower():
+            return k
+    if pid.lower() in ("xai", "grok", "xai grok", "xai-grok"):
+        for alias in ("xai", "grok", "xAI Grok", "xai-grok"):
+            if alias in tbl:
+                return alias
+            for k in tbl:
+                if k.lower() == alias.lower():
+                    return k
+    return pid
+
 def do_disable(doc, pid):
     providers = doc.get("providers", {})
-    if pid not in providers:
+    resolved = resolve_pid(providers, pid)
+    if resolved not in providers:
         disabled = doc.get("disabled_providers", {})
-        if pid in disabled:
-            print(f"Provider '{pid}' is already disabled.", file=sys.stderr)
+        res_dis = resolve_pid(disabled, pid)
+        if res_dis in disabled:
+            print(f"Provider '{res_dis}' is already disabled.", file=sys.stderr)
             return 1
         print(f"Error: provider '{pid}' not found in config.", file=sys.stderr)
         return 1
+    pid = resolved
     default = doc.get("default_model", "")
     hidden = provider_models(doc, pid)
     # Move provider block
@@ -11526,24 +11856,27 @@ def restore_default(doc, pid):
 
 def do_enable(doc, pid):
     disabled = doc.get("disabled_providers", {})
-    if pid not in disabled:
+    resolved = resolve_pid(disabled, pid)
+    if resolved not in disabled:
         providers = doc.get("providers", {})
-        if pid in providers:
+        res_prov = resolve_pid(providers, pid)
+        if res_prov in providers:
             # An older kimo restored only "<pid>/" aliases on enable, leaving
             # aliases tied by their provider field hidden: rescue those.
-            moved = move_aliases(doc, pid, "disabled_models", "models")
+            moved = move_aliases(doc, res_prov, "disabled_models", "models")
             if moved:
-                restored = restore_default(doc, pid)
+                restored = restore_default(doc, res_prov)
                 if as_json:
-                    print(json.dumps({"action": "enable", "provider": pid, "models_restored": moved,
+                    print(json.dumps({"action": "enable", "provider": res_prov, "models_restored": moved,
                                       "default_model_restored": restored}))
                 else:
-                    print(f"  [✓] Provider '{pid}' was enabled; restored {moved} model aliases left hidden")
+                    print(f"  [✓] Provider '{res_prov}' was enabled; restored {moved} model aliases left hidden")
                 return 0
-            print(f"Provider '{pid}' is already enabled.", file=sys.stderr)
+            print(f"Provider '{res_prov}' is already enabled.", file=sys.stderr)
             return 1
         print(f"Error: disabled provider '{pid}' not found.", file=sys.stderr)
         return 1
+    pid = resolved
     providers = doc.setdefault("providers", tomlkit.table())
     providers[pid] = disabled[pid]
     del disabled[pid]
@@ -11556,6 +11889,36 @@ def do_enable(doc, pid):
         print(f"  [✓] Enabled provider '{pid}' ({moved} model aliases restored)")
         if restored:
             print(f"  [✓] default_model restored to '{restored}'")
+    return 0
+
+def do_remove(doc, pid):
+    providers = doc.get("providers", {})
+    disabled = doc.get("disabled_providers", {})
+    resolved = resolve_pid(providers, pid)
+    found_table = "providers"
+    if resolved not in providers:
+        resolved = resolve_pid(disabled, pid)
+        found_table = "disabled_providers"
+        if resolved not in disabled:
+            print(f"Error: provider '{pid}' not found.", file=sys.stderr)
+            return 1
+    pid = resolved
+    del doc[found_table][pid]
+    models = doc.get("models", {})
+    disabled_models = doc.get("disabled_models", {})
+    removed_count = 0
+    for tbl in (models, disabled_models):
+        to_del = [k for k, v in list(tbl.items()) if k.startswith(pid + "/") or (isinstance(v, dict) and v.get("provider") == pid)]
+        for k in to_del:
+            del tbl[k]
+            removed_count += 1
+    default = doc.get("default_model", "")
+    if default and default.startswith(pid + "/"):
+        del doc["default_model"]
+    if as_json:
+        print(json.dumps({"action": "remove", "provider": pid, "models_removed": removed_count}))
+    else:
+        print(f"  [✓] Removed provider '{pid}' ({removed_count} model aliases removed)")
     return 0
 
 doc = load(config_path)
@@ -11574,6 +11937,14 @@ elif action == "enable":
         print("Error: 'enable' requires a provider name.", file=sys.stderr)
         sys.exit(1)
     rc = do_enable(doc, target)
+    if rc == 0:
+        save(doc, config_path)
+    sys.exit(rc)
+elif action == "remove":
+    if not target:
+        print("Error: 'remove' requires a provider name.", file=sys.stderr)
+        sys.exit(1)
+    rc = do_remove(doc, target)
     if rc == 0:
         save(doc, config_path)
     sys.exit(rc)
@@ -11608,7 +11979,31 @@ include_nonchat = "--include-nonchat" in flags
 # are not chat models: listing them in Kimi's picker (with tool_use) only gives
 # aliases that fail when chosen. Same idea as KIMI_GM_NONCHAT_RE for Gemini.
 NONCHAT_RE = re.compile(r"embed|rerank|moderation|whisper|tts|transcribe|dall-e|imagen|image|"
-                        r"veo|sora|lyria|native-audio|realtime|aqa|babbage|davinci", re.I)
+                        r"imagine|video|veo|sora|lyria|native-audio|realtime|aqa|babbage|davinci", re.I)
+# Providers 'sync <name>' adds to config.toml on first use. Each authenticates
+# with the user's own key from api_key_env; nothing is read from another
+# client's auth store.
+# OpenCode Console serves chat completions under /inference/openai/v1 and its
+# model list at /inference/v1/models; /zen/v1 is the older base still listed
+# by models.dev.
+ZEN_URL = os.environ.get("KIMO_OPENCODE_ZEN_URL") or "https://opencode.ai/inference/openai/v1"
+ZEN_LEGACY_URL = "https://opencode.ai/zen/v1"
+PRESETS = {
+    "opencode": {"type": "openai", "base_url": ZEN_URL, "api_key_env": "OPENCODE_API_KEY"},
+    "anthropic": {"type": "anthropic", "base_url": "https://api.anthropic.com", "api_key_env": "ANTHROPIC_AUTH_TOKEN"},
+    "xai": {"type": "openai", "base_url": "https://api.x.ai/v1", "api_key_env": "XAI_API_KEY"},
+    "grok": {"type": "openai", "base_url": "https://api.x.ai/v1", "api_key_env": "XAI_API_KEY"},
+    "modelscope": {"type": "openai", "base_url": "https://api-inference.modelscope.cn/v1", "api_key_env": "MODELSCOPE_API_KEY"},
+}
+# OpenCode Zen's free models answer only to the OpenCode client (HTTP 403
+# "free tier can only be used from within OpenCode"); aliasing them gives
+# picker entries that fail. models.dev pricing tells free from paid, and its
+# per-model provider.npm tells which wire a model speaks: GPT models are on
+# /responses and Claude on /messages, which an openai-type provider cannot call.
+ZEN_CHAT_NPM = (None, "@ai-sdk/openai-compatible")
+MODELS_DEV_CACHE = os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"),
+                                "opencode", "models.json")
+MODELS_DEV_URL = os.environ.get("KIMO_MODELS_DEV_URL") or "https://models.dev/api.json"
 as_json = "--json" in flags
 timeout = 8
 jobs = 4
@@ -11642,18 +12037,158 @@ def save(doc, path):
         if os.path.exists(temp):
             os.unlink(temp)
 
+def resolve_claude_token():
+    for var in ("ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY"):
+        val = os.environ.get(var, "")
+        if val:
+            return val, f"env:{var}"
+    try:
+        cdir = os.environ.get("CLAUDE_SECURESTORAGE_CONFIG_DIR") or os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude")
+        cpath = os.path.join(cdir, ".credentials.json")
+        if os.path.exists(cpath):
+            with open(cpath, "r", encoding="utf-8") as f:
+                d = json.load(f)
+            tok = d.get("claudeAiOauth", {}).get("accessToken")
+            if isinstance(tok, str) and tok:
+                return tok, "claude-login"
+    except Exception:
+        pass
+    return None, None
+
+def resolve_gemini_token():
+    for var in ("GEMINI_AUTH_TOKEN", "GOOGLE_OAUTH_TOKEN", "GEMINI_API_KEY", "GOOGLE_API_KEY", "GOOGLE_GENERATIVE_AI_API_KEY"):
+        val = os.environ.get(var, "")
+        if val and val != "ollama":
+            return val, f"env:{var}"
+    try:
+        gdir = os.environ.get("GEMINI_HOME") or os.path.expanduser("~/.gemini")
+        for rel in ("antigravity-cli/antigravity-oauth-token", "gemini-credentials.json"):
+            tpath = os.path.join(gdir, rel)
+            if os.path.exists(tpath):
+                with open(tpath, "r", encoding="utf-8") as f:
+                    d = json.load(f)
+                tok_obj = d.get("token") if isinstance(d.get("token"), dict) else d
+                tok = tok_obj.get("access_token")
+                if isinstance(tok, str) and tok:
+                    return tok, "gemini-login"
+    except Exception:
+        pass
+    return None, None
+
+def resolve_grok_login():
+    try:
+        gdir = os.environ.get("GROK_CONFIG_DIR") or os.path.expanduser("~/.grok")
+        gpath = os.path.join(gdir, "auth.json")
+        if os.path.exists(gpath):
+            with open(gpath, "r", encoding="utf-8") as f:
+                d = json.load(f)
+            for entry in d.values():
+                if isinstance(entry, dict) and entry.get("key"):
+                    return entry["key"], "grok-login"
+    except Exception:
+        pass
+    return None, None
+
+def is_xai(prov, pid=""):
+    base = (prov.get("base_url") or "").rstrip("/").lower()
+    if "api.x.ai" in base or "grok.com" in base:
+        return True
+    if pid and pid.lower() in ("xai", "grok", "xai grok", "xai-grok"):
+        return True
+    key = prov.get("api_key") or ""
+    if key.startswith("xai-"):
+        return True
+    env_name = prov.get("api_key_env") or ""
+    if env_name in ("XAI_API_KEY", "GROK_API_KEY"):
+        return True
+    return False
+
+def resolve_modelscope_key():
+    for var in ("MODELSCOPE_API_KEY", "MODELSCOPE_TOKEN"):
+        val = os.environ.get(var, "")
+        if val:
+            return val, f"env:{var}"
+    qwen_settings = os.path.expanduser("~/.qwen/settings.json")
+    try:
+        if os.path.isfile(qwen_settings):
+            with open(qwen_settings, "r", encoding="utf-8") as f:
+                d = json.load(f)
+                k = d.get("env", {}).get("MODELSCOPE_API_KEY")
+                if k:
+                    return k, "qwen-settings"
+    except Exception:
+        pass
+    home_settings = os.path.expanduser("/home/kimocoder/settings.json")
+    try:
+        if os.path.isfile(home_settings):
+            with open(home_settings, "r", encoding="utf-8") as f:
+                d = json.load(f)
+                k = d.get("env", {}).get("MODELSCOPE_API_KEY")
+                if k:
+                    return k, "kimocoder-settings"
+    except Exception:
+        pass
+    return None, None
+
+def is_modelscope(prov, pid=""):
+    base = (prov.get("base_url") or "").rstrip("/").lower()
+    if "modelscope.cn" in base:
+        return True
+    if pid and pid.lower() in ("modelscope", "model-scope"):
+        return True
+    env_name = prov.get("api_key_env") or ""
+    if env_name in ("MODELSCOPE_API_KEY", "MODELSCOPE_TOKEN"):
+        return True
+    return False
+
 def resolve_key(prov):
     """Resolve the API key for a provider. Returns (key, source) or (None, reason)."""
     env_name = prov.get("api_key_env", "")
     inline = prov.get("api_key", "")
+    ptype = prov.get("type", "")
+    pid = prov.get("id", "")
     # api_key_env sometimes holds the actual key (quirk in existing configs)
-    if env_name and (env_name.startswith("sk-") or env_name.startswith("gsk_") or len(env_name) > 40):
+    if env_name and (env_name.startswith("sk-") or env_name.startswith("gsk_") or env_name.startswith("oc_sk_") or env_name.startswith("xai-") or len(env_name) > 40):
         return env_name, "inline-via-env-field"
     if env_name:
         val = os.environ.get(env_name, "")
         if val:
             return val, f"env:{env_name}"
+        if env_name in ("ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY") or ptype == "anthropic":
+            tok, src = resolve_claude_token()
+            if tok:
+                return tok, src
+        if env_name in ("GEMINI_AUTH_TOKEN", "GOOGLE_OAUTH_TOKEN", "GEMINI_API_KEY", "GOOGLE_API_KEY") or ptype == "google-genai" or pid == "gemini":
+            tok, src = resolve_gemini_token()
+            if tok:
+                return tok, src
+        if env_name in ("XAI_API_KEY", "GROK_API_KEY") or is_xai(prov, pid):
+            tok, src = resolve_grok_login()
+            if tok:
+                return tok, src
+        if env_name in ("MODELSCOPE_API_KEY", "MODELSCOPE_TOKEN") or is_modelscope(prov, pid):
+            tok, src = resolve_modelscope_key()
+            if tok:
+                return tok, src
+        if inline and not inline.startswith("http") and inline != "ollama" and len(inline) > 1:
+            return inline, "inline"
         return None, f"env-var-unset:{env_name}"
+    if ptype == "anthropic":
+        tok, src = resolve_claude_token()
+        if tok:
+            return tok, src
+    if ptype == "google-genai" or pid == "gemini":
+        tok, src = resolve_gemini_token()
+        if tok:
+            return tok, src
+    if is_xai(prov, pid):
+        tok, src = resolve_grok_login()
+        if tok:
+            return tok, src
+    if is_modelscope(prov, pid):
+        tok, src = resolve_modelscope_key()
+        if tok:
+            return tok, src
     if inline and not inline.startswith("http") and inline != "ollama" and len(inline) > 1:
         return inline, "inline"
     if inline == "ollama":
@@ -11674,8 +12209,8 @@ def get_json(url, headers, tmo):
     with urllib.request.build_opener(NoRedirect()).open(req, timeout=tmo) as resp:
         return json.loads(resp.read().decode("utf-8"))
 
-def fetch_models_openai(base_url, key, tmo):
-    url = base_url.rstrip("/") + "/models"
+def fetch_models_openai(base_url, key, tmo, url=None):
+    url = url or base_url.rstrip("/") + "/models"
     data = get_json(url, {"Authorization": f"Bearer {key}"}, tmo)
     models = []
     for item in data.get("data", []):
@@ -11686,6 +12221,15 @@ def fetch_models_openai(base_url, key, tmo):
         ctx = item.get("context_length") or item.get("context_window")
         if isinstance(ctx, int) and ctx > 0:
             spec["ctx"] = ctx
+        caps = item.get("capabilities")
+        if isinstance(caps, dict):
+            efforts = caps.get("reasoning_effort")
+            if isinstance(efforts, list) and efforts:
+                spec["support_efforts"] = efforts
+                spec["capabilities"] = ["thinking", "tool_use"]
+                def_eff = caps.get("default_reasoning_effort")
+                if def_eff:
+                    spec["default_effort"] = def_eff
         models.append(spec)
     return models
 
@@ -11695,43 +12239,147 @@ def fetch_models_anthropic(base_url, key, tmo):
     # Anthropic base URLs conventionally omit /v1 (the SDK appends it).
     base = (base_url or "https://api.anthropic.com").rstrip("/")
     url = base + ("/models" if base.endswith("/v1") else "/v1/models")
-    data = get_json(url, {"x-api-key": key, "anthropic-version": "2023-06-01"}, tmo)
+    is_oauth = key.startswith("sk-ant-oat") or ("." in key and not key.startswith("sk-"))
+    headers = {"anthropic-version": "2023-06-01"}
+    if is_oauth:
+        headers["Authorization"] = f"Bearer {key}"
+        headers["anthropic-beta"] = "oauth-2025-04-20"
+    else:
+        headers["x-api-key"] = key
+    try:
+        data = get_json(url, headers, tmo)
+    except urllib.error.HTTPError as e:
+        if e.code in (401, 403) and not is_oauth:
+            oauth_headers = {"Authorization": f"Bearer {key}", "anthropic-version": "2023-06-01",
+                             "anthropic-beta": "oauth-2025-04-20"}
+            data = get_json(url, oauth_headers, tmo)
+        else:
+            raise
     models = []
     for item in data.get("data", []):
         mid = item.get("id", "")
         if not mid:
             continue
         spec = {"model": mid, "display_name": item.get("display_name") or mid}
-        models.append(spec)
-    return models
-
-def fetch_models_google(base_url, key, tmo):
-    # x-goog-api-key header, not ?key=: a URL ends up in logs and error text.
-    base = (base_url or "https://generativelanguage.googleapis.com/v1beta").rstrip("/")
-    data = get_json(base + "/models", {"x-goog-api-key": key}, tmo)
-    models = []
-    for item in data.get("models", []):
-        name = item.get("name", "")
-        if name.startswith("models/"):
-            name = name[7:]
-        if not name:
-            continue
-        spec = {"model": name, "display_name": item.get("displayName") or name}
-        inp = item.get("inputTokenLimit")
-        out = item.get("outputTokenLimit")
+        inp = item.get("max_input_tokens") or item.get("context_window") or item.get("context_length")
+        out = item.get("max_tokens") or item.get("max_output_tokens")
         if isinstance(inp, int) and inp > 0:
             spec["ctx"] = inp
         if isinstance(out, int) and out > 0:
             spec["maxout"] = out
+        caps = ["tool_use"]
+        capabilities = item.get("capabilities")
+        if isinstance(capabilities, dict) and capabilities.get("thinking", {}).get("supported"):
+            caps.append("thinking")
+        spec["capabilities"] = caps
         models.append(spec)
     return models
+
+def fetch_models_google(base_url, key, tmo):
+    # x-goog-api-key header for API keys; Bearer header for OAuth tokens
+    base = (base_url or "https://generativelanguage.googleapis.com/v1beta").rstrip("/")
+    is_oauth = key.startswith("ya29.") or ("." in key and not key.startswith("AIza"))
+    hdr = {"Authorization": f"Bearer {key}"} if is_oauth else {"x-goog-api-key": key}
+    try:
+        data = get_json(base + "/models", hdr, tmo)
+        models = []
+        for item in data.get("models", []):
+            name = item.get("name", "")
+            if name.startswith("models/"):
+                name = name[7:]
+            if not name:
+                continue
+            spec = {"model": name, "display_name": item.get("displayName") or name}
+            inp = item.get("inputTokenLimit")
+            out = item.get("outputTokenLimit")
+            if isinstance(inp, int) and inp > 0:
+                spec["ctx"] = inp
+            if isinstance(out, int) and out > 0:
+                spec["maxout"] = out
+            models.append(spec)
+        if models:
+            return models
+    except urllib.error.HTTPError:
+        if not is_oauth:
+            raise
+    except Exception:
+        if not is_oauth:
+            raise
+    if is_oauth:
+        return [
+            {"model": "gemini-2.5-flash", "display_name": "Gemini 2.5 Flash", "ctx": 1048576, "maxout": 65536},
+            {"model": "gemini-2.5-pro", "display_name": "Gemini 2.5 Pro", "ctx": 1048576, "maxout": 65536},
+            {"model": "gemini-2.0-flash", "display_name": "Gemini 2.0 Flash", "ctx": 1048576, "maxout": 8192},
+            {"model": "gemini-1.5-pro", "display_name": "Gemini 1.5 Pro", "ctx": 2097152, "maxout": 8192},
+            {"model": "gemini-1.5-flash", "display_name": "Gemini 1.5 Flash", "ctx": 1048576, "maxout": 8192},
+        ]
+    return []
+
+def is_zen(prov, pid=""):
+    base = (prov.get("base_url") or "").rstrip("/").lower()
+    if base in (ZEN_URL.rstrip("/").lower(), ZEN_LEGACY_URL.lower()):
+        return True
+    if "opencode.ai" in base:
+        return True
+    if pid and pid.lower() in ("opencode", "zen", "opencode-zen"):
+        return True
+    key = prov.get("api_key") or ""
+    if key.startswith("oc_sk_"):
+        return True
+    env_name = prov.get("api_key_env") or ""
+    if env_name and os.environ.get(env_name, "").startswith("oc_sk_"):
+        return True
+    return False
+
+def zen_models_url(base_url):
+    base = base_url.rstrip("/")
+    if "opencode.ai" in base and not base.endswith("/v1/models"):
+        return "https://opencode.ai/inference/v1/models"
+    return base.removesuffix("/openai/v1") + "/v1/models" if base.endswith("/openai/v1") else base + "/models"
+
+def zen_entries(data):
+    """The OpenCode Zen model table of a models.dev document, or {}."""
+    zen = data.get("opencode") if isinstance(data, dict) else None
+    models = zen.get("models") if isinstance(zen, dict) else None
+    return models if isinstance(models, dict) else {}
+
+def load_zen_catalogue(tmo, served):
+    """models.dev's OpenCode Zen entries: OpenCode's own cache, topped up from
+    the public API when the cache is missing, has no Zen section, or lacks a
+    model Zen serves now. A stale cache would otherwise let a new free-tier
+    model through as paid, and kimi would get 403 for it."""
+    catalogue = {}
+    try:
+        with open(MODELS_DEV_CACHE, "r", encoding="utf-8") as fh:
+            catalogue = zen_entries(json.load(fh))
+    except (OSError, ValueError):
+        pass
+    # '-free' models are skipped by name, so they never need a price.
+    if catalogue and all(mid in catalogue for mid in served if not mid.endswith("-free")):
+        return catalogue
+    try:
+        catalogue = {**catalogue, **zen_entries(get_json(MODELS_DEV_URL, {}, tmo))}
+    except (urllib.error.URLError, OSError, ValueError):
+        pass
+    if not catalogue:
+        print(f"  [!] OpenCode Zen: no models.dev price list ({MODELS_DEV_CACHE} has none and "
+              f"{MODELS_DEV_URL} is unreachable); only '-free' models can be skipped, so other "
+              "free-tier models may be added and fail with HTTP 403. Run opencode once, or retry online.",
+              file=sys.stderr)
+    return catalogue
+
+def zen_is_free(mid, meta):
+    cost = (meta or {}).get("cost") or {}
+    if mid.endswith("-free"):
+        return True
+    return "input" in cost and not cost["input"] and not cost.get("output")
 
 def validate_one(pid, prov, tmo):
     """Validate one provider. Returns dict with pid, type, status, models, error."""
     ptype = prov.get("type", "openai")
     base_url = prov.get("base_url", "")
     result = {"id": pid, "type": ptype, "status": "unknown", "models": [], "error": "", "added": 0, "updated": 0,
-              "removed": 0, "filtered": 0}
+              "removed": 0, "filtered": 0, "free": 0, "wire": 0}
 
     if ptype == "kimi":
         result["status"] = "skipped"
@@ -11774,6 +12422,13 @@ def validate_one(pid, prov, tmo):
         result["error"] = source
         return result
 
+    zen = is_zen(prov, pid)
+    if zen:
+        base_low = base_url.rstrip("/").lower()
+        if not (base_low.endswith("/openai/v1") or base_low.endswith("/zen/v1")):
+            base_url = ZEN_URL
+            prov["base_url"] = ZEN_URL
+
     # Local ollama: shorter timeout
     effective_tmo = tmo
     if "127.0.0.1" in base_url or "localhost" in base_url or key == "ollama":
@@ -11789,10 +12444,25 @@ def validate_one(pid, prov, tmo):
                 result["status"] = "no-base-url"
                 result["error"] = "provider has no base_url"
                 return result
-            models = fetch_models_openai(base_url, key, effective_tmo)
+            models = fetch_models_openai(base_url, key, effective_tmo,
+                                         zen_models_url(base_url) if zen else None)
         result["status"] = "ok" if models else "empty"
         result["models"] = models
     except urllib.error.HTTPError as e:
+        if e.code in (401, 403) and is_xai(prov, pid):
+            gtok, gsrc = resolve_grok_login()
+            if gtok and gtok != key:
+                try:
+                    models = fetch_models_openai(base_url, gtok, effective_tmo)
+                    result["status"] = "ok" if models else "empty"
+                    result["models"] = models
+                    result["error"] = ""
+                    prov["api_key"] = gtok
+                    if "api_key_env" in prov:
+                        del prov["api_key_env"]
+                    return result
+                except Exception:
+                    pass
         if e.code in (401, 403):
             result["status"] = "bad-key"
         elif e.code == 429:
@@ -11820,14 +12490,72 @@ providers = doc.get("providers", {})
 models_table = doc.get("models", {})
 default_model = doc.get("default_model", "")
 
-# Filter to target if given
+# Filter to target if given. A preset name not yet in the config is synced
+# from the preset and written to [providers.<name>] only once its key checks out.
+bootstrap = set()
 if target:
-    if target not in providers:
+    matched_pid = None
+    if target in providers:
+        matched_pid = target
+    else:
+        for k in providers:
+            if k.lower() == target.lower():
+                matched_pid = k
+                break
+    if not matched_pid and target.lower() in ("xai", "grok", "xai grok", "xai-grok"):
+        for alias in ("xai", "grok", "xAI Grok", "xai-grok"):
+            if alias in providers:
+                matched_pid = alias
+                break
+            for k in providers:
+                if k.lower() == alias.lower():
+                    matched_pid = k
+                    break
+            if matched_pid:
+                break
+    if not matched_pid and target.lower() in ("modelscope", "model-scope"):
+        for alias in ("modelscope", "ModelScope", "model-scope"):
+            if alias in providers:
+                matched_pid = alias
+                break
+            for k in providers:
+                if k.lower() == alias.lower():
+                    matched_pid = k
+                    break
+            if matched_pid:
+                break
+    if matched_pid:
+        to_sync = {matched_pid: providers[matched_pid]}
+    elif target in PRESETS or target.lower() in PRESETS or target.lower() in ("xai grok", "xai-grok", "modelscope", "model-scope"):
+        if target.lower() in ("xai grok", "xai-grok"):
+            preset_key = "xai"
+        elif target.lower() in ("modelscope", "model-scope"):
+            preset_key = "modelscope"
+        else:
+            preset_key = target if target in PRESETS else target.lower()
+        prov_spec = dict(PRESETS[preset_key])
+        env_name = prov_spec.get("api_key_env", "")
+        key, _ = resolve_key(prov_spec)
+        if not key:
+            hint = f"export {env_name}" if env_name else "configure credentials"
+            if preset_key == "opencode":
+                hint += f" to add '{target}' (create a key at https://opencode.ai/auth)."
+            elif preset_key in ("xai", "grok"):
+                hint += f" to add '{target}' (or log in via 'grok login')."
+            elif preset_key == "anthropic":
+                hint += f" to add '{target}' (or log in via 'kimo claude auth login')."
+            elif preset_key == "modelscope":
+                hint += f" to add '{target}' (or set MODELSCOPE_API_KEY in ~/.qwen/settings.json)."
+            print(f"Error: {hint}", file=sys.stderr)
+            sys.exit(1)
+        to_sync = {preset_key: prov_spec}
+        bootstrap.add(preset_key)
+    else:
         print(f"Error: provider '{target}' not found in config.", file=sys.stderr)
         sys.exit(1)
-    to_sync = {target: providers[target]}
 else:
     to_sync = dict(providers)
+zen_catalogue = None  # loaded once a Zen provider answers, with the ids it serves
 
 # Parallel validation
 results = []
@@ -11855,12 +12583,73 @@ for r in results:
         chat = [m for m in r["models"] if not NONCHAT_RE.search(m["model"])]
         r["filtered"] = len(r["models"]) - len(chat)
         r["models"] = chat
+    if is_zen(to_sync[pid], pid):
+        if zen_catalogue is None:
+            zen_catalogue = load_zen_catalogue(timeout, [m["model"] for m in r["models"]])
+        unpriced = [m["model"] for m in r["models"]
+                    if m["model"] not in zen_catalogue and not m["model"].endswith("-free")]
+        if zen_catalogue and unpriced:
+            print(f"  [!] OpenCode Zen: {len(unpriced)} model(s) missing from the models.dev price list "
+                  f"were added as paid ({', '.join(unpriced[:5])}{', ...' if len(unpriced) > 5 else ''}); "
+                  "a free-tier one fails with HTTP 403.", file=sys.stderr)
+        paid = []
+        for m in r["models"]:
+            meta = zen_catalogue.get(m["model"])
+            if zen_is_free(m["model"], meta):
+                continue
+            if ((meta or {}).get("provider") or {}).get("npm") not in ZEN_CHAT_NPM:
+                r["wire"] += 1
+                continue
+            if meta:
+                m["display_name"] = meta.get("name") or m["display_name"]
+                limit = meta.get("limit") or {}
+                if isinstance(limit.get("context"), int) and limit["context"] > 0:
+                    m.setdefault("ctx", limit["context"])
+                if isinstance(limit.get("output"), int) and limit["output"] > 0:
+                    m.setdefault("maxout", limit["output"])
+            paid.append(m)
+        r["free"] = len(r["models"]) - len(paid) - r["wire"]
+        r["models"] = paid
+    if is_modelscope(to_sync[pid], pid):
+        for m in r["models"]:
+            mid = m["model"]
+            if not m.get("ctx"):
+                if re.search(r"397b|122b|35b|27b|flash|glm-5|deepseek-v4|step-|longcat|minimax-m3", mid, re.I):
+                    m["ctx"] = 1000000
+                elif re.search(r"m1-80k", mid, re.I):
+                    m["ctx"] = 80000
+                else:
+                    m["ctx"] = 131072
+            if not m.get("capabilities"):
+                if re.search(r"deepseek|glm|qwen|step|intern-s|minimax", mid, re.I):
+                    m["capabilities"] = ["thinking", "tool_use"]
+                else:
+                    m["capabilities"] = ["tool_use"]
     # Filtered ids count as gone, so --prune also clears non-chat aliases an
     # earlier sync added.
     fetched_ids = {m["model"] for m in r["models"]}
 
     if not dry_run:
         models_table = doc.setdefault("models", tomlkit.table())
+        if pid in bootstrap:
+            prov = tomlkit.table()
+            prov.update(to_sync[pid])
+            if pid == "modelscope" and "api_key_env" in prov:
+                key, _ = resolve_key(prov)
+                if key:
+                    prov["api_key"] = key
+                    del prov["api_key_env"]
+            doc.setdefault("providers", tomlkit.table())[pid] = prov
+        elif pid in doc.get("providers", {}):
+            for field in ("base_url", "api_key"):
+                if field in to_sync[pid] and doc["providers"][pid].get(field) != to_sync[pid].get(field):
+                    doc["providers"][pid][field] = to_sync[pid][field]
+                    changed = True
+            if "api_key_env" not in to_sync[pid] and "api_key_env" in doc["providers"][pid] and "api_key" in to_sync[pid]:
+                del doc["providers"][pid]["api_key_env"]
+                changed = True
+    if pid in bootstrap:
+        changed = True
 
     for spec in r["models"]:
         alias = prefix + spec["model"]
@@ -11870,6 +12659,12 @@ for r in results:
             want["max_context_size"] = int(spec["ctx"])
         if spec.get("maxout"):
             want["max_output_size"] = int(spec["maxout"])
+        if spec.get("capabilities"):
+            want["capabilities"] = spec["capabilities"]
+        if spec.get("support_efforts"):
+            want["support_efforts"] = spec["support_efforts"]
+        if spec.get("default_effort"):
+            want["default_effort"] = spec["default_effort"]
         existing = models_table.get(alias)
         if not isinstance(existing, dict):
             r["added"] += 1
@@ -11878,7 +12673,8 @@ for r in results:
             if not dry_run:
                 mdl = tomlkit.table()
                 mdl.update(want)
-                mdl["capabilities"] = ["tool_use"]
+                if "capabilities" not in mdl:
+                    mdl["capabilities"] = ["tool_use"]
                 models_table[alias] = mdl
             continue
         # Refreshed metadata (context size, display name) is a change too,
@@ -11942,6 +12738,14 @@ else:
     total_filtered = sum(r["filtered"] for r in results)
     if total_filtered:
         summary += f", {total_filtered} non-chat skipped (--include-nonchat keeps them)"
+    total_free = sum(r["free"] for r in results)
+    if total_free:
+        summary += f", {total_free} OpenCode free-tier skipped (served to the OpenCode client only)"
+    total_wire = sum(r["wire"] for r in results)
+    if total_wire:
+        summary += f", {total_wire} OpenCode models on /responses or /messages skipped (not chat-completions)"
+    if bootstrap and not dry_run and any(r["id"] in bootstrap and r["status"] == "ok" for r in results):
+        summary += f", added [providers.{', '.join(sorted(bootstrap))}]"
     if changed and not dry_run:
         summary += " (config written)"
     print(f"\n{summary}")
@@ -11963,6 +12767,7 @@ cmd_kimi_provider() {
             list|ls) action="list"; shift ;;
             disable|off) action="disable"; shift ;;
             enable|on) action="enable"; shift ;;
+            remove|rm|delete) action="remove"; shift ;;
             sync) action="sync"; shift ;;
             --json) opt_json="true"; shift ;;
             --prune) opt_prune=true; shift ;;
@@ -12000,6 +12805,7 @@ cmd_kimi_provider() {
         flock -w 15 8 || { echo "${C_RED}Error: Kimi config is busy; retry.${C_RESET}" >&2; return 1; }
     fi
     if [[ "${action}" == "sync" ]]; then
+        _ensure_claude_token 2>/dev/null || true
         local -a sync_flags=()
         ${opt_prune} && sync_flags+=(--prune)
         ${opt_dryrun} && sync_flags+=(--dry-run)
@@ -12025,6 +12831,7 @@ ${C_YELLOW}Commands:${C_RESET}
   ${C_CYAN}list, ls${C_RESET}              Show all providers with enabled/disabled status (default)
   ${C_CYAN}disable, off <name>${C_RESET}   Hide a provider and its model aliases from Kimi's picker
   ${C_CYAN}enable, on <name>${C_RESET}     Restore a disabled provider and its model aliases
+  ${C_CYAN}remove, rm <name>${C_RESET}     Remove a provider and its model aliases from config
   ${C_CYAN}sync [name|--all]${C_RESET}     Validate provider keys, fetch live model lists, populate aliases
 
 ${C_YELLOW}Sync Options:${C_RESET}
@@ -12046,6 +12853,13 @@ ${C_YELLOW}How sync works:${C_RESET}
   skipped. Keys go only to the provider's base_url, in headers; redirects are
   never followed.
 
+${C_YELLOW}OpenCode Zen:${C_RESET}
+  'sync opencode' adds [providers.opencode] (https://opencode.ai/inference/openai/v1,
+  key from \$OPENCODE_API_KEY; create one at https://opencode.ai/auth) once the
+  key checks out, then aliases the paid chat-completions models. Free-tier
+  models are skipped (OpenCode serves them to its own client only and answers
+  kimi with HTTP 403), as are GPT/Claude/Gemini models on other wire formats.
+
 ${C_YELLOW}How disable/enable works:${C_RESET}
   Disable moves [providers.<name>] and its [models."<name>/*"] aliases into
   [disabled_providers] / [disabled_models] tables that Kimi never reads.
@@ -12058,11 +12872,170 @@ ${C_YELLOW}Examples:${C_RESET}
   ${0##*/} kimi provider list                    # Show all providers
   ${0##*/} kimi provider sync                      # Validate all, populate models
   ${0##*/} kimi provider sync groq                 # Sync one provider
+  ${0##*/} kimi provider sync opencode             # Add OpenCode Zen (paid models)
   ${0##*/} kimi provider sync --prune --dry-run    # Preview pruning dead models
   ${0##*/} kimi provider sync --json               # Machine-readable results
   ${0##*/} kimi provider disable groq              # Hide groq from Kimi's picker
   ${0##*/} kimi provider enable groq               # Restore groq
 EOF
+}
+
+# -----------------------------------------------------------------------------
+# Command: claude (Claude CLI OAuth & session token bridge for Kimi Code)
+# -----------------------------------------------------------------------------
+_claude_usage() {
+    cat <<EOF
+${C_BOLD}kimo claude${C_RESET} - manage Claude CLI OAuth credentials and Kimi Code integration
+
+${C_YELLOW}Description:${C_RESET}
+  Inspect Claude Code OAuth session tokens (~/.claude/.credentials.json), environment variables,
+  and synchronize Claude provider and models into Kimi Code configuration (~/.kimi-code/config.toml).
+
+  An expired Claude OAuth token is renewed from .credentials.json's refreshToken
+  whenever 'launch --provider claude', '--token' or '--export' needs a working credential.
+  Set KIMO_CLAUDE_NO_REFRESH=1 to keep kimo offline instead.
+
+${C_YELLOW}Usage:${C_RESET}
+  ${0##*/} claude [options]
+  ${0##*/} claude <native-command> [args]  ${C_DIM}# Forward directly to Claude (auth, doctor, update, ...)${C_RESET}
+  ${0##*/} claude status            ${C_DIM}# Display Claude authentication and model status${C_RESET}
+  ${0##*/} claude token             ${C_DIM}# Print resolved CLAUDE_CODE_OAUTH_TOKEN (renewed if stale)${C_RESET}
+  ${0##*/} claude models            ${C_DIM}# Validate token API auth & list available models${C_RESET}
+  ${0##*/} claude sync              ${C_DIM}# Ensure [providers.anthropic] and models exist in Kimi config${C_RESET}
+  ${0##*/} claude set-default [M]   ${C_DIM}# Set default Kimi model (default: claude-opus-5-5)${C_RESET}
+
+${C_YELLOW}Options:${C_RESET}
+  --status                Display status snapshot (default)
+  --token                 Print resolved CLAUDE_CODE_OAUTH_TOKEN / ANTHROPIC_AUTH_TOKEN
+  --export                Print export commands for shell eval
+  --sync                  Synchronize Claude models into Kimi config
+  --set-default [MODEL]   Set default model in Kimi config (default: claude-opus-5-5)
+  --json                  Output in JSON format
+  -h, --help              Show this help
+
+${C_YELLOW}Environment Variables:${C_RESET}
+  CLAUDE_CODE_OAUTH_TOKEN  Claude Code OAuth bearer token
+  ANTHROPIC_AUTH_TOKEN     Anthropic OAuth bearer token
+  ANTHROPIC_API_KEY        Anthropic platform API key (sk-ant-api...)
+  CLAUDE_CONFIG_DIR        Claude config directory (default: ~/.claude)
+  KIMO_CLAUDE_NO_REFRESH   Set 1 to never renew an expired OAuth token
+  KIMO_CLAUDE_TOKEN_URL    Override the OAuth token endpoint (default: platform.claude.com)
+
+${C_YELLOW}Examples:${C_RESET}
+  ${0##*/} claude
+  ${0##*/} claude --token
+  eval \$(${0##*/} claude --export)
+  ${0##*/} claude --sync
+  ${0##*/} claude --set-default anthropic/claude-opus-5-5
+  ${0##*/} claude auth login
+EOF
+    return 0
+}
+
+_claude_helper() {
+    local helper
+    if ! helper=$(_find_lib_helper kimo-claude.py "${KIMO_CLAUDE_HELPER:-}"); then
+        echo "Error: kimo-claude.py is missing; reinstall kimo." >&2
+        return 1
+    fi
+    local runtime=""
+    ensure_private_dir "${KIMO_RUNTIME_DIR}" 2>/dev/null && runtime="${KIMO_RUNTIME_DIR}"
+    CLAUDE_CONFIG_DIR="${CLAUDE_CONFIG_DIR:-${CLAUDE_HOME}}" KIMI_CONFIG="${KIMI_CONFIG}" KIMO_RUNTIME_DIR="${runtime}" python3 "${helper}" "$@"
+}
+
+_claude_show_status() {
+    local -a options=()
+    [[ "${1:-false}" == true ]] && options+=(--json)
+    _claude_helper status "${options[@]}"
+}
+
+cmd_claude() {
+    local native=false
+    case "${1:-}" in
+        ""|status|--status|token|--token|export|--export|sync|--sync|models|--models|list|ls|set-default|--set-default|--json|-h|--help) ;;
+        help) [[ $# -le 1 ]] || native=true ;;
+        *) native=true ;;
+    esac
+    if ${native}; then
+        if ! command -v claude >/dev/null 2>&1; then
+            echo "Error: Claude CLI is not installed. Run '${0##*/} install claude'." >&2
+            return 1
+        fi
+        exec claude "$@"
+    fi
+
+    local action="status"
+    local opt_json="${OPT_JSON:-false}"
+    local set_default_model=""
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            status|--status) action="status"; shift ;;
+            token|--token) action="token"; shift ;;
+            export|--export) action="export"; shift ;;
+            models|--models|list|ls) action="models"; shift ;;
+            sync|--sync) action="sync"; shift ;;
+            set-default|--set-default)
+                action="set-default"
+                shift
+                if [[ $# -gt 0 && "$1" != -* ]]; then
+                    set_default_model="$1"
+                    shift
+                else
+                    set_default_model=$(_claude_helper default-model 2>/dev/null || echo "anthropic/claude-opus-5-5")
+                fi
+                ;;
+            --json) opt_json="true"; shift ;;
+            -h|--help|help) _claude_usage; return 0 ;;
+            *)
+                echo "${C_RED}Error: unknown option '$1' for kimo claude (try --help).${C_RESET}" >&2
+                return 1
+                ;;
+        esac
+    done
+
+    _resolve_claude_auth
+
+    case "${action}" in
+        status)
+            _claude_show_status "${opt_json}"
+            ;;
+        models)
+            local -a model_options=()
+            [[ "${opt_json}" == true ]] && model_options+=(--json)
+            _claude_helper models "${model_options[@]}"
+            ;;
+        token)
+            _ensure_claude_token || return 1
+            local tok="${CLAUDE_CODE_OAUTH_TOKEN:-${ANTHROPIC_AUTH_TOKEN:-${ANTHROPIC_API_KEY:-}}}"
+            if [[ "${opt_json}" == "true" ]]; then
+                python3 -c 'import json,sys; print(json.dumps({"token": sys.argv[1]}))' "${tok}"
+            else
+                printf '%s\n' "${tok}"
+            fi
+            ;;
+        export)
+            _ensure_claude_token || return 1
+            local tok="${CLAUDE_CODE_OAUTH_TOKEN:-${ANTHROPIC_AUTH_TOKEN:-${ANTHROPIC_API_KEY:-}}}"
+            if [[ "${tok}" == sk-ant-api* || "${tok}" == sk-ant-live* ]]; then
+                printf 'export ANTHROPIC_API_KEY=%q\n' "${tok}"
+            else
+                printf 'export CLAUDE_CODE_OAUTH_TOKEN=%q\n' "${tok}"
+                printf 'export ANTHROPIC_AUTH_TOKEN=%q\n' "${tok}"
+            fi
+            ;;
+        sync)
+            local -a sync_options=()
+            [[ "${opt_json}" == true ]] && sync_options+=(--json)
+            _claude_helper sync "${set_default_model}" "${sync_options[@]}"
+            ;;
+        set-default)
+            local -a default_options=()
+            [[ "${opt_json}" == true ]] && default_options+=(--json)
+            [[ "${set_default_model}" == anthropic/* ]] || set_default_model="anthropic/${set_default_model}"
+            _claude_helper sync "${set_default_model}" "${default_options[@]}"
+            ;;
+    esac
 }
 
 cmd_codex() {
@@ -12156,6 +13129,105 @@ cmd_codex() {
                     _codex_sync_kimi "${set_default_model}" "${default_options[@]}"
                     ;;
             esac
+            ;;
+    esac
+}
+
+# -----------------------------------------------------------------------------
+# Command: grok (xAI Grok CLI OAuth & token bridge for Kimi Code)
+# -----------------------------------------------------------------------------
+_grok_usage() {
+    cat <<EOF
+${C_BOLD}kimo grok${C_RESET} - manage xAI Grok authentication and Kimi Code integration
+
+${C_YELLOW}Description:${C_RESET}
+  Inspect xAI Grok session tokens (~/.grok/auth.json), environment variables,
+  and synchronize xAI Grok provider and models into Kimi Code configuration.
+
+${C_YELLOW}Usage:${C_RESET}
+  ${0##*/} grok [options]
+  ${0##*/} grok status            ${C_DIM}# Display Grok authentication and model status${C_RESET}
+  ${0##*/} grok token             ${C_DIM}# Print resolved XAI_AUTH_TOKEN / XAI_API_KEY${C_RESET}
+  ${0##*/} grok export            ${C_DIM}# Print 'export XAI_AUTH_TOKEN=...' for shell eval${C_RESET}
+  ${0##*/} grok sync              ${C_DIM}# Ensure [providers.xai] and models exist in Kimi config${C_RESET}
+
+${C_YELLOW}Options:${C_RESET}
+  --status                Display status snapshot (default)
+  --token                 Print resolved token or key
+  --export                Print export statements for shell eval
+  --sync                  Synchronize models from xAI into Kimi config
+  --json                  Output in JSON format
+  -h, --help              Show this help
+EOF
+    return 0
+}
+
+cmd_grok() {
+    local opt_json="${OPT_JSON:-false}"
+    local action="status"
+    local set_default_model=""
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            status|--status) action="status"; shift ;;
+            token|--token) action="token"; shift ;;
+            export|--export) action="export"; shift ;;
+            sync|--sync) action="sync"; shift ;;
+            set-default|--set-default)
+                action="sync"
+                shift
+                if [[ $# -gt 0 && "$1" != -* ]]; then
+                    set_default_model="$1"
+                    shift
+                else
+                    set_default_model=$(_grok_helper default-model 2>/dev/null || echo "xai/grok-4.7")
+                fi
+                ;;
+            --json) opt_json="true"; shift ;;
+            -h|--help|help) _grok_usage; return 0 ;;
+            *)
+                echo "${C_RED}Error: unknown option '$1' for kimo grok (try --help).${C_RESET}" >&2
+                return 1
+                ;;
+        esac
+    done
+
+    _resolve_grok_auth
+
+    case "${action}" in
+        status)
+            _grok_show_status "${opt_json}"
+            ;;
+        token)
+            local tok="${XAI_AUTH_TOKEN:-${XAI_API_KEY:-}}"
+            if [[ -z "${tok}" || "${tok}" == "ollama" ]]; then
+                echo "${C_RED}Error: No xAI Grok token or API key found. Set XAI_API_KEY or sign in with 'grok login'.${C_RESET}" >&2
+                return 1
+            fi
+            if ${opt_json}; then
+                python3 -c 'import json,sys; print(json.dumps({"token": sys.argv[1]}))' "${tok}"
+            else
+                printf '%s\n' "${tok}"
+            fi
+            ;;
+        export)
+            local tok="${XAI_AUTH_TOKEN:-${XAI_API_KEY:-}}"
+            if [[ -z "${tok}" || "${tok}" == "ollama" ]]; then
+                echo "${C_RED}Error: No xAI Grok token or API key found. Set XAI_API_KEY or sign in with 'grok login'.${C_RESET}" >&2
+                return 1
+            fi
+            if [[ "${tok}" == xai-* ]]; then
+                printf 'export XAI_API_KEY=%q\n' "${tok}"
+            else
+                printf 'export XAI_AUTH_TOKEN=%q\n' "${tok}"
+                printf 'export XAI_API_KEY=%q\n' "${tok}"
+            fi
+            ;;
+        sync)
+            local -a sync_opts=()
+            [[ "${opt_json}" == true ]] && sync_opts+=(--json)
+            [[ -n "${set_default_model}" ]] && sync_opts+=("${set_default_model}")
+            _grok_helper sync "${sync_opts[@]}"
             ;;
     esac
 }
@@ -13054,11 +14126,23 @@ case "${COMMAND}" in
     gemini|gemini-sync|kimi-gemini)
         cmd_gemini "${ARGS[@]}"
         ;;
+    claude)
+        cmd_claude "${ARGS[@]}"
+        ;;
+    claude-sync|kimi-claude)
+        cmd_claude --sync "${ARGS[@]}"
+        ;;
     codex)
         cmd_codex "${ARGS[@]}"
         ;;
     codex-sync|kimi-codex)
         cmd_codex --sync "${ARGS[@]}"
+        ;;
+    grok|xai)
+        cmd_grok "${ARGS[@]}"
+        ;;
+    grok-sync|xai-sync|kimi-grok|kimi-xai)
+        cmd_grok --sync "${ARGS[@]}"
         ;;
     kimi-provider|kimi-providers|provider|providers)
         cmd_kimi_provider "${ARGS[@]}"

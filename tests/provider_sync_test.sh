@@ -62,6 +62,17 @@ class Provider(http.server.BaseHTTPRequestHandler):
             reply(self, {"data": [{"id": "claude-fixture"}]})
         elif self.path.startswith("/goog/"):
             reply(self, {"models": [{"name": "models/gemini-fixture"}]})
+        elif self.path == "/inference/v1/models":
+            reply(self, {"data": [{"id": "zen-paid"}, {"id": "zen-uncatalogued"}, {"id": "zen-gpt"},
+                                  {"id": "big-pickle"}, {"id": "zen-promo-free"}]})
+        elif self.path in ("/modelsdev/api.json", "/modelsdev-partial/api.json"):
+            # A models.dev stand-in; the full one knows zen-uncatalogued is free.
+            models = {"zen-paid": {"name": "Zen Paid", "cost": {"input": 1, "output": 2}},
+                      "zen-gpt": {"cost": {"input": 1, "output": 2}, "provider": {"npm": "@ai-sdk/openai"}},
+                      "big-pickle": {"cost": {"input": 0, "output": 0}}}
+            if self.path.startswith("/modelsdev/"):
+                models["zen-uncatalogued"] = {"cost": {"input": 0, "output": 0}}
+            reply(self, {"opencode": {"models": models}})
         else:
             self.send_response(404)
             self.end_headers()
@@ -152,5 +163,80 @@ models=$(python3 -c 'import sys, tomlkit; print(" ".join(tomlkit.parse(open(sys.
 check_contains "anthropic alias written" "anth/claude-fixture" "${models}"
 check_contains "google alias written" "goog/gemini-fixture" "${models}"
 check_not_contains "nothing from the redirect target" "stolen" "${models}"
+
+echo "[6] 'sync opencode' adds Zen with the user's key and skips free-tier models"
+export KIMO_OPENCODE_ZEN_URL="${BASE}/inference/openai/v1"
+mkdir -p "${XDG_CACHE_HOME}/opencode"
+cat >"${XDG_CACHE_HOME}/opencode/models.json" <<'EOF'
+{"opencode": {"models": {
+  "zen-paid": {"name": "Zen Paid", "cost": {"input": 1, "output": 2}, "limit": {"context": 200000, "output": 32000}},
+  "zen-gpt": {"name": "Zen GPT", "cost": {"input": 1, "output": 2}, "provider": {"npm": "@ai-sdk/openai"}},
+  "big-pickle": {"name": "Big Pickle", "cost": {"input": 0, "output": 0}, "limit": {"context": 200000}}
+}}}
+EOF
+before=$(sha256sum <"${KIMI_CONFIG}")
+rc=0
+nokey=$(env -u OPENCODE_API_KEY "${KIMO}" kimi provider sync opencode 2>&1) || rc=$?
+check "no OPENCODE_API_KEY: sync fails" "1" "${rc}"
+check_contains "no key: error names the env var" "OPENCODE_API_KEY" "${nokey}"
+check "no key: config untouched" "${before}" "$(sha256sum <"${KIMI_CONFIG}")"
+
+: >"${LOG}"
+OPENCODE_API_KEY="zen-user-key" "${KIMO}" kimi provider sync opencode >/dev/null 2>&1 || true
+check "Zen /inference/v1/models gets the user's key as a bearer" "Bearer zen-user-key" \
+    "$(jq -r 'select(.path == "/inference/v1/models") | .authorization' "${LOG}")"
+zen=$(python3 -c '
+import sys, tomlkit
+d = tomlkit.parse(open(sys.argv[1]).read())
+p = d["providers"]["opencode"]
+print(p["api_key_env"], "api_key" in p)
+for k, v in d["models"].items():
+    if k.startswith("opencode/"):
+        print(k, v.get("display_name"), v.get("max_context_size", "-"))
+' "${KIMI_CONFIG}")
+check_contains "provider block stores the env var name, not the key" "OPENCODE_API_KEY False" "${zen}"
+check_contains "paid model aliased with catalogue metadata" "opencode/zen-paid Zen Paid 200000" "${zen}"
+check_contains "uncatalogued model treated as paid" "opencode/zen-uncatalogued" "${zen}"
+check_not_contains "zero-cost model skipped" "big-pickle" "${zen}"
+check_not_contains "-free model skipped" "zen-promo-free" "${zen}"
+check_not_contains "Responses-wire model skipped" "zen-gpt" "${zen}"
+check_not_contains "key never written to config" "zen-user-key" "$(cat "${KIMI_CONFIG}")"
+
+echo "[7] Zen price list: stale or missing cache falls back online; no list is reported"
+CACHE="${XDG_CACHE_HOME}/opencode/models.json"
+# zen_sync <cache JSON or ""> <models.dev URL>: fresh config, sync opencode,
+# leave stderr in $zen_err and the opencode aliases in $zen_aliases.
+zen_sync() {
+    : >"${KIMI_CONFIG}"
+    : >"${LOG}"
+    if [[ -n "$1" ]]; then printf '%s\n' "$1" >"${CACHE}"; else rm -f "${CACHE}"; fi
+    zen_err=$(OPENCODE_API_KEY="zen-user-key" KIMO_MODELS_DEV_URL="$2" \
+        "${KIMO}" kimi provider sync opencode 2>&1 >/dev/null || true)
+    zen_aliases=$(python3 -c 'import sys, tomlkit; print(" ".join(k for k in tomlkit.parse(open(sys.argv[1]).read()).get("models", {}) if k.startswith("opencode/")))' "${KIMI_CONFIG}")
+}
+modelsdev_hits() { jq -s '[.[] | select(.path | startswith("/modelsdev"))] | length' "${LOG}"; }
+STALE='{"opencode": {"models": {"zen-paid": {"cost": {"input": 1, "output": 2}}}}}'
+
+zen_sync "${STALE}" "${BASE}/modelsdev/api.json"
+check "stale cache: models.dev is consulted" "1" "$(modelsdev_hits)"
+check_not_contains "stale cache: a free model it lacks is still skipped" "opencode/zen-uncatalogued" "${zen_aliases}"
+check_contains "stale cache: paid model still added" "opencode/zen-paid" "${zen_aliases}"
+
+zen_sync '{"anthropic": {"models": {}}}' "${BASE}/modelsdev/api.json"
+check "cache without a Zen section: models.dev is consulted" "1" "$(modelsdev_hits)"
+check_not_contains "cache without a Zen section: free model skipped" "opencode/zen-uncatalogued" "${zen_aliases}"
+
+FULL='{"opencode": {"models": {"zen-paid": {"cost": {"input": 1, "output": 2}}, "zen-uncatalogued": {"cost": {"input": 1, "output": 2}}, "zen-gpt": {"cost": {"input": 1, "output": 2}, "provider": {"npm": "@ai-sdk/openai"}}, "big-pickle": {"cost": {"input": 0, "output": 0}}}}}'
+zen_sync "${FULL}" "${BASE}/modelsdev/api.json"
+check "complete cache: no network lookup" "0" "$(modelsdev_hits)"
+check_contains "complete cache: its pricing is used" "opencode/zen-uncatalogued" "${zen_aliases}"
+
+zen_sync "" "${BASE}/modelsdev-partial/api.json"
+check_contains "unpriced models are named in a warning" "missing from the models.dev price list" "${zen_err}"
+check_contains "the warning lists the model" "zen-uncatalogued" "${zen_err}"
+check_not_contains "-free models are not reported as added" "zen-promo-free" "${zen_err}"
+
+zen_sync "" "${BASE}/modelsdev-gone/api.json"
+check_contains "no price list at all is reported" "no models.dev price list" "${zen_err}"
 
 harness_summary "provider sync"
