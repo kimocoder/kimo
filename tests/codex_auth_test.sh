@@ -595,7 +595,7 @@ check_contains "the configured backend is used" "provider: openai" "${dry}"
 "${KIMO}" config unset cloud_provider >/dev/null
 
 rc=0
-unknown=$("${KIMO}" launch kimi --provider grok --dry-run 2>&1) || rc=$?
+unknown=$("${KIMO}" launch kimi --provider not-a-backend --dry-run 2>&1) || rc=$?
 check "an unknown backend is rejected" 1 "${rc}"
 check_contains "the rejection lists every backend" "ollama abliteration codex openai" "${unknown}"
 rc=0
@@ -637,7 +637,7 @@ check_contains "Bash completion includes Codex native commands" 'exec review res
 # Both completion scripts are emitted from quoted heredocs, so they cannot expand
 # KIMO_LAUNCH_PROVIDERS; assert they still offer exactly what launch accepts.
 providers=$(sed -n 's/^KIMO_LAUNCH_PROVIDERS="\(.*\)"$/\1/p' "${KIMO}")
-check "the accepted backends are declared once" "ollama abliteration codex openai dashscope" "${providers}"
+check "the accepted backends are declared once" "ollama abliteration codex openai dashscope qwencloud xai anthropic claude gemini" "${providers}"
 check_contains "Bash completion offers every backend" "${providers}" "${bash_completion}"
 check_contains "Zsh completion offers every backend" "${providers}" "$("${KIMO}" completion zsh)"
 check_contains "Zsh completion includes Codex bridge" '--sync[Synchronize Codex provider' "$("${KIMO}" completion zsh)"

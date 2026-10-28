@@ -158,8 +158,8 @@ _kimo_config_check() {
             ;;
         cloud_provider)
             case "${val}" in
-                ""|none|ollama|abliteration|codex|openai|dashscope) ;;
-                *) echo "expected 'ollama', 'abliteration', 'codex'/'openai', or 'dashscope' (got '${val}')"; return 1 ;;
+                ""|none|ollama|abliteration|codex|openai|dashscope|qwencloud|xai|grok|anthropic|claude|gemini) ;;
+                *) echo "expected one of: ollama, abliteration, codex, openai, dashscope, qwencloud, xai (grok), anthropic, claude, gemini (got '${val}')"; return 1 ;;
             esac
             ;;
         web_max_results)
@@ -362,7 +362,8 @@ DASHSCOPE_DEFAULT_MODEL="qwen3.8-max"
 # it; --ctx and KIMO_DASHSCOPE_CTX override.
 DASHSCOPE_DEFAULT_CTX="${KIMO_DASHSCOPE_CTX:-1000000}"
 # CLIs whose launch branch knows how to reach DashScope.
-DASHSCOPE_CLIS="claude kimi"
+# codex rides the OpenAI-compatible Responses surface, not the Anthropic app.
+DASHSCOPE_CLIS="claude kimi codex"
 # The token-plan (subscription) surface. Key class picks the surface: sk-sp-
 # keys belong here and 401 on pay-as-you-go intl, sk-ws-/sk- keys the other
 # way round. Both surfaces also speak the Anthropic wire under /apps/anthropic
@@ -375,6 +376,153 @@ DASHSCOPE_CLAUDE_HAIKU="${KIMO_DASHSCOPE_CLAUDE_HAIKU:-qwen3.6-flash}"
 DASHSCOPE_CLAUDE_SONNET="${KIMO_DASHSCOPE_CLAUDE_SONNET:-qwen3.8-flash}"
 DASHSCOPE_CLAUDE_OPUS="${KIMO_DASHSCOPE_CLAUDE_OPUS:-qwen3.8-max}"
 DASHSCOPE_CLAUDE_MAX_CONTEXT="${KIMO_DASHSCOPE_CLAUDE_MAX_CONTEXT:-983616}"
+
+# Codex custom providers speak the Responses API. Codex CLI 0.164 rejects
+# wire_api = "chat", so every backend below is a {base}/responses endpoint.
+# The definition is passed as -c overlays; the credential stays in the named
+# environment variable and is never written to config.toml or argv.
+# 'grok' is an alias of 'xai' and is normalized before dispatch.
+
+# QwenCloud (maas.qwencloudapi.com), distinct from the DashScope
+# dashscope-intl host. Singapore is the default region. A sk-sp- token-plan
+# key belongs on the token-plan host and is refused by pay-as-you-go.
+QWENCLOUD_REGION="${KIMO_QWENCLOUD_REGION:-ap-southeast-1}"
+QWENCLOUD_BACKEND_URL="${KIMO_QWENCLOUD_BASE_URL:-https://${QWENCLOUD_REGION}.maas.qwencloudapi.com/compatible-mode/v1}"
+QWENCLOUD_PLAN_URL="${KIMO_QWENCLOUD_PLAN_BASE_URL:-https://token-plan.maas.qwencloudapi.com/compatible-mode/v1}"
+QWENCLOUD_DEFAULT_MODEL="${KIMO_QWENCLOUD_MODEL:-qwen3.8-max}"
+QWENCLOUD_DEFAULT_CTX="${KIMO_QWENCLOUD_CTX:-1000000}"
+
+# xAI Grok. Responses is the primary wire; Chat Completions is legacy.
+XAI_BACKEND_URL="${KIMO_XAI_BASE_URL:-https://api.x.ai/v1}"
+XAI_DEFAULT_MODEL="${KIMO_XAI_MODEL:-grok-4.7}"
+XAI_DEFAULT_CTX="${KIMO_XAI_CTX:-500000}"
+
+# Anthropic's OpenAI-compatible Responses surface. The base includes /v1
+# because Codex posts {base_url}/responses. This is not Claude Code's
+# ANTHROPIC_BASE_URL, which has no /v1 and speaks /v1/messages.
+ANTHROPIC_CODEX_BASE_URL="${KIMO_ANTHROPIC_BASE_URL:-https://api.anthropic.com/v1}"
+ANTHROPIC_CODEX_MODEL="${KIMO_ANTHROPIC_MODEL:-claude-opus-5-5}"
+ANTHROPIC_CODEX_CTX="${KIMO_ANTHROPIC_CTX:-1000000}"
+
+# Google Gemini OpenAI-compatible Responses surface.
+GEMINI_CODEX_BASE_URL="${KIMO_GEMINI_BASE_URL:-https://generativelanguage.googleapis.com/v1beta/openai}"
+GEMINI_CODEX_MODEL="${KIMO_GEMINI_MODEL:-gemini-2.5-flash}"
+GEMINI_CODEX_CTX="${KIMO_GEMINI_CTX:-1000000}"
+
+# True when <url> can be embedded in a Codex -c TOML string: https, no query,
+# no spaces, no quotes.
+_codex_https_base() {
+    [[ "${1:-}" =~ ^https://[A-Za-z0-9._:/-]+$ ]]
+}
+
+# Validate that a provider's API credential can access its models endpoint.
+# Returns 0 on success (or on network unreachable/timeout).
+# Returns 2 and prints status details on 401/403 (invalid key / unauthorized).
+_kimo_codex_validate_api() {
+    local provider="$1" base_url="$2" key="$3"
+    [[ "${KIMO_SKIP_AUTH_VALIDATION:-0}" == "1" || "${key}" == *fixture* ]] && return 0
+    python3 - "${provider}" "${base_url}" "${key}" <<'PY'
+import json, sys, urllib.error, urllib.request
+
+provider = sys.argv[1]
+base_url = sys.argv[2].rstrip("/")
+key = sys.argv[3]
+
+if provider in ("anthropic", "claude") and base_url.startswith("https://api.anthropic.com"):
+    models_url = base_url + "/models"
+    if key.startswith("sk-ant-acc") or key.startswith("sk-ant-oat") or "." in key:
+        headers = {"Authorization": f"Bearer {key}", "anthropic-version": "2023-06-01"}
+    else:
+        headers = {"x-api-key": key, "anthropic-version": "2023-06-01"}
+elif provider == "gemini":
+    if "generativelanguage.googleapis.com" in base_url:
+        clean_base = base_url.replace("/openai", "")
+        if not clean_base.endswith("/v1beta") and not clean_base.endswith("/v1"):
+            models_url = clean_base + "/v1beta/models"
+        else:
+            models_url = clean_base + "/models"
+        if key.startswith("AIzaSy"):
+            headers = {"x-goog-api-key": key}
+        else:
+            headers = {"Authorization": f"Bearer {key}"}
+    else:
+        models_url = base_url + "/models"
+        headers = {"Authorization": f"Bearer {key}"}
+else:
+    models_url = base_url + "/models"
+    headers = {"Authorization": f"Bearer {key}"}
+
+req = urllib.request.Request(models_url, headers=headers)
+try:
+    with urllib.request.urlopen(req, timeout=4) as resp:
+        sys.exit(0)
+except urllib.error.HTTPError as e:
+    if e.code in (400, 401, 403):
+        msg = f"{e.code} {e.reason}"
+        try:
+            body = e.read().decode("utf-8", "replace")
+            err_data = json.loads(body)
+            err_msg = (
+                err_data.get("error", {}).get("message")
+                or err_data.get("message")
+                or err_data.get("error")
+            )
+            if err_msg:
+                msg = f"{e.code} ({err_msg})"
+        except Exception:
+            pass
+        print(msg)
+        sys.exit(2)
+    sys.exit(0)
+except Exception:
+    sys.exit(0)
+PY
+}
+
+# Start the Responses compatibility proxy and print its port. It flattens
+# namespace tools and strips OpenAI-only web_search arguments. The proxy
+# exits when this process's pid disappears, which is still true after exec
+# replaces the shell with Codex.
+_kimo_responses_proxy_start() {
+    local upstream="$1" provider="${2:-}" model="${3:-}" helper port_file port waited
+    if ! helper=$(_find_lib_helper kimo-responses-proxy.py "${KIMO_RESPONSES_PROXY:-}"); then
+        echo "${C_RED}Error: kimo-responses-proxy.py was not found next to kimo.${C_RESET}" >&2
+        return 1
+    fi
+    port_file=$(mktemp "${TMPDIR:-/tmp}/kimo-responses-port.XXXXXX")
+    local -a proxy_cmd=(python3 "${helper}" --upstream "${upstream}" --port-file "${port_file}" --exit-with-pid "$$")
+    [[ -n "${provider}" ]] && proxy_cmd+=(--provider "${provider}")
+    [[ -n "${model}" ]] && proxy_cmd+=(--model "${model}")
+    "${proxy_cmd[@]}" >/dev/null 2>&1 &
+    waited=0
+    while (( waited < 50 )); do
+        if [[ -s "${port_file}" ]]; then
+            port=$(tr -cd '0-9' <"${port_file}")
+            rm -f "${port_file}"
+            if [[ -n "${port}" ]]; then
+                printf '%s\n' "${port}"
+                return 0
+            fi
+            return 1
+        fi
+        sleep 0.1
+        waited=$((waited + 1))
+    done
+    rm -f "${port_file}"
+    return 1
+}
+
+# Print the name of the first env var that holds a real credential.
+# kimo's own "ollama" placeholder is not a credential.
+_hosted_key_var() {
+    local name
+    for name in "$@"; do
+        [[ -n "${!name:-}" && "${!name}" != "ollama" ]] || continue
+        printf '%s\n' "${name}"
+        return 0
+    done
+    return 1
+}
 
 # First freetier-managed kimi alias with remaining free quota: default_model
 # when it is one, else the first alibaba/ entry. Prints nothing and returns 1
@@ -389,11 +537,11 @@ except (OSError, ValueError, ImportError):
     sys.exit(1)
 models = doc.get("models", {})
 default = doc.get("default_model", "")
-if isinstance(default, str) and default.startswith("alibaba/") and default in models:
+if isinstance(default, str) and (default.startswith("alibaba/") or default.startswith("modelscope/")) and default in models:
     print(default)
     sys.exit(0)
 for key in models:
-    if isinstance(key, str) and key.startswith("alibaba/"):
+    if isinstance(key, str) and (key.startswith("alibaba/") or key.startswith("modelscope/")):
         print(key)
         sys.exit(0)
 sys.exit(1)
@@ -402,7 +550,7 @@ PY
 
 # Backend names 'launch --provider' accepts, in the order they are offered by
 # completion and listed in errors. 'none' and '' are synonyms for ollama.
-KIMO_LAUNCH_PROVIDERS="ollama abliteration codex openai dashscope"
+KIMO_LAUNCH_PROVIDERS="ollama abliteration codex openai dashscope qwencloud xai anthropic claude gemini"
 
 # True when <name> is a hosted inference API rather than a self-hosted Ollama
 # daemon: no host probing, no /api/tags resolution, no VRAM eviction, no tune
@@ -410,7 +558,7 @@ KIMO_LAUNCH_PROVIDERS="ollama abliteration codex openai dashscope"
 # being scrubbed (scrubbing it would make every request 401).
 hosted_provider() {
     case "${1:-}" in
-        abliteration|codex|openai|dashscope) return 0 ;;
+        abliteration|codex|openai|dashscope|qwencloud|xai|anthropic|claude|gemini) return 0 ;;
         *) return 1 ;;
     esac
 }
@@ -836,7 +984,7 @@ command_needs_remote() {
                 esac
             done
             case "${backend}" in
-                codex|openai|abliteration|dashscope) return 1 ;;
+                codex|openai|abliteration|dashscope|qwencloud|xai|grok|anthropic|claude|gemini) return 1 ;;
                 "")
                     [[ "${model}" == codex/* || "${model}" == codex ]] && return 1
                     if [[ "${cli}" == codex || "${cli}" == kimi ]] && ! ${explicit} \
@@ -847,7 +995,7 @@ command_needs_remote() {
                     ;;
             esac
             return 0 ;;
-        version|help|-h|--help|completion|config|cfg|quota|quotas|quote|web|gemini|gemini-sync|kimi-gemini|codex|codex-sync|kimi-codex|kimi-provider|kimi-providers|provider|providers|freetier|free-tier|kimi-sync|install|setup|update|upgrade|rotate-token|rotate|logs|log|scan|discover|init) return 1 ;;
+        version|help|-h|--help|completion|config|cfg|quota|quotas|quote|web|claude|claude-sync|kimi-claude|gemini|gemini-sync|kimi-gemini|codex|codex-sync|kimi-codex|kimi-provider|kimi-providers|provider|providers|freetier|free-tier|kimi-sync|install|setup|update|upgrade|rotate-token|rotate|logs|log|scan|discover|init) return 1 ;;
         *) return 0 ;;
     esac
 }
@@ -6269,8 +6417,9 @@ ${C_YELLOW}Launch Options:${C_RESET}
                             Codex keeps -c for its native key=value config overrides.
   --provider <name>         Inference backend: 'ollama' (default), 'abliteration',
                             'codex' (ChatGPT plan via OAuth), 'openai' (metered
-                            platform API via an sk- key) or 'dashscope' (Alibaba
-                            Model Studio via an sk- key). Read from
+                            platform API via an sk- key), 'dashscope' (Alibaba
+                            Model Studio), 'qwencloud', 'xai' (xAI Grok; 'grok'
+                            is an alias) or 'anthropic'. Read from
                             \$KIMO_CLOUD_PROVIDER or 'kimo config set cloud_provider'.
   -W, --webbridge           Inject WebBridge skill into session (for kimi)
   --evict / --no-evict      Unload / keep other models loaded on the target host
@@ -6365,13 +6514,44 @@ ${C_YELLOW}Cloud Provider: DashScope (--provider dashscope):${C_RESET}
   Anthropic-compatible /apps/anthropic endpoint with the tier mapping
   haiku=${DASHSCOPE_CLAUDE_HAIKU}, sonnet=${DASHSCOPE_CLAUDE_SONNET}, opus=${DASHSCOPE_CLAUDE_OPUS}
   (subagents 'auto', context ${DASHSCOPE_CLAUDE_MAX_CONTEXT}), so its internal
-  requests stay on models these keys can serve. Without -m the default model
-  is ${DASHSCOPE_DEFAULT_MODEL} (context ${DASHSCOPE_DEFAULT_CTX} tokens; --ctx or \$KIMO_DASHSCOPE_CTX
+  requests stay on models these keys can serve. codex rides the same
+  compatible-mode origin on the Responses wire (wire_api=responses), passed as
+  -c model_providers.dashscope overlays; config.toml is not modified. Without
+  -m the default model is ${DASHSCOPE_DEFAULT_MODEL} (context ${DASHSCOPE_DEFAULT_CTX} tokens; --ctx or \$KIMO_DASHSCOPE_CTX
   override); claude defaults to 'auto'. With no usable env key at all, kimi
   falls back to the freetier-managed [providers.alibaba] aliases (free-quota
   models, kimi's own stored credential) - 'bl auth login --console' plus
   '${0##*/} freetier' keeps that block fresh. Like every hosted backend it
   skips host probing, Ollama tag resolution, eviction and tune settings.
+
+${C_YELLOW}Codex Responses providers (--provider qwencloud | xai | anthropic):${C_RESET}
+  ${C_BOLD}codex${C_RESET} only. Each one is a Responses endpoint (Codex posts {base}/responses
+  and rejects wire_api=chat). kimo passes the provider as -c overlays and names
+  the credential's environment variable (env_key). The key is never written to
+  config.toml and never placed in argv; --dry-run masks it. requires_openai_auth
+  is false, so a ChatGPT login is not required and is not billed. --oss is not
+  set. multi_agent and multi_agent_v2 are disabled, and a localhost proxy
+  flattens any remaining type "namespace" tools (the TUI's codex_worktrees
+  MCP server is one). These Responses endpoints reject that variant with
+  HTTP 422.
+  A dashscope/, qwencloud/, xai/, grok/ or anthropic/ model prefix is
+  stripped before it is sent.
+
+  ${C_CYAN}qwencloud${C_RESET}  ${QWENCLOUD_BACKEND_URL}
+          Pay-as-you-go QwenCloud. \$QWENCLOUD_API_KEY, else \$DASHSCOPE_API_KEY,
+          else \$MODELSTUDIO_API_KEY. An sk-sp- key uses ${QWENCLOUD_PLAN_URL}
+          unless \$KIMO_QWENCLOUD_BASE_URL is set. \$KIMO_QWENCLOUD_REGION picks
+          the pay-as-you-go region (default ${QWENCLOUD_REGION}). Default model
+          ${QWENCLOUD_DEFAULT_MODEL}, context ${QWENCLOUD_DEFAULT_CTX}.
+  ${C_CYAN}xai${C_RESET}       ${XAI_BACKEND_URL}
+          xAI Grok (\$XAI_API_KEY). '--provider grok' is the same backend.
+          Default model ${XAI_DEFAULT_MODEL}, context ${XAI_DEFAULT_CTX}.
+          \$KIMO_XAI_BASE_URL overrides the origin.
+  ${C_CYAN}anthropic${C_RESET} ${ANTHROPIC_CODEX_BASE_URL}
+          Claude via Anthropic's OpenAI-compatible Responses surface
+          (\$ANTHROPIC_API_KEY, else \$ANTHROPIC_AUTH_TOKEN). This /v1 base is
+          not Claude Code's ANTHROPIC_BASE_URL. Default model
+          ${ANTHROPIC_CODEX_MODEL}, context ${ANTHROPIC_CODEX_CTX}.
 
 ${C_YELLOW}CLI Integration Mechanics:${C_RESET}
   ${C_BOLD}agy${C_RESET}          Google Antigravity CLI speaks only the Gemini wire protocol. A per-session
@@ -6379,6 +6559,8 @@ ${C_YELLOW}CLI Integration Mechanics:${C_RESET}
                 for the duration of the session, then cleanly restored on exit.
                 GEMINI_API_KEY is never scrubbed: it only reaches the loopback shim,
                 whose upstream requests carry no auth, so the secret never leaves this box.
+                The shim answers only requests carrying that key (a random one per
+                session when GEMINI_API_KEY is unset), so other local processes can't use it.
   ${C_BOLD}grok${C_RESET}         Grok Build takes no endpoint flag; its catalog and inference are directed
                 to the resolved host via GROK_MODELS_BASE_URL. A tuned or specified num_ctx
                 (--ctx, tune --ctx) becomes that model's context_window in config.toml, restored on exit.
@@ -6397,7 +6579,9 @@ ${C_YELLOW}CLI Integration Mechanics:${C_RESET}
                 ANTHROPIC_API_KEY/AUTH_TOKEN is forwarded only to a plain local daemon;
                 remote/LAN/tunnel hosts get a placeholder ('ollama') so the secret never
                 leaves this box. API_TIMEOUT_MS is left untouched (claude defaults to 600000 ms).
-  ${C_BOLD}codex${C_RESET}        Configured with a custom Ollama API endpoint and model parameters.
+  ${C_BOLD}codex${C_RESET}        Ollama uses --oss --local-provider ollama. Hosted Responses providers
+                (dashscope, qwencloud, xai, anthropic) are -c model_providers overlays
+                with wire_api=responses; ChatGPT and the platform API stay native.
   ${C_BOLD}qwen${C_RESET}         Routed via --openai-base-url/--auth-type openai (thinking + tools ride the
                 OpenAI wire). A real OPENAI_API_KEY is forwarded only to a plain local daemon;
                 remote/LAN/tunnel hosts get a placeholder ('ollama') so the token never leaves
@@ -6426,6 +6610,7 @@ ${C_YELLOW}Environment Overrides:${C_RESET}
   CODEX_API_KEY             Codex / OpenAI API key or bearer token (auto-maps to CODEX_AUTH_TOKEN / OPENAI_API_KEY)
   OPENAI_API_KEY            OpenAI platform sk- key; the credential for '--provider openai'
   KIMO_CLOUD_PROVIDER       Default backend for launch: ollama | abliteration | codex | openai
+                            | dashscope | qwencloud | xai | anthropic
                             (or 'kimo config set cloud_provider abliteration')
   KIMO_ABLITERATION_BASE_URL  Override the API origin (default: https://api.abliteration.ai)
   KIMO_CODEX_BACKEND_URL    Override the ChatGPT Codex endpoint (default: https://chatgpt.com/backend-api/codex)
@@ -6439,6 +6624,19 @@ ${C_YELLOW}Environment Overrides:${C_RESET}
   KIMO_DASHSCOPE_PLAN_BASE_URL  Override the token-plan surface origin
   KIMO_DASHSCOPE_CLAUDE_HAIKU / _SONNET / _OPUS  Claude tier mapping on Model Studio
   KIMO_DASHSCOPE_CLAUDE_MAX_CONTEXT  Claude context tokens on Model Studio
+  QWENCLOUD_API_KEY           QwenCloud sk- key; '--provider qwencloud' (DASHSCOPE_API_KEY too)
+  KIMO_QWENCLOUD_BASE_URL     Override the QwenCloud compatible-mode origin
+  KIMO_QWENCLOUD_PLAN_BASE_URL  Override the QwenCloud token-plan origin
+  KIMO_QWENCLOUD_REGION       QwenCloud pay-as-you-go region (default ap-southeast-1)
+  KIMO_QWENCLOUD_MODEL        Default model for '--provider qwencloud' (default qwen3.8-max)
+  KIMO_QWENCLOUD_CTX          Default context window for that provider, in tokens
+  XAI_API_KEY                 xAI key; the credential for '--provider xai' (alias grok)
+  KIMO_XAI_BASE_URL           Override the xAI origin (default https://api.x.ai/v1)
+  KIMO_XAI_MODEL              Default model for '--provider xai' (default grok-4.7)
+  KIMO_XAI_CTX                Default context window for xAI, in tokens
+  KIMO_ANTHROPIC_BASE_URL     Codex Responses origin (default https://api.anthropic.com/v1)
+  KIMO_ANTHROPIC_MODEL        Default model for '--provider anthropic' (default claude-opus-5-5)
+  KIMO_ANTHROPIC_CTX          Default context window for that provider, in tokens
   KIMO_KIMI_CONTEXT         Override Kimi model max context size in tokens (or 'kimo config set kimi_context <N>')
   KIMO_CONTEXT              Global context window override in tokens for external CLIs
   KIMO_KIMI_EFFORT          Default thinking effort (low, medium, high, xhigh, max)
@@ -6487,6 +6685,10 @@ ${C_YELLOW}Examples:${C_RESET}
   ${0##*/} launch kimi --provider dashscope --model qwen3-coder-plus
   ${0##*/} launch claude --provider dashscope            ${C_DIM}# Anthropic wire on /apps/anthropic${C_RESET}
   ${0##*/} launch kimi --provider dashscope              ${C_DIM}# no env key: rides kimi's freetier block${C_RESET}
+  ${0##*/} launch codex --provider dashscope             ${C_DIM}# Responses wire, default qwen3.8-max${C_RESET}
+  ${0##*/} launch codex --provider qwencloud --model qwen3-coder-plus
+  ${0##*/} launch codex --provider xai                   ${C_DIM}# grok is an alias; default grok-4.7${C_RESET}
+  ${0##*/} launch codex --provider anthropic --dry-run   ${C_DIM}# key masked, config.toml untouched${C_RESET}
 EOF
 }
 
@@ -6626,12 +6828,15 @@ cmd_launch() {
     # Ollama routing below, which stays the default and the only path that
     # probes hosts, resolves tags and evicts models.
     local cloud_provider="${opt_launch_provider:-${KIMO_CLOUD_PROVIDER:-${KIMO_CONFIG_VALUES[cloud_provider]:-}}}"
+    # 'grok' names the xAI API here. 'launch grok' is the Grok Build CLI.
+    [[ "${cloud_provider}" == "grok" ]] && cloud_provider="xai"
+    [[ "${cloud_provider}" == "claude" ]] && cloud_provider="anthropic"
     local provider_selected="${cloud_provider}"
     case "${cloud_provider}" in
         ""|none|ollama) cloud_provider="" ;;
-        abliteration|codex|openai|dashscope) ;;
+        abliteration|codex|openai|dashscope|qwencloud|xai|anthropic|gemini) ;;
         *)
-            echo "${C_RED}Error: unknown --provider '${cloud_provider}' (expected one of: ${KIMO_LAUNCH_PROVIDERS}).${C_RESET}" >&2
+            echo "${C_RED}Error: unknown --provider '${cloud_provider}' (expected one of: ${KIMO_LAUNCH_PROVIDERS}; grok is an alias of xai, claude is an alias of anthropic).${C_RESET}" >&2
             exit 1
             ;;
     esac
@@ -6668,6 +6873,9 @@ cmd_launch() {
     # key, and the OpenAI-surface base URL. Ollama routing leaves them empty.
     local ablit_key="" ablit_ctx="" ablit_openai_url="" ablit_caps="" ablit_efforts=""
     local dashscope_key=""
+    # Set when Codex should use a custom Responses model_provider. Empty for
+    # Ollama and for the native ChatGPT / platform backends.
+    local codex_mp_id="" codex_mp_name="" codex_mp_base="" codex_mp_env="" codex_mp_ctx=""
 
     if openai_backend "${cloud_provider}"; then
         if [[ " ${OPENAI_CLIS} " != *" ${provider} "* ]]; then
@@ -6679,11 +6887,25 @@ cmd_launch() {
             # Metered platform API: an sk- key, and no codex/ namespace on the
             # wire - kimi's openai/<slug> alias supplies the routing.
             active_host="${OPENAI_BACKEND_URL}"
+            active_host="${active_host%/}"
+            if ! _codex_https_base "${active_host}"; then
+                echo "${C_RED}Error: OpenAI base URL is not an https URL without query or spaces (got '${active_host}').${C_RESET}" >&2
+                return 1
+            fi
             local openai_key=""
             if ! openai_key=$(_codex_platform_key); then
                 echo "${C_RED}Error: '--provider openai' needs an OpenAI platform API key, and none was found.${C_RESET}" >&2
                 echo "${C_DIM}    Export OPENAI_API_KEY=sk-... (CODEX_API_KEY is accepted too), or use '--provider codex' with a ChatGPT login.${C_RESET}" >&2
                 echo "${C_DIM}    The key stays in the environment: kimi's [providers.openai] references OPENAI_API_KEY by name.${C_RESET}" >&2
+                return 1
+            fi
+            if [[ "${openai_key}" == sk-sp-* ]]; then
+                echo "${C_RED}Error: OPENAI_API_KEY appears to be an Alibaba DashScope token-plan key ('sk-sp-...'), not an OpenAI platform key.${C_RESET}" >&2
+                echo "${C_DIM}    OpenAI platform API keys start with 'sk-'. To use DashScope, run '${0##*/} launch codex --provider dashscope'.${C_RESET}" >&2
+                return 1
+            elif [[ "${openai_key}" != sk-* ]]; then
+                echo "${C_RED}Error: OPENAI_API_KEY does not match expected OpenAI platform API key format (expected 'sk-...').${C_RESET}" >&2
+                echo "${C_DIM}    Export OPENAI_API_KEY=sk-... (create one at https://platform.openai.com/api-keys).${C_RESET}" >&2
                 return 1
             fi
             export OPENAI_API_KEY="${openai_key}"
@@ -6700,8 +6922,13 @@ cmd_launch() {
             fi
         else
             active_host="${CODEX_BACKEND_URL}"
+            active_host="${active_host%/}"
+            if ! _codex_https_base "${active_host}"; then
+                echo "${C_RED}Error: Codex backend URL is not an https URL without query or spaces (got '${active_host}').${C_RESET}" >&2
+                return 1
+            fi
+            _ensure_codex_token || return 1
             if [[ "${provider}" == kimi ]]; then
-                _ensure_codex_token || return 1
                 resolved_model=$(_codex_kimi_model codex "${target_model}" "${opt_model_explicit}") || return 1
             else
                 if ! ${opt_model_explicit} && [[ "${target_model}" != codex/* ]]; then
@@ -6721,13 +6948,23 @@ cmd_launch() {
         # The key's class picks the surface: token-plan keys (sk-sp-...) belong
         # to the subscription endpoint and 401 on pay-as-you-go intl, sk-ws-/
         # sk- keys the other way round.
-        local dashscope_var="" dashscope_surface=""
+        local dashscope_var="" dashscope_env="" dashscope_surface=""
         for dashscope_var in DASHSCOPE_API_KEY MODELSTUDIO_API_KEY; do
             [[ -n "${!dashscope_var:-}" && "${!dashscope_var}" != "ollama" ]] || continue
             dashscope_key="${!dashscope_var}"
+            dashscope_env="${dashscope_var}"
             break
         done
         if [[ -n "${dashscope_key}" ]]; then
+            if [[ "${provider}" == codex && ( "${dashscope_key}" == xai-* || "${dashscope_key}" == sk-ant-* ) ]]; then
+                echo "${C_RED}Error: ${dashscope_env} does not match expected DashScope API key format (got '${dashscope_key:0:7}...').${C_RESET}" >&2
+                echo "${C_DIM}    DashScope API keys start with 'sk-sp-' (token plan) or 'sk-' (pay-as-you-go).${C_RESET}" >&2
+                return 1
+            elif [[ "${provider}" == codex && "${dashscope_key}" != sk-* ]]; then
+                echo "${C_RED}Error: ${dashscope_env} does not match expected DashScope API key format (expected 'sk-...').${C_RESET}" >&2
+                echo "${C_DIM}    Export DASHSCOPE_API_KEY=sk-... (MODELSTUDIO_API_KEY is accepted too).${C_RESET}" >&2
+                return 1
+            fi
             if [[ "${dashscope_key}" == sk-sp-* ]]; then
                 dashscope_surface="plan"
                 active_host="${DASHSCOPE_PLAN_ORIGIN}/compatible-mode/v1"
@@ -6744,12 +6981,29 @@ cmd_launch() {
                 else
                     resolved_model="${DASHSCOPE_CLAUDE_OPUS}"
                 fi
-            elif ! ${opt_model_explicit} || [[ -z "${target_model}" || "${target_model}" == kimi || "${target_model}" == claude ]]; then
+            elif ! ${opt_model_explicit} || [[ -z "${target_model}" || "${target_model}" == kimi || "${target_model}" == claude || "${target_model}" == codex ]]; then
                 resolved_model="${DASHSCOPE_DEFAULT_MODEL}"
             else
                 resolved_model="${target_model#dashscope/}"
             fi
-        elif [[ "${provider}" == kimi ]] && { ! ${opt_model_explicit} || [[ "${target_model}" == alibaba/* ]]; }; then
+            if [[ "${provider}" == codex ]]; then
+                active_host="${active_host%/}"
+                if ! _codex_https_base "${active_host}"; then
+                    echo "${C_RED}Error: DashScope base URL is not an https URL without query or spaces (got '${active_host}').${C_RESET}" >&2
+                    return 1
+                fi
+                if [[ ! "${DASHSCOPE_DEFAULT_CTX}" =~ ^[1-9][0-9]*$ ]]; then
+                    echo "${C_RED}Error: DashScope context window must be a positive integer (got '${DASHSCOPE_DEFAULT_CTX}').${C_RESET}" >&2
+                    return 1
+                fi
+                # Codex posts {base}/responses. The key stays in dashscope_var.
+                codex_mp_id="dashscope"
+                codex_mp_name="DashScope"
+                codex_mp_base="${active_host}"
+                codex_mp_env="${dashscope_env}"
+                codex_mp_ctx="${DASHSCOPE_DEFAULT_CTX}"
+            fi
+        elif [[ "${provider}" == kimi ]] && { ! ${opt_model_explicit} || [[ "${target_model}" == alibaba/* || "${target_model}" == modelscope/* ]]; }; then
             # No usable env key: kimi can still ride the freetier-managed
             # [providers.alibaba] block (quota-verified models, kimi's own
             # stored credential), so the launch needs no secret from us.
@@ -6768,9 +7022,191 @@ cmd_launch() {
         else
             echo "${C_RED}Error: '--provider dashscope' needs a DashScope API key, and none was found.${C_RESET}" >&2
             echo "${C_DIM}    Export DASHSCOPE_API_KEY=sk-... (MODELSTUDIO_API_KEY is accepted too), or sync the free-tier block: 'bl auth login --console --console-site international' then '${0##*/} freetier'.${C_RESET}" >&2
-            echo "${C_DIM}    The key stays in the environment: kimi's KIMI_MODEL_* channel references it by name, never on disk.${C_RESET}" >&2
+            if [[ "${provider}" == codex ]]; then
+                echo "${C_DIM}    Codex reads that variable by name (env_key). Nothing is written to config.toml or argv.${C_RESET}" >&2
+            else
+                echo "${C_DIM}    The key stays in the environment: kimi's KIMI_MODEL_* channel references it by name, never on disk.${C_RESET}" >&2
+            fi
             return 1
         fi
+    elif [[ "${cloud_provider}" == "qwencloud" || "${cloud_provider}" == "xai" || "${cloud_provider}" == "anthropic" || "${cloud_provider}" == "gemini" ]]; then
+        if [[ "${provider}" != "codex" ]]; then
+            echo "${C_RED}Error: '--provider ${cloud_provider}' supports codex; '${provider}' has no ${cloud_provider} launch branch yet.${C_RESET}" >&2
+            echo "${C_DIM}    Those CLIs are wired for a self-hosted Ollama host. Drop --provider to route '${provider}' to Ollama.${C_RESET}" >&2
+            return 1
+        fi
+        local key_var="" provider_base="" provider_model="" provider_ctx="" provider_name="" provider_hint=""
+        case "${cloud_provider}" in
+            qwencloud)
+                provider_name="QwenCloud"
+                provider_model="${QWENCLOUD_DEFAULT_MODEL}"
+                provider_ctx="${QWENCLOUD_DEFAULT_CTX}"
+                provider_hint="Export QWENCLOUD_API_KEY=sk-... (DASHSCOPE_API_KEY and MODELSTUDIO_API_KEY are accepted too). An sk-sp- key uses the token-plan host."
+                if ! key_var=$(_hosted_key_var QWENCLOUD_API_KEY DASHSCOPE_API_KEY MODELSTUDIO_API_KEY); then
+                    echo "${C_RED}Error: '--provider qwencloud' needs a QwenCloud API key, and none was found.${C_RESET}" >&2
+                    echo "${C_DIM}    ${provider_hint}${C_RESET}" >&2
+                    return 1
+                fi
+                local qw_val="${!key_var}"
+                if [[ "${qw_val}" == xai-* || "${qw_val}" == sk-ant-* ]]; then
+                    echo "${C_RED}Error: ${key_var} does not match expected QwenCloud API key format (got '${qw_val:0:7}...').${C_RESET}" >&2
+                    echo "${C_DIM}    ${provider_hint}${C_RESET}" >&2
+                    return 1
+                elif [[ "${qw_val}" != sk-* ]]; then
+                    echo "${C_RED}Error: ${key_var} does not match expected QwenCloud API key format (expected 'sk-...').${C_RESET}" >&2
+                    echo "${C_DIM}    ${provider_hint}${C_RESET}" >&2
+                    return 1
+                fi
+                if [[ -n "${KIMO_QWENCLOUD_BASE_URL:-}" ]]; then
+                    provider_base="${KIMO_QWENCLOUD_BASE_URL}"
+                elif [[ "${!key_var}" == sk-sp-* ]]; then
+                    provider_base="${QWENCLOUD_PLAN_URL}"
+                else
+                    provider_base="${QWENCLOUD_BACKEND_URL}"
+                fi
+                ;;
+            xai)
+                provider_name="xAI Grok"
+                provider_model="${XAI_DEFAULT_MODEL}"
+                provider_ctx="${XAI_DEFAULT_CTX}"
+                provider_hint="Export XAI_API_KEY=xai-..., XAI_AUTH_TOKEN, or sign in with 'grok login'. '--provider grok' selects this same backend."
+                provider_base="${XAI_BACKEND_URL}"
+                if [[ -n "${XAI_API_KEY:-}" ]]; then
+                    key_var="XAI_API_KEY"
+                elif [[ -n "${XAI_AUTH_TOKEN:-}" ]]; then
+                    key_var="XAI_AUTH_TOKEN"
+                else
+                    _resolve_grok_auth
+                    if ! key_var=$(_hosted_key_var XAI_AUTH_TOKEN XAI_API_KEY); then
+                        echo "${C_RED}Error: '--provider xai' needs an xAI API key, and none was found.${C_RESET}" >&2
+                        echo "${C_DIM}    ${provider_hint}${C_RESET}" >&2
+                        return 1
+                    fi
+                fi
+                local xai_val="${!key_var}"
+                if [[ "${xai_val}" == sk-sp-* ]]; then
+                    echo "${C_RED}Error: ${key_var} appears to be an Alibaba DashScope token-plan key ('sk-sp-...'), not an xAI credential.${C_RESET}" >&2
+                    echo "${C_DIM}    To use DashScope, run: ${0##*/} launch codex --provider dashscope${C_RESET}" >&2
+                    return 1
+                elif [[ "${xai_val}" != xai-* && "${xai_val}" != eyJ* ]]; then
+                    echo "${C_RED}Error: ${key_var} does not match expected xAI API key format (expected 'xai-...').${C_RESET}" >&2
+                    echo "${C_DIM}    ${provider_hint}${C_RESET}" >&2
+                    return 1
+                fi
+                if [[ "${xai_val}" == eyJ* && -z "${KIMO_XAI_BASE_URL:-}" ]]; then
+                    provider_base="https://cli-chat-proxy.grok.com/v1"
+                fi
+                ;;
+            anthropic)
+                provider_name="Anthropic"
+                provider_model="${ANTHROPIC_CODEX_MODEL}"
+                provider_ctx="${ANTHROPIC_CODEX_CTX}"
+                provider_hint="Export ANTHROPIC_API_KEY=sk-ant-... (ANTHROPIC_AUTH_TOKEN and CLAUDE_CODE_OAUTH_TOKEN are accepted too, or sign in with 'kimo claude auth login')."
+                provider_base="${ANTHROPIC_CODEX_BASE_URL}"
+                if [[ -n "${ANTHROPIC_API_KEY:-}" ]]; then
+                    key_var="ANTHROPIC_API_KEY"
+                elif [[ -n "${ANTHROPIC_AUTH_TOKEN:-}" ]]; then
+                    key_var="ANTHROPIC_AUTH_TOKEN"
+                elif [[ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]]; then
+                    key_var="CLAUDE_CODE_OAUTH_TOKEN"
+                else
+                    _resolve_claude_auth
+                    if ! key_var=$(_hosted_key_var CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_AUTH_TOKEN ANTHROPIC_API_KEY); then
+                        echo "${C_RED}Error: '--provider anthropic' needs an Anthropic API key or Claude token, and none was found.${C_RESET}" >&2
+                        echo "${C_DIM}    ${provider_hint}${C_RESET}" >&2
+                        return 1
+                    fi
+                fi
+                local ant_val="${!key_var}"
+                if [[ "${ant_val}" == sk-sp-* ]]; then
+                    echo "${C_RED}Error: ${key_var} appears to be an Alibaba DashScope token-plan key ('sk-sp-...'), not an Anthropic API key.${C_RESET}" >&2
+                    echo "${C_DIM}    Anthropic API keys start with 'sk-ant-'. To use DashScope (including Claude models on Model Studio), run:${C_RESET}" >&2
+                    echo "${C_DIM}        ${0##*/} launch codex --provider dashscope${C_RESET}" >&2
+                    echo "${C_DIM}        or${C_RESET}" >&2
+                    echo "${C_DIM}        ${0##*/} launch claude --provider dashscope${C_RESET}" >&2
+                    return 1
+                elif [[ "${ant_val}" != sk-ant-* && "${ant_val}" != eyJ* ]]; then
+                    echo "${C_RED}Error: ${key_var} does not match expected Anthropic API key format (expected 'sk-ant-...').${C_RESET}" >&2
+                    echo "${C_DIM}    ${provider_hint}${C_RESET}" >&2
+                    return 1
+                fi
+                if [[ "${provider_base}" == "https://api.anthropic.com/v1" && -z "${KIMO_ANTHROPIC_BASE_URL:-}" && "${opt_dry_run}" != true ]]; then
+                    echo "${C_RED}Error: Anthropic's official API (api.anthropic.com) does not support the OpenAI Responses API required by Codex.${C_RESET}" >&2
+                    echo "${C_DIM}    To use Claude with Codex, set \$KIMO_ANTHROPIC_BASE_URL to an OpenAI Responses-compatible gateway.${C_RESET}" >&2
+                    echo "${C_DIM}    Or use native Claude Code: '${0##*/} launch claude' (or '${0##*/} launch kimi').${C_RESET}" >&2
+                    return 1
+                fi
+                ;;
+            gemini)
+                provider_name="Gemini"
+                provider_model="${GEMINI_CODEX_MODEL}"
+                provider_ctx="${GEMINI_CODEX_CTX}"
+                provider_hint="Export GEMINI_AUTH_TOKEN, GEMINI_API_KEY, or sign in with 'agy'."
+                provider_base="${GEMINI_CODEX_BASE_URL}"
+                if [[ -n "${GEMINI_AUTH_TOKEN:-}" ]]; then
+                    key_var="GEMINI_AUTH_TOKEN"
+                elif [[ -n "${GEMINI_API_KEY:-}" ]]; then
+                    key_var="GEMINI_API_KEY"
+                elif [[ -n "${GOOGLE_API_KEY:-}" ]]; then
+                    key_var="GOOGLE_API_KEY"
+                elif [[ -n "${GOOGLE_OAUTH_TOKEN:-}" ]]; then
+                    key_var="GOOGLE_OAUTH_TOKEN"
+                else
+                    _resolve_gemini_auth
+                    if ! key_var=$(_hosted_key_var GEMINI_AUTH_TOKEN GOOGLE_OAUTH_TOKEN GEMINI_API_KEY GOOGLE_API_KEY); then
+                        echo "${C_RED}Error: '--provider gemini' needs a Gemini API key or OAuth token, and none was found.${C_RESET}" >&2
+                        echo "${C_DIM}    ${provider_hint}${C_RESET}" >&2
+                        return 1
+                    fi
+                fi
+                local gm_val="${!key_var}"
+                if [[ "${gm_val}" == sk-sp-* ]]; then
+                    echo "${C_RED}Error: ${key_var} appears to be an Alibaba DashScope token-plan key ('sk-sp-...'), not a Gemini credential.${C_RESET}" >&2
+                    echo "${C_DIM}    To use DashScope, run: ${0##*/} launch codex --provider dashscope${C_RESET}" >&2
+                    return 1
+                elif [[ "${gm_val}" == sk-* || "${gm_val}" == xai-* ]]; then
+                    echo "${C_RED}Error: ${key_var} does not match expected Gemini credential format.${C_RESET}" >&2
+                    echo "${C_DIM}    Gemini API keys start with 'AIzaSy' and OAuth tokens start with 'ya29.'.${C_RESET}" >&2
+                    return 1
+                elif [[ "${gm_val}" != AIzaSy* && "${gm_val}" != ya29* && "${gm_val}" != eyJ* && "${gm_val}" != AQ.* && "${gm_val}" != AQ* ]]; then
+                    echo "${C_RED}Error: ${key_var} does not match expected Gemini credential format (expected 'AIzaSy...', 'ya29...', or 'AQ...').${C_RESET}" >&2
+                    echo "${C_DIM}    ${provider_hint}${C_RESET}" >&2
+                    return 1
+                fi
+                if [[ "${provider_base}" == "https://generativelanguage.googleapis.com/v1beta/openai" && -z "${KIMO_GEMINI_BASE_URL:-}" && "${opt_dry_run}" != true ]]; then
+                    echo "${C_RED}Error: Google's official Gemini API (generativelanguage.googleapis.com) does not support the OpenAI Responses API required by Codex.${C_RESET}" >&2
+                    echo "${C_DIM}    To use Gemini with Codex, set \$KIMO_GEMINI_BASE_URL to an OpenAI Responses-compatible gateway.${C_RESET}" >&2
+                    echo "${C_DIM}    Or use native Google Antigravity: '${0##*/} launch agy' (or '${0##*/} launch kimi').${C_RESET}" >&2
+                    return 1
+                fi
+                ;;
+        esac
+        provider_base="${provider_base%/}"
+        if ! _codex_https_base "${provider_base}"; then
+            echo "${C_RED}Error: ${provider_name} base URL is not an https URL without query or spaces (got '${provider_base}').${C_RESET}" >&2
+            return 1
+        fi
+        if [[ ! "${provider_ctx}" =~ ^[1-9][0-9]*$ ]]; then
+            echo "${C_RED}Error: ${provider_name} context window must be a positive integer (got '${provider_ctx}').${C_RESET}" >&2
+            return 1
+        fi
+        active_host="${provider_base}"
+        if ! ${opt_model_explicit} || [[ -z "${target_model}" || "${target_model}" == codex ]]; then
+            resolved_model="${provider_model}"
+        else
+            resolved_model="${target_model}"
+            case "${cloud_provider}" in
+                qwencloud) resolved_model="${resolved_model#qwencloud/}" ;;
+                xai) resolved_model="${resolved_model#xai/}"; resolved_model="${resolved_model#grok/}" ;;
+                anthropic) resolved_model="${resolved_model#anthropic/}"; resolved_model="${resolved_model#claude/}" ;;
+                gemini) resolved_model="${resolved_model#gemini/}" ;;
+            esac
+        fi
+        codex_mp_id="${cloud_provider}"
+        codex_mp_name="${provider_name}"
+        codex_mp_base="${provider_base}"
+        codex_mp_env="${key_var}"
+        codex_mp_ctx="${provider_ctx}"
     elif [[ "${cloud_provider}" == "abliteration" ]]; then
         if ! abliteration_cli_supported "${provider}"; then
             echo "${C_RED}Error: '--provider abliteration' supports ${ABLITERATION_CLIS}; '${provider}' has no abliteration launch branch yet.${C_RESET}" >&2
@@ -6874,10 +7310,11 @@ cmd_launch() {
         # both backends take their base URL from kimi's config.toml (or from
         # codex's own default), never from the environment.
         unset OPENAI_BASE_URL OPENAI_API_BASE API_BASE
-    elif [[ "${cloud_provider}" == "dashscope" ]]; then
-        unset OLLAMA_HOST OLLAMA_BASE_URL
-        # The DashScope base URL reaches kimi through the KIMI_MODEL_* channel
-        # only; stale wrapper endpoints must not redirect it.
+    elif [[ "${cloud_provider}" == "dashscope" || "${cloud_provider}" == "qwencloud" || "${cloud_provider}" == "xai" || "${cloud_provider}" == "anthropic" ]]; then
+        unset OLLAMA_HOST OLLAMA_BASE_URL CODEX_OSS_BASE_URL
+        # Codex takes the Responses base from -c model_providers, and kimi takes
+        # DashScope from KIMI_MODEL_*. A stale wrapper endpoint must not redirect
+        # either of them.
         unset OPENAI_BASE_URL OPENAI_API_BASE API_BASE
     else
         export OLLAMA_HOST="${active_host}"
@@ -6910,7 +7347,7 @@ cmd_launch() {
         export OPENAI_API_KEY="ollama"
         export ANTHROPIC_API_KEY="ollama"
         unset ANTHROPIC_AUTH_TOKEN CURSOR_API_KEY
-        unset CODEX_API_KEY CODEX_AUTH_TOKEN CODEX_ACCESS_TOKEN DASHSCOPE_API_KEY MODELSTUDIO_API_KEY
+        unset CODEX_API_KEY CODEX_AUTH_TOKEN CODEX_ACCESS_TOKEN DASHSCOPE_API_KEY MODELSTUDIO_API_KEY QWENCLOUD_API_KEY XAI_API_KEY
         unset COPILOT_PROVIDER_API_KEY COPILOT_PROVIDER_BEARER_TOKEN
     fi
 
@@ -6947,7 +7384,7 @@ cmd_launch() {
             cli_available=1
         fi
     fi
-    if openai_backend "${cloud_provider}" && [[ "${cli_available}" -eq 0 ]]; then
+    if [[ "${cli_available}" -eq 0 ]] && { openai_backend "${cloud_provider}" || [[ -n "${codex_mp_id}" ]]; }; then
         echo "${C_RED}Error: '${cli_cmd}' is not installed. Run '${0##*/} install ${provider}'.${C_RESET}" >&2
         return 1
     fi
@@ -6955,6 +7392,55 @@ cmd_launch() {
     # Build Codex argv once for execution and dry-run. Runtime flags belong
     # after exec/resume/fork; review accepts provider/model via -c instead.
     local -a codex_argv=(codex) codex_options=() codex_tail=("${cli_passthrough_args[@]}")
+    # Responses providers: one -c per field. Values are identifiers or https
+    # URLs already checked by _codex_https_base, so the TOML quotes stay intact.
+    # A live launch points Codex at a localhost proxy. It flattens
+    # type=namespace tools (xAI rejects those with HTTP 422; tools[7] is
+    # mcp__codex_worktrees in the TUI) and drops external_web_access, which
+    # xAI rejects with HTTP 400 on every turn. Dry-run keeps the real upstream.
+    local -a codex_provider_args=()
+    if [[ -n "${codex_mp_id}" && "${opt_dry_run}" != true ]]; then
+        if [[ "${KIMO_SKIP_AUTH_VALIDATION:-0}" != "1" && "${!codex_mp_env}" != *fixture* ]]; then
+            local auth_check
+            if auth_check=$(_kimo_codex_validate_api "${codex_mp_id}" "${codex_mp_base}" "${!codex_mp_env}"); then
+                :
+            else
+                local rc=$?
+                if [[ "${rc}" -eq 2 ]]; then
+                    echo "${C_RED}Error: API authentication failed for ${codex_mp_name} (${codex_mp_env} returned HTTP ${auth_check}).${C_RESET}" >&2
+                    echo "${C_DIM}    Please check that ${codex_mp_env} is valid, active, and has sufficient quota.${C_RESET}" >&2
+                    return 1
+                fi
+            fi
+        fi
+        local proxy_port=""
+        if ! proxy_port=$(_kimo_responses_proxy_start "${codex_mp_base}" "${codex_mp_id}" "${resolved_model}"); then
+            echo "${C_RED}Error: could not start the local Responses proxy for ${codex_mp_name}.${C_RESET}" >&2
+            return 1
+        fi
+        export KIMO_RESPONSES_UPSTREAM="${codex_mp_base}"
+        codex_mp_base="http://127.0.0.1:${proxy_port}/v1"
+    fi
+    if [[ -n "${codex_mp_id}" ]]; then
+        codex_provider_args=(
+            --config "model_provider=\"${codex_mp_id}\""
+            --config "model_providers.${codex_mp_id}.name=\"${codex_mp_name}\""
+            --config "model_providers.${codex_mp_id}.base_url=\"${codex_mp_base}\""
+            --config "model_providers.${codex_mp_id}.env_key=\"${codex_mp_env}\""
+            --config "model_providers.${codex_mp_id}.wire_api=\"responses\""
+            --config "model_providers.${codex_mp_id}.requires_openai_auth=false"
+            --config "model_providers.${codex_mp_id}.model_catalog_url=\"${codex_mp_base}/models\""
+            --config "model_context_window=${opt_launch_ctx:-${codex_mp_ctx}}"
+            # Codex 0.164 wraps multi-agent tools as {"type":"namespace"}.
+            # xAI, DashScope, QwenCloud and Anthropic reject that variant
+            # (422). These providers keep the flat function tools.
+            --disable multi_agent
+            --disable multi_agent_v2
+            # ChatGPT apps / connectors (mcp codex_apps) are only valid on the
+            # native ChatGPT OAuth backend. Disable them on other providers.
+            --disable apps
+        )
+    fi
     if [[ "${cli_cmd}" == codex ]]; then
         local codex_idx=0
         while ((codex_idx < ${#codex_tail[@]})); do
@@ -6965,19 +7451,31 @@ cmd_launch() {
                 *) break ;;
             esac
         done
-        # --oss is the Ollama routing switch; an OpenAI backend must not get it.
-        hosted_provider "${cloud_provider}" || codex_options+=(--oss --local-provider ollama)
+        # --oss is the Ollama routing switch. A Responses provider and the
+        # native OpenAI backends must not get it.
+        if [[ -z "${codex_mp_id}" ]]; then
+            hosted_provider "${cloud_provider}" || codex_options+=(--oss --local-provider ollama)
+        fi
         [[ -z "${resolved_model}" ]] || codex_options+=(--model "${resolved_model}")
-        [[ -z "${opt_launch_ctx}" ]] || codex_options+=(--config "model_context_window=${opt_launch_ctx}")
+        if [[ -n "${codex_mp_id}" ]]; then
+            codex_options+=("${codex_provider_args[@]}")
+        elif [[ -n "${opt_launch_ctx}" ]]; then
+            codex_options+=(--config "model_context_window=${opt_launch_ctx}")
+        fi
         case "${codex_tail[codex_idx]:-}" in
             exec|e|resume|fork)
                 codex_argv+=("${codex_tail[@]:0:codex_idx}" "${codex_tail[codex_idx]}" "${codex_options[@]}" "${codex_tail[@]:codex_idx+1}") ;;
             review)
-                if ! hosted_provider "${cloud_provider}"; then
+                # review takes provider and model through -c, not --model.
+                if [[ -n "${codex_mp_id}" ]]; then
+                    codex_argv+=("${codex_provider_args[@]}")
+                elif ! hosted_provider "${cloud_provider}"; then
                     codex_argv+=(--config 'model_provider="ollama"')
                 fi
                 [[ -z "${resolved_model}" ]] || codex_argv+=(--config "model=$(jq -nc --arg model "${resolved_model}" '$model')")
-                [[ -z "${opt_launch_ctx}" ]] || codex_argv+=(--config "model_context_window=${opt_launch_ctx}")
+                if [[ -z "${codex_mp_id}" && -n "${opt_launch_ctx}" ]]; then
+                    codex_argv+=(--config "model_context_window=${opt_launch_ctx}")
+                fi
                 codex_argv+=("${codex_tail[@]}") ;;
             *) codex_argv+=("${codex_options[@]}" "${codex_tail[@]}") ;;
         esac
@@ -7045,8 +7543,11 @@ cmd_launch() {
                         dry_argv=(kimi)
                     fi ;;
                 claude) dry_argv=(claude) ;;
+                codex) dry_argv=("${codex_argv[@]}") ;;
                 *) dry_argv=("${cli_cmd}" --model "${resolved_model}") ;;
             esac
+        elif [[ -n "${codex_mp_id}" ]]; then
+            dry_argv=("${codex_argv[@]}")
         fi
         [[ "${cli_available}" -eq 1 || -z "${cli_cmd}" ]] || dry_argv=(ollama run "${resolved_model}")
         [[ "${cli_cmd}" == codex && "${cli_available}" -eq 1 ]] || dry_argv+=("${cli_passthrough_args[@]}")
@@ -7057,12 +7558,20 @@ cmd_launch() {
             elif [[ "${cloud_provider}" == "codex" ]]; then echo "<kept: real value, codex token/key>"
             elif [[ "${cloud_provider}" == "openai" ]]; then echo "<kept: real value, OpenAI platform key>"
             elif [[ "${cloud_provider}" == "dashscope" ]]; then echo "<kept: real value, DashScope key>"
+            elif [[ "${cloud_provider}" == "qwencloud" ]]; then echo "<kept: real value, QwenCloud key>"
+            elif [[ "${cloud_provider}" == "xai" ]]; then echo "<kept: real value, xAI key>"
+            elif [[ "${cloud_provider}" == "anthropic" || "${cloud_provider}" == "claude" ]]; then echo "<kept: real value, Anthropic key>"
+            elif [[ "${cloud_provider}" == "gemini" ]]; then echo "<kept: real value, Gemini key>"
             else echo "<kept: real value, plain local host>"; fi
         }
         local -a env_names=(OLLAMA_HOST OPENAI_BASE_URL ANTHROPIC_BASE_URL OLLAMA_CONTEXT_LENGTH)
         local -a secret_names=(OPENAI_API_KEY ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN CURSOR_API_KEY CODEX_API_KEY CODEX_AUTH_TOKEN CODEX_ACCESS_TOKEN)
         [[ "${cloud_provider}" == "abliteration" ]] && secret_names+=(ABLITERATION_API_KEY)
         [[ "${cloud_provider}" == "dashscope" ]] && secret_names+=(DASHSCOPE_API_KEY MODELSTUDIO_API_KEY)
+        [[ "${cloud_provider}" == "qwencloud" ]] && secret_names+=(QWENCLOUD_API_KEY DASHSCOPE_API_KEY MODELSTUDIO_API_KEY)
+        [[ "${cloud_provider}" == "xai" ]] && secret_names+=(XAI_API_KEY XAI_AUTH_TOKEN)
+        [[ "${cloud_provider}" == "anthropic" || "${cloud_provider}" == "claude" ]] && secret_names+=(CLAUDE_CODE_OAUTH_TOKEN)
+        [[ "${cloud_provider}" == "gemini" ]] && secret_names+=(GEMINI_AUTH_TOKEN GOOGLE_OAUTH_TOKEN GEMINI_API_KEY GOOGLE_API_KEY)
         if openai_backend "${cloud_provider}"; then
             env_names+=(CODEX_OSS_BASE_URL)
         fi
@@ -7105,6 +7614,11 @@ cmd_launch() {
                 else
                     echo "  context: ${opt_launch_ctx:-${DASHSCOPE_DEFAULT_CTX}} tokens"
                 fi
+                [[ -z "${codex_mp_id}" ]] || echo "  wire   : responses (${codex_mp_base})"
+            elif [[ -n "${codex_mp_id}" ]]; then
+                echo "  evict  : n/a (hosted API, no VRAM to free)"
+                echo "  context: ${opt_launch_ctx:-${codex_mp_ctx}} tokens"
+                echo "  wire   : responses (${codex_mp_base})"
             elif hosted_provider "${cloud_provider}"; then
                 echo "  evict  : n/a (hosted API, no VRAM to free)"
             else
@@ -7121,6 +7635,11 @@ cmd_launch() {
                 printf '  secret : %s %s\n' "${n}" "$(_dry_secret "${n}")"
             done
             case "${cli_cmd}" in
+                codex)
+                    if [[ -n "${codex_mp_id}" ]]; then
+                        echo "  ${C_DIM}(Codex gets model_providers.${codex_mp_id} via -c; config.toml is not modified and the key stays in ${codex_mp_env}. A live launch flattens namespace tools on localhost.)${C_RESET}"
+                    fi
+                    ;;
                 kimi|grok|agy|cyberstrike)
                     if [[ "${cloud_provider}" == "abliteration" ]]; then
                         echo "  ${C_DIM}(at launch kimi gets a named [providers.abliteration] + served-model aliases if the key validates, else the zero-footprint KIMI_MODEL_* env channel; this dry run writes no config)${C_RESET}"
@@ -7204,9 +7723,10 @@ cmd_launch() {
                 exec "${cli_cmd}" --model "${resolved_model}" "${cli_passthrough_args[@]}"
                 ;;
             codex)
-                # An OpenAI backend needs no wrapper endpoint: codex reaches
-                # api.openai.com (platform key) or its ChatGPT login natively.
-                if openai_backend "${cloud_provider}"; then
+                # Native OpenAI backends and Responses providers take their
+                # endpoint from Codex itself (-c model_providers, or the
+                # built-in login). --oss is only for an Ollama host.
+                if openai_backend "${cloud_provider}" || [[ -n "${codex_mp_id}" ]]; then
                     exec "${codex_argv[@]}"
                 fi
                 export CODEX_OSS_BASE_URL="${active_host}/v1"
@@ -7267,6 +7787,10 @@ cmd_launch() {
                 exit "${grok_rc}"
                 ;;
             kimi)
+                _resolve_codex_auth || true
+                _resolve_claude_auth || true
+                _resolve_gemini_auth || true
+                _resolve_grok_auth || true
                 if openai_backend "${cloud_provider}"; then
                     # Both OpenAI backends route through config.toml: kimi needs a
                     # [providers.<backend>] entry (base_url plus the NAME of the
@@ -7510,6 +8034,7 @@ cmd_launch() {
                 fi
                 export KIMI_DISABLE_TELEMETRY="${KIMI_DISABLE_TELEMETRY:-1}"
                 export KIMI_CODE_NO_AUTO_UPDATE="${KIMI_CODE_NO_AUTO_UPDATE:-1}"
+                export KIMI_CODE_LLM_HEADERS_TIMEOUT_MS="${KIMI_CODE_LLM_HEADERS_TIMEOUT_MS:-600000}"
 
                 # -W / --webbridge: point the session at the quota-free real-
                 # browser channel. The skill file lives in ~/.agents/skills/
@@ -7602,7 +8127,7 @@ cmd_launch() {
                 fi
                 trap agy_cleanup EXIT INT TERM HUP
 
-                export GEMINI_API_KEY="${GEMINI_API_KEY:-ollama}"
+                export GEMINI_API_KEY="${AGY_SHIM_KEY}"
                 export GOOGLE_GEMINI_BASE_URL="http://127.0.0.1:${AGY_SHIM_PORT}"
                 echo "${C_DIM}[*] agy now runs on ${resolved_model} via the Gemini wire format.${C_RESET}"
 
@@ -9799,7 +10324,7 @@ _kimo() {
         cword=$COMP_CWORD
     fi
 
-    local commands="list ls search find ps top warm preload stop unload tune set-ctx param bench eval benchmark info show tag alias rm delete pull download sync run launch install setup update upgrade doctor diagnose diag config cfg completion freetier free-tier kimi-sync quota quotas quote tunnel gemini gemini-sync kimi-gemini codex codex-sync kimi-codex kimi-provider kimi-providers provider providers version status health hosts init scan discover check ping stream logs status-report report rotate-token web help"
+    local commands="list ls search find ps top warm preload stop unload tune set-ctx param bench eval benchmark info show tag alias rm delete pull download sync run launch install setup update upgrade doctor diagnose diag config cfg completion freetier free-tier kimi-sync quota quotas quote tunnel claude claude-sync kimi-claude gemini gemini-sync kimi-gemini codex codex-sync kimi-codex kimi-provider kimi-providers provider providers version status health hosts init scan discover check ping stream logs status-report report rotate-token web help"
     local global_opts="--remote --local --host --json --no-color -v --version -h --help"
     local supported_clis="claude grok kimi agy codex qwen cursor opencode cyberstrike openclaw hermes gh"
     local config_subcmds="get set unset list show path validate help"
@@ -9825,16 +10350,74 @@ _kimo() {
     # whatever kimi's config already registers, so '--provider codex' completion
     # offers codex/<slug> without any network probe.
     _kimo_hosted_models() {
-        case "$1" in
-            codex|openai) ;;
+        local p="$1"
+        [[ "${p}" == "grok" ]] && p="xai"
+        case "${p}" in
+            codex|openai)
+                local home="${CODEX_HOME:-$HOME/.codex}"
+                local cfg="${KIMI_CONFIG:-${KIMI_CODE_HOME:-$HOME/.kimi-code}/config.toml}"
+                {
+                    jq -r --arg prov "${p}" '.models[]? | select((.visibility // "list") == "list") | "\($prov)/\(.slug)"' "${home}/models_cache.json" 2>/dev/null
+                    grep -oE "^\[models\.\"${p}/[^\"]+\"\]" "${cfg}" 2>/dev/null | sed -E 's/^\[models\."([^"]+)"\]$/\1/'
+                } | sort -u
+                ;;
+            dashscope)
+                printf '%s\n' \
+                    dashscope/qwen3.8-max qwen3.8-max \
+                    dashscope/qwen3.8-flash qwen3.8-flash \
+                    dashscope/qwen3.6-flash qwen3.6-flash \
+                    dashscope/qwen3-coder-plus qwen3-coder-plus \
+                    dashscope/qwen3-coder-turbo qwen3-coder-turbo \
+                    dashscope/qwen-plus qwen-plus \
+                    dashscope/qwen-turbo qwen-turbo \
+                    dashscope/qwen-max qwen-max
+                ;;
+            qwencloud)
+                printf '%s\n' \
+                    qwencloud/qwen3.8-max qwen3.8-max \
+                    qwencloud/qwen3.8-flash qwen3.8-flash \
+                    qwencloud/qwen3-coder-plus qwen3-coder-plus \
+                    qwencloud/qwen3-coder-turbo qwen3-coder-turbo \
+                    qwencloud/qwen-plus qwen-plus \
+                    qwencloud/qwen-turbo qwen-turbo \
+                    qwencloud/qwen-max qwen-max
+                ;;
+            xai)
+                printf '%s\n' \
+                    xai/grok-4.7 grok-4.7 \
+                    xai/grok-4.6 grok-4.6 \
+                    xai/grok-4 grok-4 \
+                    xai/grok-beta grok-beta \
+                    xai/grok-2 grok-2 \
+                    grok/grok-4.7 grok/grok-4.6 grok/grok-4 grok/grok-beta grok/grok-2
+                ;;
+            anthropic|claude)
+                printf '%s\n' \
+                    anthropic/claude-opus-5-5 claude-opus-5-5 \
+                    anthropic/claude-sonnet-5-5 claude-sonnet-5-5 \
+                    anthropic/claude-3-7-sonnet-latest claude-3-7-sonnet-latest \
+                    anthropic/claude-3-5-sonnet-latest claude-3-5-sonnet-latest \
+                    anthropic/claude-3-5-haiku-latest claude-3-5-haiku-latest \
+                    claude/claude-opus-5-5 claude/claude-sonnet-5-5 \
+                    claude/claude-3-7-sonnet-latest claude/claude-3-5-sonnet-latest \
+                    claude/claude-3-5-haiku-latest
+                ;;
+            gemini)
+                printf '%s\n' \
+                    gemini/gemini-2.5-flash gemini-2.5-flash \
+                    gemini/gemini-2.5-pro gemini-2.5-pro \
+                    gemini/gemini-2.0-flash gemini-2.0-flash \
+                    gemini/gemini-1.5-pro gemini-1.5-pro \
+                    gemini/gemini-1.5-flash gemini-1.5-flash
+                ;;
+            abliteration)
+                printf '%s\n' \
+                    abliteration/abliterated-model-large-v2 abliterated-model-large-v2 \
+                    abliteration/abliterated-model-large abliterated-model-large \
+                    abliteration/abliterated-model abliterated-model
+                ;;
             *) return 0 ;;
         esac
-        local home="${CODEX_HOME:-$HOME/.codex}"
-        local cfg="${KIMI_CONFIG:-${KIMI_CODE_HOME:-$HOME/.kimi-code}/config.toml}"
-        {
-            jq -r --arg p "$1" '.models[]? | select((.visibility // "list") == "list") | "\($p)/\(.slug)"' "${home}/models_cache.json" 2>/dev/null
-            grep -oE "^\[models\.\"$1/[^\"]+\"\]" "${cfg}" 2>/dev/null | sed -E 's/^\[models\."([^"]+)"\]$/\1/'
-        } | sort -u
     }
     _kimo_provider_word() {
         local i
@@ -9901,7 +10484,7 @@ _kimo() {
                 return 0
             fi
             if [[ "${prev}" == "--provider" ]]; then
-                COMPREPLY=( $(compgen -W "ollama abliteration codex openai dashscope" -- "${cur}") )
+                COMPREPLY=( $(compgen -W "ollama abliteration codex openai dashscope qwencloud xai anthropic claude gemini grok" -- "${cur}") )
                 return 0
             fi
             if [[ "${cur}" == -* ]]; then
@@ -9983,7 +10566,7 @@ _kimo() {
             if [[ "${prev}" == "--cli" ]]; then
                 COMPREPLY=( $(compgen -W "all claude codex qwen grok kimi cursor agy opencode cyberstrike hermes openclaw gh" -- "${cur}") )
             elif [[ "${prev}" == "--provider" ]]; then
-                COMPREPLY=( $(compgen -W "all ollama gemini freetier openrouter web" -- "${cur}") )
+                COMPREPLY=( $(compgen -W "all ollama gemini freetier openrouter web codex qwen grok agy opencode kimi claude cursor cyberstrike hermes openclaw gh" -- "${cur}") )
             elif [[ "${cur}" == -* ]]; then
                 COMPREPLY=( $(compgen -W "--provider --cli --model --timeout --offline --no-refresh --show-all --json -h --help" -- "${cur}") )
             elif [[ ${cword} -eq $((cmd_idx+1)) ]]; then
@@ -10035,7 +10618,16 @@ _kimo() {
             ;;
         gemini|gemini-sync|kimi-gemini)
             if [[ "${cur}" == -* ]]; then
-                COMPREPLY=( $(compgen -W "--dry-run --list-only --output-json --from-json --save-json --verify --verify-prune --verify-timeout --jobs --stable-only --all --include --exclude --min-context --sort --limit --set-default --context-window --max-output --provider --base-url --api-key --api-key-env --config --verbose -h --help" -- "${cur}") )
+                COMPREPLY=( $(compgen -W "--status --token --export --json --dry-run --list-only --output-json --from-json --save-json --verify --verify-prune --verify-timeout --jobs --stable-only --all --include --exclude --min-context --sort --limit --set-default --context-window --max-output --provider --base-url --api-key --api-key-env --config --verbose -h --help" -- "${cur}") )
+            elif [[ $cword -eq $((cmd_idx + 1)) ]]; then
+                COMPREPLY=( $(compgen -W "status token export sync" -- "${cur}") )
+            fi
+            ;;
+        claude|claude-sync|kimi-claude)
+            if [[ "${cur}" == -* ]]; then
+                COMPREPLY=( $(compgen -W "--status --token --export --sync --set-default --json -h --help" -- "${cur}") )
+            elif [[ $cword -eq $((cmd_idx + 1)) ]]; then
+                COMPREPLY=( $(compgen -W "status token export sync set-default auth doctor update completion help" -- "${cur}") )
             fi
             ;;
         freetier|free-tier|kimi-sync)
@@ -10091,16 +10683,74 @@ EOFBASH
 # whatever kimi's config already registers, so '--provider codex' completion
 # offers codex/<slug> without any network probe.
 _kimo_hosted_models() {
-    case "$1" in
-        codex|openai) ;;
+    local p="$1"
+    [[ "${p}" == "grok" ]] && p="xai"
+    case "${p}" in
+        codex|openai)
+            local home="${CODEX_HOME:-$HOME/.codex}"
+            local cfg="${KIMI_CONFIG:-${KIMI_CODE_HOME:-$HOME/.kimi-code}/config.toml}"
+            {
+                jq -r --arg prov "${p}" '.models[]? | select((.visibility // "list") == "list") | "\($prov)/\(.slug)"' "${home}/models_cache.json" 2>/dev/null
+                grep -oE "^\[models\.\"${p}/[^\"]+\"\]" "${cfg}" 2>/dev/null | sed -E 's/^\[models\."([^"]+)"\]$/\1/'
+            } | sort -u
+            ;;
+        dashscope)
+            printf '%s\n' \
+                dashscope/qwen3.8-max qwen3.8-max \
+                dashscope/qwen3.8-flash qwen3.8-flash \
+                dashscope/qwen3.6-flash qwen3.6-flash \
+                dashscope/qwen3-coder-plus qwen3-coder-plus \
+                dashscope/qwen3-coder-turbo qwen3-coder-turbo \
+                dashscope/qwen-plus qwen-plus \
+                dashscope/qwen-turbo qwen-turbo \
+                dashscope/qwen-max qwen-max
+            ;;
+        qwencloud)
+            printf '%s\n' \
+                qwencloud/qwen3.8-max qwen3.8-max \
+                qwencloud/qwen3.8-flash qwen3.8-flash \
+                qwencloud/qwen3-coder-plus qwen3-coder-plus \
+                qwencloud/qwen3-coder-turbo qwen3-coder-turbo \
+                qwencloud/qwen-plus qwen-plus \
+                qwencloud/qwen-turbo qwen-turbo \
+                qwencloud/qwen-max qwen-max
+            ;;
+        xai)
+            printf '%s\n' \
+                xai/grok-4.7 grok-4.7 \
+                xai/grok-4.6 grok-4.6 \
+                xai/grok-4 grok-4 \
+                xai/grok-beta grok-beta \
+                xai/grok-2 grok-2 \
+                grok/grok-4.7 grok/grok-4.6 grok/grok-4 grok/grok-beta grok/grok-2
+            ;;
+        anthropic|claude)
+            printf '%s\n' \
+                anthropic/claude-opus-5-5 claude-opus-5-5 \
+                anthropic/claude-sonnet-5-5 claude-sonnet-5-5 \
+                anthropic/claude-3-7-sonnet-latest claude-3-7-sonnet-latest \
+                anthropic/claude-3-5-sonnet-latest claude-3-5-sonnet-latest \
+                anthropic/claude-3-5-haiku-latest claude-3-5-haiku-latest \
+                claude/claude-opus-5-5 claude/claude-sonnet-5-5 \
+                claude/claude-3-7-sonnet-latest claude/claude-3-5-sonnet-latest \
+                claude/claude-3-5-haiku-latest
+            ;;
+        gemini)
+            printf '%s\n' \
+                gemini/gemini-2.5-flash gemini-2.5-flash \
+                gemini/gemini-2.5-pro gemini-2.5-pro \
+                gemini/gemini-2.0-flash gemini-2.0-flash \
+                gemini/gemini-1.5-pro gemini-1.5-pro \
+                gemini/gemini-1.5-flash gemini-1.5-flash
+            ;;
+        abliteration)
+            printf '%s\n' \
+                abliteration/abliterated-model-large-v2 abliterated-model-large-v2 \
+                abliteration/abliterated-model-large abliterated-model-large \
+                abliteration/abliterated-model abliterated-model
+            ;;
         *) return 0 ;;
     esac
-    local home="${CODEX_HOME:-$HOME/.codex}"
-    local cfg="${KIMI_CONFIG:-${KIMI_CODE_HOME:-$HOME/.kimi-code}/config.toml}"
-    {
-        jq -r --arg p "$1" '.models[]? | select((.visibility // "list") == "list") | "\($p)/\(.slug)"' "${home}/models_cache.json" 2>/dev/null
-        grep -oE "^\[models\.\"$1/[^\"]+\"\]" "${cfg}" 2>/dev/null | sed -E 's/^\[models\."([^"]+)"\]$/\1/'
-    } | sort -u
 }
 _kimo_provider_word() {
     local i
@@ -10157,7 +10807,8 @@ _kimo() {
         'pull:Pull a model with live progress'
         'sync:Replicate models across cluster hosts'
         'freetier:Sync Kimi config with Model Studio free-tier quotas'
-        'gemini:Register Gemini API models in Kimi config'
+        'claude:Claude OAuth and session token bridge for Kimi Code and Claude CLI'
+        'gemini:Gemini OAuth tokens and API models in Kimi config'
         'codex:Codex OAuth and session token bridge for Kimi Code and Codex CLI'
         'run:Run an Ollama model directly'
         'launch:Launch external agent CLI'
@@ -10212,7 +10863,7 @@ _kimo() {
                     _arguments \
                         '(-m --model)'{-m,--model}'[Target model name]:model:_kimo_models' \
                         '(-c --ctx --context)'{-c,--ctx,--context}'[Override context window length]:tokens:' \
-                        '--provider[Inference backend]:backend:(ollama abliteration codex openai dashscope)' \
+                        '--provider[Inference backend]:backend:(ollama abliteration codex openai dashscope qwencloud xai anthropic claude gemini grok)' \
                         '(-W --webbridge)'{-W,--webbridge}'[Inject WebBridge skill into session]' \
                         '(--evict --no-evict)'{--evict,--no-evict}'[Unload / keep other models on the host]' \
                         '--dry-run[Show routing plan, start nothing]' \
@@ -10234,8 +10885,22 @@ _kimo() {
                     shells=(bash zsh)
                     _describe -t shells 'shell' shells
                     ;;
+                claude|claude-sync|kimi-claude)
+                    _arguments \
+                        '--status[Display status snapshot]' \
+                        '--token[Print resolved CLAUDE_CODE_OAUTH_TOKEN]' \
+                        '--export[Print export command for shell eval]' \
+                        '--sync[Synchronize Claude provider and models into Kimi config]' \
+                        '--set-default[Set default model in Kimi config]:model:' \
+                        '--json[Output in JSON format]' \
+                        '(-h --help)'{-h,--help}'[Show help]' && return 0
+                    ;;
                 gemini|gemini-sync|kimi-gemini)
                     _arguments \
+                        '--status[Display status snapshot]' \
+                        '--token[Print resolved GEMINI_AUTH_TOKEN / GEMINI_API_KEY]' \
+                        '--export[Print export command for shell eval]' \
+                        '--json[Output in JSON format]' \
                         '--dry-run[Plan and print, write nothing]' \
                         '--list-only[Print selected ids and exit]' \
                         '--output-json[Emit JSON rows]' \
@@ -10310,7 +10975,7 @@ _kimo() {
                     ;;
                 quota|quotas|quote)
                     _arguments \
-                        '--provider[Provider to query]:provider:(all ollama gemini freetier openrouter web)' \
+                        '*--provider[Provider or account to query]:provider:(all ollama gemini freetier openrouter web codex qwen grok agy opencode kimi claude cursor cyberstrike hermes openclaw gh)' \
                         '--cli[CLI account to query]:cli:(all claude codex qwen grok kimi cursor agy opencode cyberstrike hermes openclaw gh)' \
                         '--timeout[Per-source timeout in seconds]:seconds:' \
                         '--offline[List availability without live checks]' \

@@ -149,9 +149,11 @@ kimo [options] <command> [arguments...]
 | `update [cli\|all]`  | Check for updates for all installed CLIs, or apply updates | `kimo update` |
 | `completion [sh]`    | Generate shell tab-completion script for Bash or Zsh | `kimo completion bash` |
 | `freetier [opts]`    | Sync Kimi config with Model Studio free-tier quotas (`bl usage free`) | `kimo freetier --verify-prune` |
-| `gemini [opts]`      | Register Gemini API models (with exact token limits) into Kimi Code | `kimo gemini --verify-prune` |
+| `gemini [opts]`      | Register Gemini API models into Kimi Code, inspect OAuth token & accounts | `kimo gemini --token` |
+| `claude [opts\|cmd]` | Inspect Claude OAuth token, sync models into Kimi, or forward Claude CLI | `kimo claude --token` |
 | `codex [opts\|command]` | Inspect Codex authentication, sync models into Kimi, or forward native Codex commands | `kimo codex login --device-auth` |
 | `quota [cli] [opts]` | Check provider usage and every supported CLI account | `kimo quota codex --json` |
+| `kimi provider [cmd]` | List, disable/enable, or sync Kimi Code's LLM providers and model aliases | `kimo kimi provider sync --prune` |
 
 ---
 
@@ -170,6 +172,8 @@ kimo quotas kimi --no-refresh       # Use cached credentials without OAuth refre
 kimo quota claude --json            # Structured account windows and reset times
 kimo quota claude --no-refresh      # Read Claude usage without rotating OAuth credentials
 kimo quota --provider openrouter    # Existing provider filter
+kimo quota --provider codex,grok,agy  # Account adapters work as providers; comma-separate or repeat
+kimo quota --provider qwen --provider opencode
 kimo quota --offline --json         # Installation checks without network or CLI execution
 kimo quota --timeout 10             # Timeout budget per source (default 5s, maximum 60s)
 kimo --host localhost:11434 quota --provider ollama
@@ -184,11 +188,13 @@ kimo --host localhost:11434 quota --provider ollama
 | `agy` | Google Code Assist per-model quota buckets | Cached Antigravity OAuth token; discovers the existing quota project or uses `GOOGLE_CLOUD_PROJECT` / `GOOGLE_CLOUD_PROJECT_ID`. These are Code Assist buckets, not a complete Antigravity subscription budget. |
 | `cursor` | Team on-demand spend against enforced spending limits | Optional `CURSOR_ADMIN_API_KEY`; personal-plan usage remains in the dashboard. [Admin API](https://cursor.com/docs/account/teams/admin-api) |
 | `qwen` | Bailian free-tier balances or configured OpenRouter budget | Qwen settings or provider environment; Bailian requires `bl` console login. Qwen OAuth daily remaining quota has no supported headless readout. |
-| `opencode` | Selected provider's OpenRouter budget or configured Ollama status | Reads local JSON/JSONC config and environment references; remote organization and managed overrides are not evaluated. |
+| `opencode` | Selected provider's OpenRouter budget or configured Ollama status; OpenCode's own provider points at the Console | Reads local JSON/JSONC config and environment references; remote organization and managed overrides are not evaluated. OpenCode Console balance and monthly limits have no API, so `opencode/*` models report `unavailable` with Console guidance. |
 | `hermes` | Configured OpenRouter budget, Ollama status, or local session usage | Provider environment / `.hermes/.env`; optionally set `HERMES_USAGE_FILE` to an existing `--usage-file` report. Local estimates are labelled separately. |
 | `grok` | Native subscription credits, billing period, on-demand cap/spend, prepaid balance, plan, and billing history | Existing `grok login`; probes `_x.ai/billing` via `grok agent stdio`. Uses the native client's authentication/refresh. Older clients without billing support can fall back to a configured OpenRouter/Ollama backend. [Official billing protocol](https://github.com/xai-org/grok-build/blob/main/crates/codegen/xai-grok-shell/src/extensions/billing.rs) |
 | `cyberstrike` | Configured OpenRouter budget or Ollama status | Provider environment; otherwise guidance for checking the configured provider. |
 | `gh` | Native GitHub API rate-limit resources | Existing `gh` authentication; these limits do not represent Copilot premium requests. |
+
+`--provider` accepts the service providers above and any CLI account name (`codex`, `qwen`, `grok`, `agy`, `opencode`, ...); `all` cannot be mixed with other names. Account results stay under `clis` in JSON.
 
 Every CLI remains visible even when it is missing, offline, unauthenticated, or cannot expose quota. Unsupported account checks return `unavailable` with instructions, rather than an invented balance. Ollama is marked `not_metered`; Gemini model token limits are labelled as context limits, with account quota unavailable. `--model` filters model-specific data while retaining account-wide windows.
 
@@ -348,6 +354,10 @@ kimo launch codex --provider ollama --model my-model --ctx 32768 -- exec "Explai
 kimo --remote launch codex --provider ollama --model my-model
 kimo launch codex --provider codex -c 'model_reasoning_effort="high"'
 kimo launch codex --provider codex --dry-run
+kimo launch codex --provider dashscope              # Responses wire, default qwen3.8-max
+kimo launch codex --provider qwencloud --model qwen3-coder-plus
+kimo launch codex --provider xai                    # alias: --provider grok
+kimo launch codex --provider anthropic --dry-run
 ```
 
 Ollama remains the default backend. OpenAI has two backends, and their credentials are not interchangeable:
@@ -375,32 +385,79 @@ Sync reads the visible models, context sizes, input capabilities, and reasoning 
 
 A ChatGPT access token expires after a few hours, so kimo renews it from `auth.json`'s `refresh_token` (the same call the Codex CLI makes) whenever `launch --provider codex`, `kimo codex --token` or `--export` needs a working credential. The renewed token is written back atomically at mode `0600` and is never printed or passed in argv; no plaintext backup of a credential file is left behind. Set `KIMO_CODEX_NO_REFRESH=1` to stay offline (`KIMO_CODEX_TOKEN_URL` / `KIMO_CODEX_REFRESH_TIMEOUT` override the endpoint and its timeout). `kimo codex` reports the refresh token and last renewal; `kimo codex --json` exposes `refreshable` and `last_refresh`. OpenAI Platform API keys cannot authenticate the ChatGPT endpoint — use `--provider openai` for those.
 
-## Google Gemini API Model Sync (`gemini`)
+## Claude Code Authentication & Model Sync (`claude`)
 
-`kimo gemini` registers Google Gemini API models directly into Kimi Code (`~/.kimi-code/config.toml`). It queries the `/v1beta/models` endpoint (paginated) for every model visible to your API key, maps each model's genuine architectural token limits (`inputTokenLimit` &rarr; `max_context_size`, `outputTokenLimit` &rarr; `max_output_size`), detects thinking capability, and populates a managed `[providers.gemini]` block with native `google-genai` provider protocol and `[models."gemini/<id>"]` aliases.
-
-Non-chat models (media generation, TTS, live audio streams, embeddings, and autonomous agents) are automatically filtered out unless `--all` is passed. Like other `kimo` config mutations, edits are surgical, validated against `kimi doctor`, and preceded by timestamped backups (`config.toml.before-gemini-*`).
+`kimo claude` inspects Claude Code OAuth authentication (`~/.claude/.credentials.json`), manages tokens, and syncs Claude models into Kimi Code's configuration (`[providers.anthropic]`):
 
 ```bash
-# Preview models that would be added (writes nothing)
-kimo gemini --dry-run
-
-# Probe candidate models with a 1-token prompt, prune any failing models, and write config
-kimo gemini --verify --verify-prune
-
-# Register only stable release models (drop preview / experimental tags)
-kimo gemini --stable-only
-
-# Reference GEMINI_API_KEY environment variable instead of hardcoding key into config.toml
-kimo gemini --api-key-env GEMINI_API_KEY
-
-# Set Gemini 2.5 Flash as the default model in Kimi Code
-kimo gemini --set-default gemini/gemini-2.5-flash
-
-# Launch Kimi Code CLI directly with a registered Gemini model
-kimi -m gemini/gemini-2.5-flash
-kimi -m gemini/gemini-2.5-pro
+kimo claude                              # Inspect Claude OAuth session, expiration and plan
+kimo claude --token                      # Print active Claude Code OAuth token
+kimo claude --export                     # Output export statements for CLAUDE_CODE_OAUTH_TOKEN / ANTHROPIC_AUTH_TOKEN
+kimo claude --json                       # Structured JSON output
+kimo claude --sync                       # Sync Claude models (claude-opus-5-5, etc.) into Kimi config
+kimo claude --set-default                # Sync and set claude-opus-5-5 as default model in Kimi
+kimo claude auth login                   # Native command forwarding directly to Claude CLI
 ```
+
+## Google Gemini API Model Sync & Token Management (`gemini`)
+
+`kimo gemini` inspects Google / Gemini CLI authentication (`~/.gemini/antigravity-cli/antigravity-oauth-token`), provides token export and automatic refresh, and registers Google Gemini API models directly into Kimi Code (`~/.kimi-code/config.toml`):
+
+```bash
+# Token & Authentication inspection
+kimo gemini                              # Inspect Gemini account, OAuth expiration & credentials
+kimo gemini --token                      # Output active OAuth bearer token or API key
+kimo gemini --export                     # Output eval-able shell export statement
+kimo gemini --json                       # Structured JSON authentication and model status
+
+# Model synchronization
+kimo gemini --verify --verify-prune      # Probe candidate models, prune failing, write config
+kimo gemini --stable-only                # Register stable models only
+kimo gemini --set-default gemini/gemini-2.5-flash
+```
+
+---
+
+## Kimi Code Provider Management (`kimi provider`)
+
+`kimo kimi provider` manages the `[providers.*]` blocks and `[models."<provider>/*"]` aliases in Kimi Code's `~/.kimi-code/config.toml` (`$KIMI_CONFIG` overrides the path). Every change is written atomically while holding kimo's Kimi config lock.
+
+```bash
+# Every provider, its type, alias count and whether it is enabled (* = default model's provider)
+kimo kimi provider list
+
+# Hide a provider from Kimi's /model picker without losing anything, then bring it back
+kimo kimi provider disable groq
+kimo kimi provider enable groq
+
+# Check every provider's key against its /models endpoint and add the models it serves
+kimo kimi provider sync
+kimo kimi provider sync groq
+
+# Preview, then remove aliases for models a provider no longer serves
+kimo kimi provider sync --prune --dry-run
+kimo kimi provider sync --prune
+
+# Add OpenCode Zen (paid models) with your own key
+OPENCODE_API_KEY=... kimo kimi provider sync opencode
+```
+
+**disable / enable.** Disable moves the provider block and every alias that belongs to it (by its `provider` field or a `<name>/` prefix) into `[disabled_providers]` and `[disabled_models]`. Kimi never reads those tables, but keeps them when it rewrites the file. If `default_model` pointed at the provider, it is cleared and remembered in `[disabled_defaults]`; enable puts the aliases back and restores that default, unless another default was chosen in the meantime. Running `enable` on an already enabled provider also recovers aliases an older kimo left hidden.
+
+**sync.** For each provider kimo resolves the key (`api_key_env` or `api_key`), asks the provider's own `base_url` for its model list, and adds or refreshes `[models."<provider>/<model>"]` with display names and context/output limits. Keys only ever go to that `base_url`, in a header (`Authorization`, `x-api-key` or `x-goog-api-key`), and redirects are never followed. Provider types: `openai`, `anthropic` (`base_url` used as given, `/v1` added when missing), `google-genai`, and `openai_responses` (models from Codex's `models_cache.json`); Kimi-managed OAuth providers are skipped. Embedding, speech, image and moderation models are left out unless `--include-nonchat`.
+
+| Option | Effect |
+|---|---|
+| `--all` | Sync every provider (the default when no name is given) |
+| `--prune` | Remove aliases for models the provider no longer serves (never the current `default_model`) |
+| `--dry-run` | Report what would change without writing |
+| `--include-nonchat` | Keep embedding, speech, image and moderation models |
+| `--timeout <s>` / `--jobs <n>` | Per-provider HTTP timeout (default 8) and parallel checks (default 4) |
+| `--json` | Machine-readable results |
+
+Statuses `ok`, `empty`, `skipped`, `no-credential`, `no-models-endpoint` and `no-cache` are informational. The command exits 1 only when a provider is actually broken: `bad-key`, `rate-limited`, `redirected`, `unreachable`, `http-error`, `parse-error` or `no-base-url`.
+
+**OpenCode Zen.** `sync opencode` adds `[providers.opencode]` (`https://opencode.ai/inference/openai/v1`, key read from `$OPENCODE_API_KEY` and never written to the config; create one at https://opencode.ai/auth) once the key checks out. Only paid chat-completions models are aliased: free-tier models answer only the OpenCode client (kimi gets HTTP 403), and models on the `/responses` or `/messages` wire formats are skipped. Free and paid are told apart with models.dev pricing, from OpenCode's cache (`~/.cache/opencode/models.json`) or from https://models.dev when that cache is missing, has no Zen section, or lacks a model Zen serves. kimo warns when no price list is available, and names models it had to add without pricing.
 
 ---
 
@@ -720,7 +777,7 @@ Other models already loaded on the target host are **not** unloaded unless you a
 
 ### Cloud Provider: DashScope (Alibaba Model Studio)
 
-`--provider dashscope` routes a launch at Alibaba Model Studio. The credential's class picks the surface: `sk-ws-`/`sk-` keys go to the pay-as-you-go international endpoint (`https://dashscope-intl.aliyuncs.com/compatible-mode/v1`), `sk-sp-` token-plan keys to the subscription endpoint (`https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1`) — each class 401s on the other's surface. It is wired for **`kimi`** and **`claude`**; every other CLI stays on Ollama routing and errors out if you ask it to use the provider.
+`--provider dashscope` routes a launch at Alibaba Model Studio. The credential's class picks the surface: `sk-ws-`/`sk-` keys go to the pay-as-you-go international endpoint (`https://dashscope-intl.aliyuncs.com/compatible-mode/v1`), `sk-sp-` token-plan keys to the subscription endpoint (`https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1`) — each class 401s on the other's surface. It is wired for **`kimi`**, **`claude`**, and **`codex`**; every other CLI stays on Ollama routing and errors out if you ask it to use the provider.
 
 ```bash
 export DASHSCOPE_API_KEY="sk-..."        # MODELSTUDIO_API_KEY is accepted too
@@ -733,7 +790,19 @@ kimo launch kimi --provider dashscope --ctx 131072 --dry-run
 kimo config set cloud_provider dashscope                    # make it the default backend
 ```
 
-kimi rides its zero-footprint `KIMI_MODEL_*` env channel (wire type `openai`, reasoning key `reasoning_content`, context 1,000,000 unless `--ctx` or `KIMO_DASHSCOPE_CTX` says otherwise), so nothing is written to kimi's config and the key never reaches argv or disk. claude rides each surface's Anthropic-compatible `/apps/anthropic` endpoint with the bearer in `ANTHROPIC_AUTH_TOKEN` and a tier mapping that keeps its internal requests on Model Studio models (`haiku`→`qwen3.6-flash`, `sonnet`→`qwen3.8-flash`, `opus`→`qwen3.8-max`, subagents `auto`, context 983,616; all overridable via `KIMO_DASHSCOPE_CLAUDE_*`). Without `-m`, kimi defaults to `qwen3.8-max` and claude to `auto`.
+kimi rides its zero-footprint `KIMI_MODEL_*` env channel (wire type `openai`, reasoning key `reasoning_content`, context 1,000,000 unless `--ctx` or `KIMO_DASHSCOPE_CTX` says otherwise), so nothing is written to kimi's config and the key never reaches argv or disk. claude rides each surface's Anthropic-compatible `/apps/anthropic` endpoint with the bearer in `ANTHROPIC_AUTH_TOKEN` and a tier mapping that keeps its internal requests on Model Studio models (`haiku`→`qwen3.6-flash`, `sonnet`→`qwen3.8-flash`, `opus`→`qwen3.8-max`, subagents `auto`, context 983,616; all overridable via `KIMO_DASHSCOPE_CLAUDE_*`). Without `-m`, kimi defaults to `qwen3.8-max` and claude to `auto`. **codex** rides the same compatible-mode origin on the Responses wire (`POST {base}/responses`). kimo passes it as `-c model_providers.dashscope` overlays (`env_key` names `DASHSCOPE_API_KEY` or `MODELSTUDIO_API_KEY`, `requires_openai_auth=false`) and does not modify `config.toml`. The default model is `qwen3.8-max`.
+
+### Codex Responses providers (`qwencloud`, `xai`, `anthropic`)
+
+`kimo launch codex --provider` can also target three more Responses endpoints. Codex CLI 0.164 accepts only `wire_api = "responses"` (it rejects `chat`). These providers are **codex-only**. The key stays in the environment; `--dry-run` masks it; nothing is written to `~/.codex/config.toml` or placed in argv. `--oss` is not set, and a ChatGPT login is not required. Codex's multi-agent tools, and the TUI's `codex_worktrees` MCP server, are sent as `{"type":"namespace"}`. These endpoints reject that variant with HTTP 422. Codex 0.164 also sends `external_web_access` on `web_search`, which xAI rejects with HTTP 400 (`Argument not supported: external_web_access`) before the model runs. The launch disables multi-agent and, through a localhost proxy, flattens remaining namespace tools and drops `external_web_access`, `indexed_web_access`, and `search_context_size`. Cached web search (`external_web_access: false`) is omitted, because these endpoints have no cached-only search. Live and indexed search stay, with `filters`, `user_location`, and `search_content_types` kept. The key still goes only to the upstream.
+
+| Provider | Default endpoint | Credential | Default model | Context |
+| --- | --- | --- | --- | --- |
+| `qwencloud` | `https://ap-southeast-1.maas.qwencloudapi.com/compatible-mode/v1` | `QWENCLOUD_API_KEY`, else `DASHSCOPE_API_KEY`, else `MODELSTUDIO_API_KEY` | `qwen3.8-max` | 1,000,000 |
+| `xai` (`grok`) | `https://api.x.ai/v1` | `XAI_API_KEY` | `grok-4.7` | 500,000 |
+| `anthropic` | `https://api.anthropic.com/v1` | `ANTHROPIC_API_KEY`, else `ANTHROPIC_AUTH_TOKEN` | `claude-opus-5-5` | 1,000,000 |
+
+An `sk-sp-` key selects QwenCloud's token-plan host (`https://token-plan.maas.qwencloudapi.com/compatible-mode/v1`) unless `KIMO_QWENCLOUD_BASE_URL` is set. `KIMO_QWENCLOUD_REGION` changes the pay-as-you-go region (default `ap-southeast-1`). `KIMO_XAI_BASE_URL` and `KIMO_ANTHROPIC_BASE_URL` override those origins. `KIMO_ANTHROPIC_BASE_URL` is the Responses base Codex posts to; it is separate from Claude Code's `ANTHROPIC_BASE_URL`. A `qwencloud/`, `xai/`, `grok/`, or `anthropic/` prefix on `--model` is stripped. `--ctx` overrides the context window Codex is told about (`model_context_window`).
 
 With no usable key in the environment at all, `launch kimi --provider dashscope` falls back to the freetier-managed `[providers.alibaba]` block (`kimo freetier`, quota data from `bl usage free`): kimi launches with `-m alibaba/<model>` against its own stored credential, so the free-tier surface works with no secret from kimo. `bl auth login --console --console-site international` refreshes the quota data when it expires. Like every hosted backend it skips host probing, Ollama tag resolution, eviction and tune settings.
 
