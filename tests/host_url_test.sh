@@ -35,6 +35,11 @@ http://gpu.lan:8080/ollama|http://gpu.lan:8080/ollama
 http://[fe80::1]|http://[fe80::1]:11434
 http://user:pw@gpu.lan|http://user:pw@gpu.lan:11434
 http://user:pw@gpu.lan:9|http://user:pw@gpu.lan:9
+::1|http://[::1]:11434
+http://fe80::1|http://[fe80::1]:11434
+https://::1|https://[::1]
+http://gpu.lan//|http://gpu.lan:11434
+https://example.invalid/ollama//|https://example.invalid/ollama
 EOF
 )
 

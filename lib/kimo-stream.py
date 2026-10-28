@@ -100,14 +100,18 @@ def normalize_url(url):
     keep their own port, a port never lands after the path, and an IPv6
     literal's colons are not mistaken for one."""
     url = (url or "").strip()
-    url = url[:-1] if url.endswith("/") else url
     scheme, rest = "http", url
     match = re.match(r"([A-Za-z][A-Za-z0-9+.-]*)://(.*)$", url)
     if match:
         scheme, rest = match.group(1).lower(), match.group(2)
+    rest = rest.rstrip("/")
     authority, slash, path = rest.partition("/")
     path = slash + path
-    hostport = authority.rsplit("@", 1)[-1]
+    userinfo, at, hostport = authority.rpartition("@")
+    # A bare IPv6 literal (::1, fe80::1) needs brackets before a port can follow.
+    if hostport.count(":") > 1 and re.fullmatch(r"[0-9A-Fa-f:.]+", hostport):
+        hostport = f"[{hostport}]"
+        authority = userinfo + at + hostport
     if scheme == "http" and not path and not re.fullmatch(r"(\[[^]]*\]|[^:]+):[0-9]+", hostport):
         authority += ":11434"
     return f"{scheme}://{authority}{path}"
@@ -414,24 +418,48 @@ def save_tuning(model_name, options: dict, merge=True):
         os.close(fd)
 
 
+def match_tuning(tunings, model_name):
+    """The tunings key model_name names, and the keys it could mean.
+
+    Returns (key, candidates): key is the one entry meant - an exact or
+    case-insensitive match, '<name>:latest', or the only '<name>:<tag>' - or
+    None. clear_tuning deletes what this returns, so a bare name never
+    resolves by substring ('llama' must not pick 'my-llama-coder:7b'), and a
+    name with several tags resolves to none of them.
+    """
+    if model_name in tunings:
+        return model_name, [model_name]
+    lowered = model_name.lower()
+    exact = [name for name in tunings if name.lower() == lowered]
+    if len(exact) == 1:
+        return exact[0], exact
+    if exact:
+        return None, exact
+    if ":" not in model_name:
+        latest = f"{lowered}:latest"
+        for name in tunings:
+            if name.lower() == latest:
+                return name, [name]
+        tagged = [name for name in tunings if name.lower().startswith(f"{lowered}:")]
+        return (tagged[0] if len(tagged) == 1 else None), tagged
+    return None, []
+
+
 def clear_tuning(model_name):
-    """Remove tuning options for model_name from TUNINGS_FILE."""
+    """Remove tuning options for model_name from TUNINGS_FILE.
+
+    Returns (removed key or None, candidate keys); candidates name the
+    choices when model_name is ambiguous.
+    """
     if not os.path.exists(TUNINGS_FILE):
-        return None
+        return None, []
     lock_path = TUNINGS_FILE + ".lock"
     os.makedirs(os.path.dirname(lock_path), exist_ok=True)
     fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o644)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX)
         tunings = load_tunings()
-        matched = None
-        for name in list(tunings):
-            if name == model_name or name.lower() == model_name.lower():
-                matched = name
-                break
-            if name.startswith(f"{model_name}:") or model_name in name:
-                matched = name
-                break
+        matched, candidates = match_tuning(tunings, model_name)
         if matched and matched in tunings:
             del tunings[matched]
             tmp = TUNINGS_FILE + ".tmp"
@@ -439,8 +467,8 @@ def clear_tuning(model_name):
                 json.dump(tunings, f, indent=2, sort_keys=True)
                 f.write("\n")
             os.replace(tmp, TUNINGS_FILE)
-            return matched
-        return None
+            return matched, candidates
+        return None, candidates
     finally:
         fcntl.flock(fd, fcntl.LOCK_UN)
         os.close(fd)
@@ -1397,16 +1425,22 @@ def main():
         if not target_name:
             print("error: a MODEL is required for --clear-tuning", file=sys.stderr)
             return 2
-        removed = clear_tuning(target_name)
+        removed, candidates = clear_tuning(target_name)
+        ambiguous = not removed and len(candidates) > 1
         if args.as_json:
-            print(json.dumps({"status": "ok" if removed else "not_found", "model": target_name, "removed": removed, "tunings_file": TUNINGS_FILE}, indent=2))
+            status = "ok" if removed else "ambiguous" if ambiguous else "not_found"
+            print(json.dumps({"status": status, "model": target_name, "removed": removed,
+                              "candidates": candidates if ambiguous else [], "tunings_file": TUNINGS_FILE}, indent=2))
             return 0 if removed else 1
         if removed:
             print(f"[✓] Cleared tuning options for '{removed}' in {TUNINGS_FILE}")
             return 0
-        else:
-            print(f"[-] No tuning options found for '{target_name}' in {TUNINGS_FILE}", file=sys.stderr)
+        if ambiguous:
+            print(f"[-] '{target_name}' matches several tuned models ({', '.join(candidates)}); "
+                  "name one exactly. Nothing was cleared.", file=sys.stderr)
             return 1
+        print(f"[-] No tuning options found for '{target_name}' in {TUNINGS_FILE}", file=sys.stderr)
+        return 1
 
     if args.tune and not cli_tuning and not args.model:
         print("error: --tune requires a MODEL and at least one option (--ctx, --temp, --predict, --batch, --gpu)",

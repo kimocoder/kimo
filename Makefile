@@ -315,8 +315,9 @@ test-install-packages:
 	@tests/install_packages_test.sh
 
 clean:
-	@echo "[*] Cleaning temporary and backup files..."
+	@echo "[*] Cleaning temporary, backup and bytecode files..."
 	@rm -f *~ *.tmp *.bak
+	@rm -rf lib/__pycache__ tests/__pycache__ tests/lib/__pycache__
 	@echo "[✓] Clean."
 
 test-extra: test-config-validate test-rotate-token test-jq-guard test-pull-json test-backup-prune test-web-url-esc test-gh-guard test-model-args test-launch-contract test-sync test-model-commands test-shim test-install-packages test-config-rules test-hardening test-host-url test-web-bridge test-option-values test-update-lookup test-codex-update test-qwen-update test-cli-health test-provider-sync test-kimi-provider

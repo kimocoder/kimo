@@ -28,6 +28,7 @@ Environment: KIMO_SHIM_UPSTREAM_TOKEN, when set, is sent as
 from __future__ import annotations
 
 import argparse
+import hmac
 import json
 import logging
 import math
@@ -297,6 +298,23 @@ class GeminiShimHandler(BaseHTTPRequestHandler):
     def _send_error(self, code: int, message: str) -> None:
         self._send_json_response(code, error_body(code, message))
 
+    def _authorized(self) -> bool:
+        """With a client key configured, require it as Gemini clients send it:
+        the x-goog-api-key header or a ?key= query parameter. Without this any
+        local process (or a web page that guesses the port) could drive the
+        upstream, and with it the bridge token the shim attaches."""
+        expected = self.server.client_key
+        if not expected:
+            return True
+        given = self.headers.get("x-goog-api-key", "")
+        if not given:
+            query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            given = (query.get("key") or [""])[0]
+        if hmac.compare_digest(given.encode("utf-8"), expected.encode("utf-8")):
+            return True
+        self._send_error(401, "Missing or invalid API key for this shim.")
+        return False
+
     def _model_entry(self, name: str) -> dict:
         return {"name": f"models/{name}", "displayName": name, "supportedGenerationMethods": list(METHODS)}
 
@@ -315,6 +333,8 @@ class GeminiShimHandler(BaseHTTPRequestHandler):
 
         if path in ("/healthz", "/health"):
             self._send_json_response(200, {"status": "ok", "service": "ollama-gemini-shim"})
+            return
+        if not self._authorized():
             return
 
         if path in ("/v1beta/models", "/v1/models"):
@@ -355,6 +375,8 @@ class GeminiShimHandler(BaseHTTPRequestHandler):
         return body
 
     def do_POST(self) -> None:
+        if not self._authorized():
+            return
         parsed = urllib.parse.urlparse(self.path)
         match = MODEL_PATH.match(parsed.path)
         if not match:
@@ -471,7 +493,7 @@ class GeminiShimServer(ThreadingHTTPServer):
     daemon_threads = True
 
     def __init__(self, server_address: tuple[str, int], upstream: str, default_model: str,
-                 upstream_token: str = ""):  # nosec B107 - empty means no upstream auth
+                 upstream_token: str = "", client_key: str = ""):  # nosec B107 - empty means no auth
         # The upstream is opened with urllib, which would also follow file:// or
         # custom schemes; only an Ollama HTTP(S) endpoint is acceptable.
         if urllib.parse.urlparse(upstream).scheme not in ("http", "https"):
@@ -482,6 +504,9 @@ class GeminiShimServer(ThreadingHTTPServer):
         # Bearer token for a token-protected bridge in front of Ollama. It comes
         # from the environment, never argv, and goes only to the upstream.
         self.upstream_auth = f"Bearer {upstream_token}" if upstream_token else ""
+        # Key clients must present (see GeminiShimHandler._authorized); also
+        # from the environment only. Empty leaves the shim open, as before.
+        self.client_key = client_key
 
 
 def main() -> None:
@@ -495,7 +520,8 @@ def main() -> None:
 
     try:
         server = GeminiShimServer((args.host, args.port), args.upstream, args.default_model,
-                                  os.environ.get("KIMO_SHIM_UPSTREAM_TOKEN", ""))
+                                  os.environ.get("KIMO_SHIM_UPSTREAM_TOKEN", ""),
+                                  client_key=os.environ.get("KIMO_SHIM_CLIENT_KEY", ""))
     except ValueError as exc:
         parser.error(str(exc))
     bound_port = server.server_address[1]

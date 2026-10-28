@@ -226,7 +226,16 @@ load_kimo_config() {
     if [[ -n "${KIMO_CONFIG_VALUES[webbridge_url]:-}" && -z "${KIMO_WEBBRIDGE_URL:-}" ]]; then
         WEBBRIDGE_URL="${KIMO_CONFIG_VALUES[webbridge_url]}"
     fi
-    if [[ -n "${KIMO_CONFIG_VALUES[webbridge_port]:-}" && -z "${KIMO_WEBBRIDGE_PORT:-}" ]]; then
+    # The env port is interpolated into the URL and 'web status --json' like a
+    # file value, so it gets the same check; a bad one falls back to config/default.
+    local why env_port="${KIMO_WEBBRIDGE_PORT:-}"
+    if [[ -n "${env_port}" ]] && ! why=$(_kimo_config_check webbridge_port "${env_port}"); then
+        KIMO_CONFIG_IGNORED+=("KIMO_WEBBRIDGE_PORT: ${why}")
+        env_port=""
+        WEBBRIDGE_PORT=10086
+        [[ -z "${KIMO_WEBBRIDGE_URL:-}" ]] && WEBBRIDGE_URL="http://127.0.0.1:10086/command"
+    fi
+    if [[ -n "${KIMO_CONFIG_VALUES[webbridge_port]:-}" && -z "${env_port}" ]]; then
         WEBBRIDGE_PORT="${KIMO_CONFIG_VALUES[webbridge_port]}"
         # Rebuild the URL only if no full custom URL is set
         if [[ "${WEBBRIDGE_URL}" == "http://127.0.0.1:10086/command" ]]; then
@@ -242,7 +251,6 @@ load_kimo_config() {
     fi
     # Both are interpolated into printed curl/JS snippets and URLs, so an env
     # value gets the same check as a file value.
-    local why
     if ! why=$(_kimo_config_check web_max_results "${WEB_MAX_RESULTS}"); then
         KIMO_CONFIG_IGNORED+=("KIMO_WEB_MAX_RESULTS: ${why}")
         WEB_MAX_RESULTS=10
@@ -833,16 +841,23 @@ command_needs_remote() {
 #   proxies such as https://example.com/ollama) keep their own default port,
 #   and an added port always goes on the authority, never after the path.
 normalize_host_url() {
-    local url="${1%/}" scheme="http" rest authority path="" hostport
+    local url="$1" scheme="http" rest authority path="" hostport userinfo=""
     if [[ "${url}" =~ ^([A-Za-z][A-Za-z0-9+.-]*)://(.*)$ ]]; then
         scheme="${BASH_REMATCH[1],,}"
         rest="${BASH_REMATCH[2]}"
     else
         rest="${url}"
     fi
+    while [[ "${rest}" == */ ]]; do rest="${rest%/}"; done
     authority="${rest%%/*}"
     [[ "${rest}" == */* ]] && path="/${rest#*/}"
     hostport="${authority##*@}"
+    [[ "${authority}" == *@* ]] && userinfo="${authority%@*}@"
+    # A bare IPv6 literal (::1, fe80::1) needs brackets before a port can follow.
+    if [[ "${hostport}" == *:*:* && "${hostport}" =~ ^[0-9A-Fa-f:.]+$ ]]; then
+        hostport="[${hostport}]"
+        authority="${userinfo}${hostport}"
+    fi
     if [[ "${scheme}" == "http" && -z "${path}" && ! "${hostport}" =~ ^(\[[^]]*\]|[^:]+):[0-9]+$ ]]; then
         authority="${authority}:11434"
     fi
@@ -1987,7 +2002,7 @@ def detect_subnets(all_interfaces=False):
                 iface = parts[1]
                 cidr = parts[3]
                 if not all_interfaces:
-                    if iface == "lo" or iface.startswith(("docker", "br-", "veth", "virbr", "cni", "flannel")):
+                    if iface == "lo" or iface.startswith(("docker", "br-", "veth", "virbr", "cni", "flannel", "podman")):
                         continue
                 try:
                     net = ipaddress.ip_network(cidr, strict=False)
@@ -3785,6 +3800,26 @@ cmd_tune() {
         esac
     done
 
+    # Checked here, not in the Python writer: a bad value would otherwise be a
+    # traceback, or (a negative ctx) be persisted and applied to every run.
+    local _opt _val
+    for _opt in ctx batch predict; do
+        _val="opt_${_opt}"
+        if [[ -n "${!_val}" && ! "${!_val}" =~ ^[1-9][0-9]*$ ]]; then
+            echo "${C_RED}Error: --${_opt} needs a positive whole number, got '${!_val}'.${C_RESET}" >&2
+            exit 1
+        fi
+    done
+    # num_gpu: layers to offload; 0 is CPU-only and -1 lets Ollama decide.
+    if [[ -n "${opt_num_gpu}" && ! "${opt_num_gpu}" =~ ^(-1|[0-9]+)$ ]]; then
+        echo "${C_RED}Error: --num-gpu needs a whole number of layers (0 = CPU only, -1 = auto), got '${opt_num_gpu}'.${C_RESET}" >&2
+        exit 1
+    fi
+    if [[ -n "${opt_temp}" && ! "${opt_temp}" =~ ^([0-9]+(\.[0-9]*)?|\.[0-9]+)$ ]]; then
+        echo "${C_RED}Error: --temp needs a non-negative number such as 0.7, got '${opt_temp}'.${C_RESET}" >&2
+        exit 1
+    fi
+
     local active_host=""
     local resolved_source="${source_model}"
     if [[ -n "${TARGET_HOST}" ]]; then
@@ -3825,24 +3860,47 @@ cmd_tune() {
             fi
         fi
         if ${opt_clear}; then
-            python3 -c '
-import json, os, sys
-f = sys.argv[1]
-m = sys.argv[2]
+            local clear_state
+            if ! clear_state=$(python3 - "${TUNINGS_FILE}" "${resolved_source}" <<'PY'
+import fcntl, json, os, sys
+f, m = sys.argv[1], sys.argv[2]
 if not os.path.exists(f):
+    print("absent")
     sys.exit(0)
-d = json.load(open(f)) or {}
-removed = d.pop(m, None)
-if removed is not None:
+try:
+    # The lock lib/kimo-stream.py takes too, so 'stream --tune' cannot
+    # interleave with this read-modify-write.
+    fd = os.open(f + ".lock", os.O_CREAT | os.O_RDWR, 0o644)
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    with open(f, encoding="utf-8") as fh:
+        text = fh.read()
+    d = json.loads(text) if text.strip() else {}
+    d = {} if d is None else d
+    if not isinstance(d, dict):
+        raise ValueError("expected a JSON object")
+    if m not in d:
+        print("absent")
+        sys.exit(0)
+    del d[m]
     tmp = f + ".tmp"
     with open(tmp, "w", encoding="utf-8") as fh:
         json.dump(d, fh, indent=2, sort_keys=True)
         fh.write("\n")
     os.replace(tmp, f)
-    print("removed:" + m)
-else:
-    print("absent")' "${TUNINGS_FILE}" "${resolved_source}" || true
-            echo "${C_GREEN}[✓] Cleared tuned defaults for '${resolved_source}'.${C_RESET}"
+except (OSError, ValueError) as e:
+    print(f"{f}: {e}", file=sys.stderr)
+    sys.exit(1)
+print("removed")
+PY
+            ); then
+                echo "${C_RED}Error: could not clear tuned defaults for '${resolved_source}' (see above); ${TUNINGS_FILE} is unchanged.${C_RESET}" >&2
+                exit 1
+            fi
+            if [[ "${clear_state}" == removed ]]; then
+                echo "${C_GREEN}[✓] Cleared tuned defaults for '${resolved_source}'.${C_RESET}"
+            else
+                echo "${C_DIM}No tuned defaults registered for '${resolved_source}'; nothing to clear.${C_RESET}"
+            fi
         fi
         exit 0
     fi
@@ -3861,6 +3919,7 @@ OM_opt_batch = _om_os.environ["OM_opt_batch"]
 OM_opt_predict = _om_os.environ["OM_opt_predict"]
 OM_opt_temp = _om_os.environ["OM_opt_temp"]
 OM_opt_num_gpu = _om_os.environ["OM_opt_num_gpu"]
+import fcntl
 import json
 import os
 import sys
@@ -3889,19 +3948,35 @@ if not params:
 
 # 1) Persist as per-model defaults so 'run'/'launch' apply them automatically
 #    (baked per-model tuning; the base model manifest is left untouched).
-tunings = {}
-if os.path.exists(tunings_file):
-    try:
+#    New options merge into the model's existing ones, as 'kimo stream --tune'
+#    does: 'tune m --temp 0.2' after 'tune m --ctx 8192' keeps num_ctx.
+try:
+    os.makedirs(os.path.dirname(tunings_file) or ".", exist_ok=True)
+    # The lock lib/kimo-stream.py takes too, so the two writers serialize.
+    lock_fd = os.open(tunings_file + ".lock", os.O_CREAT | os.O_RDWR, 0o644)
+    fcntl.flock(lock_fd, fcntl.LOCK_EX)
+    tunings = {}
+    if os.path.exists(tunings_file):
         with open(tunings_file, "r", encoding="utf-8") as f:
-            tunings = json.load(f) or {}
-    except Exception:
-        tunings = {}
-tunings[source] = params
-tmp = tunings_file + ".tmp"
-with open(tmp, "w", encoding="utf-8") as f:
-    json.dump(tunings, f, indent=2, sort_keys=True)
-    f.write("\n")
-os.replace(tmp, tunings_file)
+            text = f.read()
+        # A corrupt store is reported, never silently replaced: it holds
+        # every other model's tuning too.
+        tunings = (json.loads(text) if text.strip() else {}) or {}
+        if not isinstance(tunings, dict):
+            raise ValueError("expected a JSON object")
+    current = tunings.get(source)
+    params = {**current, **params} if isinstance(current, dict) else params
+    tunings[source] = params
+    tmp = tunings_file + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(tunings, f, indent=2, sort_keys=True)
+        f.write("\n")
+    os.replace(tmp, tunings_file)
+    fcntl.flock(lock_fd, fcntl.LOCK_UN)
+    os.close(lock_fd)
+except (OSError, ValueError) as e:
+    print(f"\033[0;31mError: could not update {tunings_file}: {e}\033[0m", file=sys.stderr)
+    sys.exit(1)
 
 print(f"\033[0;32m[✓] Registered tuned defaults for '{source}' (applies to run/launch):\033[0m")
 for k, v in params.items():
@@ -5113,6 +5188,7 @@ GEMINI_SHIM_PATHS=(
 AGY_CLAIM_DIR="${KIMO_AGY_CLAIM_DIR:-${AGY_CLAIM_DIR:-${KIMO_RUNTIME_DIR}/agy-claims}}"
 AGY_SHIM_PID=""
 AGY_SHIM_PORT=""
+AGY_SHIM_KEY=""
 AGY_SHIM_OUT=""
 AGY_SHIM_ERR=""
 AGY_CLAIM_FILE=""
@@ -5257,8 +5333,18 @@ agy_start_shim() {
     AGY_SHIM_PORT=""
     AGY_SHIM_OUT=$(mktemp) || return 1
     AGY_SHIM_ERR=$(mktemp) || return 1
-    python3 -u "${shim}" --host 127.0.0.1 --port 0 --upstream "${upstream}" \
-        --default-model "${model}" --print-port >"${AGY_SHIM_OUT}" 2>"${AGY_SHIM_ERR}" &
+    # The shim only serves clients that present this key, so another local
+    # process cannot use it (and the bridge token it attaches upstream). agy
+    # sends GEMINI_API_KEY, so a real key the user set is reused unchanged;
+    # otherwise a random per-session key replaces the guessable 'ollama'.
+    AGY_SHIM_KEY="${GEMINI_API_KEY:-}"
+    if [[ -z "${AGY_SHIM_KEY}" || "${AGY_SHIM_KEY}" == ollama ]]; then
+        AGY_SHIM_KEY=$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))') || return 1
+    fi
+    # Environment, not argv: argv is world-readable in /proc and ps.
+    KIMO_SHIM_CLIENT_KEY="${AGY_SHIM_KEY}" python3 -u "${shim}" --host 127.0.0.1 --port 0 \
+        --upstream "${upstream}" --default-model "${model}" --print-port \
+        >"${AGY_SHIM_OUT}" 2>"${AGY_SHIM_ERR}" &
     AGY_SHIM_PID=$!
 
     while ((tries++ < 100)); do
@@ -12706,7 +12792,10 @@ ${C_YELLOW}Usage:${C_RESET}
   ${0##*/} quote [options]
 
 ${C_YELLOW}Options:${C_RESET}
-  ${C_CYAN}--provider <p>${C_RESET} Provider: ollama | gemini | freetier | openrouter | web | all
+  ${C_CYAN}--provider <p>${C_RESET} Provider: ollama | gemini | freetier | openrouter | web | all,
+                    or an account: codex | qwen | grok | agy | opencode | kimi | claude |
+                    cursor | cyberstrike | hermes | openclaw | gh
+                    Comma-separate or repeat for several: --provider codex,grok
   ${C_CYAN}--cli <name>${C_RESET}   CLI: claude | codex | qwen | grok | kimi | cursor | agy |
                     opencode | cyberstrike | hermes | openclaw | gh | all
   ${C_CYAN}--offline${C_RESET}      List availability without network or native usage commands
@@ -12722,6 +12811,8 @@ ${C_YELLOW}Examples:${C_RESET}
   ${0##*/} quota
   ${0##*/} quota --provider ollama
   ${0##*/} quota --provider gemini --model flash
+  ${0##*/} quota --provider codex,grok,agy        # several accounts at once
+  ${0##*/} quota --provider qwen --provider opencode
   ${0##*/} quota codex --json
   ${0##*/} quota --cli all
   ${0##*/} quota --json
@@ -12737,7 +12828,7 @@ cmd_quota() {
         echo "Error: python3 is required for quota checks." >&2
         return 1
     fi
-    local helper gemini_key="" opt_offline=false quota_provider="all" quota_cli=false
+    local helper gemini_key="" opt_offline=false quota_providers="" quota_cli=false
     local options=()
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -12747,10 +12838,10 @@ cmd_quota() {
                     echo "Error: $1 requires a value." >&2
                     return 1
                 fi
-                [[ "$1" == --provider ]] && quota_provider="$2"
+                [[ "$1" == --provider ]] && quota_providers+=",$2"
                 [[ "$1" == --cli ]] && quota_cli=true
                 options+=("$1" "$2"); shift 2 ;;
-            --provider=*) quota_provider="${1#*=}"; options+=("$1"); shift ;;
+            --provider=*) quota_providers+=",${1#*=}"; options+=("$1"); shift ;;
             --cli=*) quota_cli=true; options+=("$1"); shift ;;
             --model=*|--timeout=*) options+=("$1"); shift ;;
             --offline) opt_offline=true; options+=("$1"); shift ;;
@@ -12764,7 +12855,9 @@ cmd_quota() {
         echo "Error: kimo-quota.py is missing; reinstall kimo or set KIMO_QUOTA_HELPER." >&2
         return 1
     fi
-    if ! ${opt_offline} && ! ${quota_cli} && [[ "${quota_provider}" == all || "${quota_provider}" == gemini ]]; then
+    # Resolve the Gemini key only when the gemini provider will be queried.
+    if ! ${opt_offline} && ! ${quota_cli} && [[ -z "${quota_providers}" || ",${quota_providers// /}," =~ ,(all|gemini), ]]; then
+        _resolve_gemini_auth
         gemini_key=$(_gemini_resolve_key 2>/dev/null) || gemini_key=""
     fi
     ${OPT_JSON} && options+=(--json)
@@ -12798,7 +12891,7 @@ fi
 # first --host).
 if [[ "${HOST_MODE}" == "multi" ]] && command_needs_remote "${COMMAND}"; then
     case "${COMMAND}" in
-        check|ping|hosts|init|scan|discover|ps|top|list|ls|search|find|stop|unload|info|show|status|health|status-report|report|logs|log|rotate-token|rotate|install|setup|update|upgrade|doctor|diagnose|diag|config|cfg|completion|sync|freetier|free-tier|kimi-sync|gemini|gemini-sync|kimi-gemini|web|version|help|-h|--help|tunnel|quota|quotas|quote) ;;
+        check|ping|hosts|init|scan|discover|ps|top|list|ls|search|find|stop|unload|info|show|status|health|status-report|report|logs|log|rotate-token|rotate|install|setup|update|upgrade|doctor|diagnose|diag|config|cfg|completion|sync|freetier|free-tier|kimi-sync|gemini|gemini-sync|kimi-gemini|claude|claude-sync|kimi-claude|codex|codex-sync|kimi-codex|web|version|help|-h|--help|tunnel|quota|quotas|quote) ;;
         # rm finds each model's host itself (exact names, several models).
         rm|delete) ;;
         *)

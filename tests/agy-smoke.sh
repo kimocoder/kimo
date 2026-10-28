@@ -10,7 +10,8 @@
 #   * settings.json is patched for the session (modelProvider=gemini +
 #     customModelsConfig.customModels[<model>]) and restored on exit
 #   * GEMINI_API_KEY is NOT scrubbed - it only ever reaches the localhost shim,
-#     whose upstream requests carry no auth (unlike qwen/claude)
+#     whose upstream requests carry no auth (unlike qwen/claude); the shim
+#     answers only that key (a random one per session when it is unset)
 #
 # The real shim is started (it is local and reaped), but AGY_SETTINGS is pointed
 # at a temp file so the user's real settings.json is never touched.
@@ -49,6 +50,13 @@ out="${AGY_SMOKE_OUT:?AGY_SMOKE_OUT unset}"
 base="${GOOGLE_GEMINI_BASE_URL-}"
 code=""
 [[ -n "${base}" ]] && code="$(curl -s -o /dev/null -w '%{http_code}' -m 2 "${base}/healthz" 2>/dev/null || true)"
+# The shim must refuse callers without agy's key and serve agy itself.
+nokey="" withkey=""
+if [[ -n "${base}" ]]; then
+    nokey="$(curl -s -o /dev/null -w '%{http_code}' -m 2 "${base}/v1beta/models" 2>/dev/null || true)"
+    withkey="$(printf 'header = "x-goog-api-key: %s"\n' "${GEMINI_API_KEY-}" \
+        | curl -s -o /dev/null -w '%{http_code}' -m 5 -K - "${base}/v1beta/models" 2>/dev/null || true)"
+fi
 {
     printf 'ARGV\n'
     printf '%s\n' "$@"
@@ -56,6 +64,8 @@ code=""
     printf 'GEMINI_API_KEY=%s\n' "${GEMINI_API_KEY-<unset>}"
     printf 'GOOGLE_GEMINI_BASE_URL=%s\n' "${base-<unset>}"
     printf 'SHIM_HEALTHZ=%s\n' "${code}"
+    printf 'SHIM_NOKEY=%s\n' "${nokey}"
+    printf 'SHIM_WITHKEY=%s\n' "${withkey}"
     printf 'SETTINGS_PROVIDER=%s\n' "$(jq -r '.modelProvider // "<none>"' "${AGY_SETTINGS}" 2>/dev/null)"
     printf 'SETTINGS_MODELS=%s\n' "$(jq -r '(.customModelsConfig.customModels // {}) | keys | join(",")' "${AGY_SETTINGS}" 2>/dev/null)"
 } > "${out}"
@@ -90,6 +100,8 @@ else
         bad "GOOGLE_GEMINI_BASE_URL is not a loopback shim: '${shim_base}'"
     fi
     check "shim /healthz answered" "200" "$(env_val "${CAPTURE}" SHIM_HEALTHZ)"
+    check "shim refuses a caller without the key" "401" "$(env_val "${CAPTURE}" SHIM_NOKEY)"
+    check "shim serves agy's GEMINI_API_KEY" "200" "$(env_val "${CAPTURE}" SHIM_WITHKEY)"
     check "settings modelProvider patched to gemini" "gemini" "$(env_val "${CAPTURE}" SETTINGS_PROVIDER)"
     if [[ ",$(env_val "${CAPTURE}" SETTINGS_MODELS)," == *",kalidroid-27b:latest,"* ]]; then
         ok "settings customModels contains the launched model"
@@ -116,10 +128,22 @@ fi
 echo "[*] mocked: GEMINI_API_KEY passthrough (no scrub needed)"
 unset GEMINI_API_KEY 2>/dev/null || true
 run_launch
-check "GEMINI_API_KEY defaults to ollama" "ollama" "$(env_val "${CAPTURE}" GEMINI_API_KEY)"
+first_key="$(env_val "${CAPTURE}" GEMINI_API_KEY)"
+check_match "unset GEMINI_API_KEY becomes a random session key" '^[A-Za-z0-9_-]{40,}$' "${first_key}"
+run_launch
+if [[ -n "${first_key}" && "$(env_val "${CAPTURE}" GEMINI_API_KEY)" != "${first_key}" ]]; then
+    ok "each session gets its own key"
+else
+    bad "session key repeated across launches"
+fi
+check "the session key unlocks the shim" "200" "$(env_val "${CAPTURE}" SHIM_WITHKEY)"
+
+GEMINI_API_KEY="ollama" run_launch
+check_match "the guessable 'ollama' placeholder is replaced too" '^[A-Za-z0-9_-]{40,}$' "$(env_val "${CAPTURE}" GEMINI_API_KEY)"
 
 GEMINI_API_KEY="g-key-REAL" run_launch
 check "GEMINI_API_KEY passes through (only reaches localhost shim)" "g-key-REAL" "$(env_val "${CAPTURE}" GEMINI_API_KEY)"
+check "a real GEMINI_API_KEY is the shim's key" "200" "$(env_val "${CAPTURE}" SHIM_WITHKEY)"
 
 echo
 echo "mocked smoke: ${pass} passed, ${fail} failed"

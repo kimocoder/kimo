@@ -305,6 +305,35 @@ class ShimTest(unittest.TestCase):
                 server.shutdown()
                 server.server_close()
 
+    def test_client_key_is_required_when_configured(self):
+        upstream = f"http://127.0.0.1:{self.upstream.server_address[1]}"
+        keyed = serve(shim.GeminiShimServer(("127.0.0.1", 0), upstream, "d", client_key="session-key"))
+        base = f"http://127.0.0.1:{keyed.server_address[1]}"
+
+        def status(path, method="GET", headers=None):
+            data = json.dumps(self.user()).encode() if method == "POST" else None
+            req = urllib.request.Request(base + path, data=data, method=method, headers=headers or {})
+            try:
+                with urllib.request.urlopen(req, timeout=10) as resp:
+                    return resp.status
+            except urllib.error.HTTPError as e:
+                with e:
+                    return e.code
+
+        generate = "/v1beta/models/m:generateContent"
+        try:
+            self.assertEqual(status("/healthz"), 200, "health checks stay open")
+            self.assertEqual(status("/v1beta/models"), 401)
+            self.assertEqual(status(generate, "POST"), 401)
+            self.assertEqual(status(generate, "POST", {"x-goog-api-key": "wrong"}), 401)
+            self.assertEqual(Upstream.requests, [], "a refused request never reaches the upstream")
+            self.assertEqual(status("/v1beta/models", headers={"x-goog-api-key": "session-key"}), 200)
+            self.assertEqual(status(generate, "POST", {"x-goog-api-key": "session-key"}), 200)
+            self.assertEqual(status(generate + "?key=session-key", "POST"), 200)
+        finally:
+            keyed.shutdown()
+            keyed.server_close()
+
     def test_non_http_upstream_is_refused(self):
         for upstream in ("file:///etc/passwd", "ftp://host/x", "127.0.0.1:11434"):
             with self.assertRaises(ValueError, msg=upstream):

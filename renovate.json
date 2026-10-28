@@ -1,7 +1,11 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "description": "GitHub Actions are updated by Dependabot (.github/dependabot.yml: SHA pins, 7-day cooldown). Renovate's github-actions manager is off so the two bots do not open duplicate PRs; Renovate still covers any other manifest added later.",
   "extends": [
     "config:recommended"
   ],
-  "minimumReleaseAge": "7 days"
+  "minimumReleaseAge": "7 days",
+  "github-actions": {
+    "enabled": false
+  }
 }

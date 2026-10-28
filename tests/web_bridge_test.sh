@@ -114,4 +114,15 @@ urlcmd=$("${KIMO}" web url "https://example.org/?q=it's" 2>/dev/null | sed '1d')
 sent=$(bash -c "curl() { while [[ \$# -gt 0 ]]; do [[ \$1 == -d ]] && { printf '%s' \"\$2\"; return; }; shift; done; }; ${urlcmd}")
 check "web url command keeps a quoted URL intact" "https://example.org/?q=it's" "$(jq -r '.args.url' <<<"${sent}" 2>/dev/null || echo unparseable)"
 
+# The env port is validated like the config value: a bad one is reported and
+# the default applies, instead of crashing 'web status --json' in jq.
+rc=0
+out=$(KIMO_WEBBRIDGE_PORT=abc "${KIMO}" --json web status 2>"${WORK}/port.err") || rc=$?
+check "a non-numeric KIMO_WEBBRIDGE_PORT still gives valid JSON" "10086" "$(jq -r '.port' <<<"${out}" 2>/dev/null || echo unparseable)"
+check_contains "the bad env port is reported" "KIMO_WEBBRIDGE_PORT" "$(cat "${WORK}/port.err")"
+out=$(env -u KIMO_WEBBRIDGE_URL KIMO_WEBBRIDGE_PORT=99999 "${KIMO}" --json web status 2>/dev/null) || true
+check "an out-of-range env port falls back to the default URL" "http://127.0.0.1:10086/command" "$(jq -r '.url' <<<"${out}" 2>/dev/null || echo unparseable)"
+out=$(env -u KIMO_WEBBRIDGE_URL KIMO_WEBBRIDGE_PORT=10123 "${KIMO}" --json web status 2>/dev/null) || true
+check "a valid env port still builds the URL" "http://127.0.0.1:10123/command" "$(jq -r '.url' <<<"${out}" 2>/dev/null || echo unparseable)"
+
 harness_summary "web bridge"

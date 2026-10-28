@@ -87,5 +87,77 @@ out=$(KIMO_DEFAULT_MODEL="" "${KIMO}" --host "${BENCH_URL}" bench 2>&1) || rc=$?
 check "no model and none loaded is an error, not a hardcoded default" "1" "${rc}"
 check_contains "the error says how to pick a model" "config set default_model" "${out}"
 
+echo "[*] tune merges options, validates values and never clobbers the store"
+TUNE() { "${KIMO}" --host "${LOCAL_URL}" tune "$@"; }
+tuned() { jq -cS --arg m "$1" '.[$m]' "${KIMO_TUNINGS_FILE}"; }
+printf '{"localonly:latest": {"num_ctx": 4096}, "other:7b": {"num_ctx": 2048}}\n' >"${KIMO_TUNINGS_FILE}"
+TUNE localonly:latest --temp 0.2 >/dev/null 2>&1 || bad "tune --temp failed"
+check "a second tune keeps the earlier option" '{"num_ctx":4096,"temperature":0.2}' "$(tuned localonly:latest)"
+TUNE localonly:latest --ctx 8192 >/dev/null 2>&1 || bad "tune --ctx failed"
+check "a repeated option is updated in place" '{"num_ctx":8192,"temperature":0.2}' "$(tuned localonly:latest)"
+check "other models' tunings are untouched" '{"num_ctx":2048}' "$(tuned other:7b)"
+before=$(cat "${KIMO_TUNINGS_FILE}")
+for bad_args in "--ctx abc" "--ctx -5" "--ctx 0" "--batch 1.5" "--predict x" "--num-gpu -2" "--num-gpu x" "--temp -1" "--temp hot"; do
+    rc=0
+    # shellcheck disable=SC2086  # word-split the option and its value
+    out=$(TUNE localonly:latest ${bad_args} 2>&1) || rc=$?
+    check "tune rejects ${bad_args}" "1" "${rc}"
+    check_not_contains "tune ${bad_args} is an error, not a traceback" "Traceback" "${out}"
+done
+check "rejected values leave the store unchanged" "${before}" "$(cat "${KIMO_TUNINGS_FILE}")"
+TUNE localonly:latest --num-gpu -1 >/dev/null 2>&1 || bad "tune --num-gpu -1 failed"
+check "--num-gpu -1 (auto) is accepted" "-1" "$(jq -r '."localonly:latest".num_gpu' "${KIMO_TUNINGS_FILE}")"
+
+# 'kimo stream --tune' takes the same lock, so the two writers serialize.
+python3 - "${KIMO_TUNINGS_FILE}.lock" "${HARNESS_ROOT}/lock-held" <<'PY' &
+import fcntl, sys, time
+with open(sys.argv[1], "a") as fh:
+    fcntl.flock(fh, fcntl.LOCK_EX)
+    open(sys.argv[2], "w").close()
+    time.sleep(1.0)
+PY
+holder=$!
+until [[ -e "${HARNESS_ROOT}/lock-held" ]]; do sleep 0.02; done
+start=$(date +%s%N)
+TUNE localonly:latest --batch 512 >/dev/null 2>&1 || bad "tune --batch failed"
+waited_ms=$(( ($(date +%s%N) - start) / 1000000 ))
+wait "${holder}"
+check "tune waits for the tunings lock" "yes" "$( ((waited_ms >= 700)) && echo yes || echo "no (${waited_ms}ms)")"
+
+out=$(TUNE localonly:latest --clear 2>&1) || bad "tune --clear failed"
+check_contains "--clear reports the removal" "Cleared tuned defaults" "${out}"
+check "--clear removes only that model" '["other:7b"]' "$(jq -c 'keys' "${KIMO_TUNINGS_FILE}")"
+rc=0
+out=$(TUNE localonly:latest --clear 2>&1) || rc=$?
+check "--clear with nothing registered succeeds" "0" "${rc}"
+check_not_contains "--clear with nothing registered does not claim a removal" "Cleared" "${out}"
+
+printf 'not json' >"${KIMO_TUNINGS_FILE}"
+for args in "--clear" "--ctx 4096"; do
+    rc=0
+    # shellcheck disable=SC2086
+    out=$(TUNE localonly:latest ${args} 2>&1) || rc=$?
+    check "tune ${args} on a corrupt store fails" "1" "${rc}"
+    check_not_contains "tune ${args} on a corrupt store gives no traceback" "Traceback" "${out}"
+    check_not_contains "tune ${args} on a corrupt store claims no success" "[✓]" "${out}"
+    check "tune ${args} leaves a corrupt store as it was" "not json" "$(cat "${KIMO_TUNINGS_FILE}")"
+done
+
+echo "[*] stream --clear-tuning clears exactly the named model"
+STREAM_TUNINGS="${HARNESS_ROOT}/stream-tunings.json"
+CLEAR() { KIMO_TUNINGS_FILE="${STREAM_TUNINGS}" python3 "${ROOT_DIR}/lib/kimo-stream.py" "$@" --clear-tuning; }
+printf '{"my-llama-coder:7b": {"num_ctx": 1}, "qwen3:8b": {"num_ctx": 2}, "qwen3:14b": {"num_ctx": 3}, "phi4:latest": {"num_ctx": 4}}\n' >"${STREAM_TUNINGS}"
+rc=0
+CLEAR llama >/dev/null 2>&1 || rc=$?
+check "a substring never matches ('llama' vs my-llama-coder:7b)" "1:4" "${rc}:$(jq 'length' "${STREAM_TUNINGS}")"
+rc=0
+out=$(CLEAR qwen3 --json 2>/dev/null) || rc=$?
+check "a name with several tags is ambiguous and clears nothing" "1:ambiguous:4" "${rc}:$(jq -r '.status' <<<"${out}"):$(jq 'length' "${STREAM_TUNINGS}")"
+CLEAR my-llama-coder >/dev/null 2>&1 || bad "clearing a uniquely tagged name failed"
+check "a name with one tag clears that tag" "false" "$(jq 'has("my-llama-coder:7b")' "${STREAM_TUNINGS}")"
+CLEAR phi4 >/dev/null 2>&1 || bad "clearing name:latest failed"
+CLEAR QWEN3:8B >/dev/null 2>&1 || bad "clearing a case-insensitive exact name failed"
+check "':latest' and case-insensitive exact names clear just that entry" '["qwen3:14b"]' "$(jq -c 'keys' "${STREAM_TUNINGS}")"
+
 echo
 harness_summary "model commands"
