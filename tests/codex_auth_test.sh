@@ -637,7 +637,7 @@ check_contains "Bash completion includes Codex native commands" 'exec review res
 # Both completion scripts are emitted from quoted heredocs, so they cannot expand
 # KIMO_LAUNCH_PROVIDERS; assert they still offer exactly what launch accepts.
 providers=$(sed -n 's/^KIMO_LAUNCH_PROVIDERS="\(.*\)"$/\1/p' "${KIMO}")
-check "the accepted backends are declared once" "ollama abliteration codex openai dashscope qwencloud xai anthropic claude gemini" "${providers}"
+check "the accepted backends are declared once" "ollama abliteration codex openai dashscope alibaba qwencloud xai anthropic claude gemini vllm" "${providers}"
 check_contains "Bash completion offers every backend" "${providers}" "${bash_completion}"
 check_contains "Zsh completion offers every backend" "${providers}" "$("${KIMO}" completion zsh)"
 check_contains "Zsh completion includes Codex bridge" '--sync[Synchronize Codex provider' "$("${KIMO}" completion zsh)"

@@ -1,9 +1,18 @@
 #!/usr/bin/env python3
 """
-ollama-gemini-shim.py – Gemini wire-format to Ollama /api/chat translation shim.
+ollama-gemini-shim.py – Gemini wire-format translation shim.
 
 Enables Google Antigravity (agy) and other Gemini-only CLI clients to seamlessly
 interface with native and remote Ollama instances without external proxies.
+
+Two upstream wires, picked with --upstream-kind:
+  - ollama (default)  {upstream}/api/chat, NDJSON stream, {upstream}/api/tags
+  - openai            {upstream}/chat/completions, SSE stream, {upstream}/models
+The openai kind is what reaches a hosted OpenAI-compatible API such as Alibaba
+Model Studio's compatible-mode surface, which has no Gemini endpoint and no
+/api/chat. Its sampling controls sit at the top level of the request rather
+than in an "options" object, the output cap is max_tokens, there is no top_k,
+and reasoning arrives as delta.reasoning_content instead of message.thinking.
 
 Endpoints implemented:
   - GET  /healthz
@@ -16,13 +25,15 @@ Endpoints implemented:
 Translated both ways: text, inline images, function declarations / calls /
 responses, thinking ("thought" parts), generationConfig (temperature, topP,
 topK, maxOutputTokens, stopSequences, seed, penalties, JSON mode/schema,
-thinkingBudget) and usageMetadata. Content Ollama cannot take (fileData
+thinkingBudget) and usageMetadata. Content the upstream cannot take (fileData
 URIs, non-image inline data, code-execution parts) is rejected with a 400
 rather than silently dropped. Model names may carry tags and namespaces
 (models/ns/model:tag:method); the method is split off at the last colon.
 
 Environment: KIMO_SHIM_UPSTREAM_TOKEN, when set, is sent as
-"Authorization: Bearer <token>" to the upstream (a token-protected bridge).
+"Authorization: Bearer <token>" to the upstream (a token-protected bridge, or
+the API key of a hosted provider). KIMO_SHIM_CLIENT_KEY, when set, is the key
+callers must present.
 """
 
 from __future__ import annotations
@@ -46,12 +57,15 @@ logging.basicConfig(level=logging.INFO, format="[gemini-shim] %(asctime)s - %(me
 logger = logging.getLogger("gemini-shim")
 
 METHODS = ("generateContent", "streamGenerateContent", "countTokens")
+UPSTREAM_KINDS = ("ollama", "openai")
 MODEL_PATH = re.compile(r"^/(?:v1beta|v1)/models/(.+):(%s)$" % "|".join(METHODS))
 MAX_BODY = 64 * 1024 * 1024  # inline images make requests large, but bound them
 STATUS = {400: "INVALID_ARGUMENT", 401: "UNAUTHENTICATED", 403: "PERMISSION_DENIED",
           404: "NOT_FOUND", 413: "INVALID_ARGUMENT", 429: "RESOURCE_EXHAUSTED",
           500: "INTERNAL", 502: "UNAVAILABLE", 503: "UNAVAILABLE", 504: "DEADLINE_EXCEEDED"}
 FINISH = {"stop": "STOP", "length": "MAX_TOKENS"}
+FINISH_OPENAI = {"stop": "STOP", "length": "MAX_TOKENS", "tool_calls": "STOP",
+                 "function_call": "STOP", "content_filter": "SAFETY"}
 
 
 class RequestError(Exception):
@@ -68,7 +82,7 @@ def error_body(code: int, message: str) -> dict:
 
 
 # -----------------------------------------------------------------------------
-# Gemini request -> Ollama /api/chat
+# Gemini request -> upstream request (Ollama /api/chat or OpenAI chat/completions)
 # -----------------------------------------------------------------------------
 def convert_schema(schema: object) -> object:
     """Gemini Schema (OBJECT/STRING... upper-case types) -> JSON Schema."""
@@ -100,8 +114,18 @@ def parts_of(holder: object, where: str) -> list:
     return parts
 
 
-def convert_turn(turn: dict, index: int) -> list:
-    """One Gemini content -> one or more Ollama messages."""
+def convert_turn(turn: dict, index: int, flavor: str = "ollama",
+                 pending_calls: dict | None = None) -> list:
+    """One Gemini content -> one or more upstream messages.
+
+    `flavor` picks the wire the messages are rendered for. The two disagree on
+    images (a base64 array vs. data-URL content parts), on tool-call arguments
+    (an object vs. a JSON string carrying a mandatory id) and on tool results
+    (`tool_name` vs. `tool_call_id`). `pending_calls` maps a function name to
+    the call ids already offered for it, so an OpenAI tool result can name the
+    call it answers: Gemini clients routinely echo back only the name.
+    """
+    backend = "Ollama" if flavor == "ollama" else "OpenAI-compatible"
     role = turn.get("role", "user")
     role = {"model": "assistant", "function": "user"}.get(role, role)
     if role not in ("user", "assistant", "system"):
@@ -116,32 +140,58 @@ def convert_turn(turn: dict, index: int) -> list:
             data = part.get("inlineData") or part.get("inline_data") or {}
             mime = data.get("mimeType") or data.get("mime_type") or ""
             if not mime.startswith("image/"):
-                raise RequestError(400, f"inlineData of type '{mime or 'unknown'}' is not supported by the Ollama shim (images only).")
-            images.append(data.get("data", ""))
+                raise RequestError(400, f"inlineData of type '{mime or 'unknown'}' is not supported by the {backend} shim (images only).")
+            images.append((mime, data.get("data", "")))
         elif "functionCall" in part or "function_call" in part:
             call = part.get("functionCall") or part.get("function_call") or {}
-            tool_calls.append({"function": {"name": call.get("name", ""), "arguments": call.get("args") or {}}})
+            name = call.get("name", "")
+            tool_calls.append((str(call.get("id") or f"call_{index}_{len(tool_calls)}_{name}"),
+                               name, call.get("args") or {}))
         elif "functionResponse" in part or "function_response" in part:
             result = part.get("functionResponse") or part.get("function_response") or {}
-            tool_results.append({"role": "tool", "tool_name": result.get("name", ""),
-                                 "content": json.dumps(result.get("response", {}))})
+            tool_results.append((str(result.get("id") or ""), result.get("name", ""),
+                                 json.dumps(result.get("response", {}))))
         elif "fileData" in part or "file_data" in part:
-            raise RequestError(400, "fileData (URI) parts are not supported by the Ollama shim; send inline data instead.")
+            raise RequestError(400, f"fileData (URI) parts are not supported by the {backend} shim; send inline data instead.")
         elif "executableCode" in part or "codeExecutionResult" in part:
-            raise RequestError(400, "Code-execution parts are not supported by the Ollama shim.")
+            raise RequestError(400, f"Code-execution parts are not supported by the {backend} shim.")
         elif "thoughtSignature" in part or "thought_signature" in part:
             continue
         else:
             raise RequestError(400, f"Unsupported part in contents[{index}]: {', '.join(sorted(part)) or 'empty'}.")
     messages = []
     if text or images or tool_calls:
-        message = {"role": role, "content": "".join(text)}
-        if images:
-            message["images"] = images
+        joined = "".join(text)
+        if flavor == "openai" and images:
+            content = [{"type": "text", "text": joined}] if joined else []
+            content += [{"type": "image_url", "image_url": {"url": f"data:{mime};base64,{blob}"}}
+                        for mime, blob in images]
+            message = {"role": role, "content": content}
+        else:
+            message = {"role": role, "content": joined}
+            if images:
+                message["images"] = [blob for _, blob in images]
         if tool_calls:
-            message["tool_calls"] = tool_calls
+            if flavor == "openai":
+                message["tool_calls"] = [
+                    {"id": call_id, "type": "function",
+                     "function": {"name": name, "arguments": json.dumps(args)}}
+                    for call_id, name, args in tool_calls]
+            else:
+                message["tool_calls"] = [{"function": {"name": name, "arguments": args}}
+                                         for _, name, args in tool_calls]
+            if pending_calls is not None:
+                for call_id, name, _ in tool_calls:
+                    pending_calls.setdefault(name, []).append(call_id)
         messages.append(message)
-    messages.extend(tool_results)
+    for call_id, name, body in tool_results:
+        if flavor == "openai":
+            if not call_id:
+                offered = (pending_calls or {}).get(name) or []
+                call_id = offered.pop(0) if offered else f"call_{name}"
+            messages.append({"role": "tool", "tool_call_id": call_id, "content": body})
+        else:
+            messages.append({"role": "tool", "tool_name": name, "content": body})
     return messages
 
 
@@ -225,6 +275,92 @@ def build_chat(request: dict, model: str, stream: bool) -> dict:
     return payload
 
 
+def tool_choice_of(request: dict) -> str:
+    """Gemini functionCallingConfig.mode -> OpenAI tool_choice, or "" to omit."""
+    config = (request.get("toolConfig") or {}).get("functionCallingConfig") or {}
+    return {"ANY": "required", "AUTO": "auto"}.get(str(config.get("mode", "")).upper(), "")
+
+
+def build_openai_chat(request: dict, model: str, stream: bool) -> dict:
+    """Gemini request -> OpenAI chat/completions payload.
+
+    Used for a hosted OpenAI-compatible upstream (Alibaba Model Studio's
+    compatible-mode surface among them), which takes sampling controls at the
+    top level instead of an "options" object and caps output with max_tokens.
+    """
+    if not isinstance(request, dict):
+        raise RequestError(400, "Request body must be a JSON object.")
+    pending_calls: dict = {}
+    messages = []
+    system = request.get("systemInstruction") or request.get("system_instruction")
+    if system:
+        text = "".join(str(p.get("text", "")) for p in parts_of(system, "systemInstruction"))
+        if text:
+            messages.append({"role": "system", "content": text})
+    contents = request.get("contents", [])
+    if not isinstance(contents, list):
+        raise RequestError(400, "contents must be a list.")
+    for index, turn in enumerate(contents):
+        if not isinstance(turn, dict):
+            raise RequestError(400, f"contents[{index}] must be an object.")
+        messages.extend(convert_turn(turn, index, "openai", pending_calls))
+
+    payload = {"model": model, "messages": messages, "stream": stream}
+    if stream:
+        # Without this the compatible-mode stream carries no usage object at
+        # all, and usageMetadata would report zero tokens for the whole turn.
+        payload["stream_options"] = {"include_usage": True}
+
+    config = request.get("generationConfig") or {}
+    if not isinstance(config, dict):
+        raise RequestError(400, "generationConfig must be an object.")
+    try:
+        for src, dst, cast in (("temperature", "temperature", float), ("topP", "top_p", float),
+                               ("maxOutputTokens", "max_tokens", int), ("seed", "seed", int),
+                               ("presencePenalty", "presence_penalty", float),
+                               ("frequencyPenalty", "frequency_penalty", float)):
+            if config.get(src) is not None:
+                payload[dst] = cast(config[src])
+    except (TypeError, ValueError) as exc:
+        raise RequestError(400, f"Invalid generationConfig value: {exc}") from None
+    if config.get("topK") is not None:
+        logger.info("ignoring topK: the OpenAI-compatible wire has no such control")
+    stops = config.get("stopSequences")
+    if stops:
+        payload["stop"] = [str(s) for s in stops] if isinstance(stops, list) else [str(stops)]
+
+    schema = config.get("responseJsonSchema") or config.get("responseSchema")
+    if schema:
+        payload["response_format"] = {"type": "json_schema", "json_schema": {
+            "name": "response_schema", "strict": True,
+            "schema": schema if "responseJsonSchema" in config else convert_schema(schema)}}
+    elif config.get("responseMimeType") == "application/json":
+        payload["response_format"] = {"type": "json_object"}
+
+    thinking = config.get("thinkingConfig") or {}
+    if isinstance(thinking, dict) and thinking:
+        budget = thinking.get("thinkingBudget")
+        if budget == 0:
+            payload["enable_thinking"] = False
+        elif stream:
+            # Turning thinking *on* is only forwarded when streaming: the
+            # compatible-mode surface rejects enable_thinking=true on a
+            # non-streaming call, and generateContent is not the path a Gemini
+            # client uses for its main turn anyway.
+            if thinking.get("includeThoughts") or budget is not None:
+                payload["enable_thinking"] = True
+            if isinstance(budget, int) and budget > 0:
+                payload["thinking_budget"] = budget
+
+    tools = convert_tools(request)
+    if tools:
+        payload["tools"] = tools
+        choice = tool_choice_of(request)
+        if choice:
+            payload["tool_choice"] = choice
+    return payload
+
+
 def estimate_tokens(request: dict) -> int:
     """countTokens without loading the model: ~4 characters per token."""
     inner = request.get("generateContentRequest") if isinstance(request.get("generateContentRequest"), dict) else request
@@ -244,32 +380,58 @@ def estimate_tokens(request: dict) -> int:
 
 
 # -----------------------------------------------------------------------------
-# Ollama /api/chat -> Gemini response
+# Upstream response -> Gemini response
 # -----------------------------------------------------------------------------
+def call_part(call: dict) -> dict:
+    """One upstream tool_call -> a Gemini functionCall part."""
+    function = call.get("function") or {}
+    args = function.get("arguments") or {}
+    if isinstance(args, str):
+        try:
+            args = json.loads(args) if args.strip() else {}
+        except ValueError:
+            args = {"_raw": args}
+    part = {"name": function.get("name", ""), "args": args}
+    if call.get("id"):
+        part["id"] = call["id"]
+    return {"functionCall": part}
+
+
 def to_parts(message: dict) -> list:
     parts = []
     if message.get("thinking"):
         parts.append({"text": message["thinking"], "thought": True})
     if message.get("content"):
         parts.append({"text": message["content"]})
-    for call in message.get("tool_calls") or []:
-        function = call.get("function") or {}
-        args = function.get("arguments") or {}
-        if isinstance(args, str):
-            try:
-                args = json.loads(args)
-            except ValueError:
-                args = {"_raw": args}
-        call_part = {"name": function.get("name", ""), "args": args}
-        if call.get("id"):
-            call_part["id"] = call["id"]
-        parts.append({"functionCall": call_part})
+    parts += [call_part(call) for call in message.get("tool_calls") or []]
+    return parts
+
+
+def to_parts_openai(message: dict) -> list:
+    """An OpenAI chat message -> Gemini parts.
+
+    Reasoning arrives as reasoning_content (what the Qwen compatible-mode
+    surface returns) rather than Ollama's message.thinking.
+    """
+    parts = []
+    if message.get("reasoning_content"):
+        parts.append({"text": message["reasoning_content"], "thought": True})
+    if message.get("content"):
+        parts.append({"text": message["content"]})
+    parts += [call_part(call) for call in message.get("tool_calls") or []]
     return parts
 
 
 def usage(chunk: dict) -> dict:
     prompt, output = chunk.get("prompt_eval_count") or 0, chunk.get("eval_count") or 0
     return {"promptTokenCount": prompt, "candidatesTokenCount": output, "totalTokenCount": prompt + output}
+
+
+def usage_openai(chunk: dict) -> dict:
+    counts = chunk.get("usage") or {}
+    prompt, output = counts.get("prompt_tokens") or 0, counts.get("completion_tokens") or 0
+    return {"promptTokenCount": prompt, "candidatesTokenCount": output,
+            "totalTokenCount": counts.get("total_tokens") or (prompt + output)}
 
 
 def candidate(parts: list, finish: str | None) -> dict:
@@ -328,6 +490,21 @@ class GeminiShimHandler(BaseHTTPRequestHandler):
         # Scheme checked to be http(s) in GeminiShimServer.__init__.
         return urllib.request.urlopen(req, timeout=timeout)  # nosec B310
 
+    def _upstream_models(self) -> list:
+        """The upstream catalogue, or the default model when it cannot answer."""
+        try:
+            if self.server.upstream_kind == "openai":
+                with self._upstream("/models", timeout=10.0) as resp:
+                    raw = json.loads(resp.read().decode("utf-8"))
+                return [m.get("id", "") for m in raw.get("data", []) if isinstance(m, dict)]
+            with self._upstream("/api/tags", timeout=5.0) as resp:
+                raw = json.loads(resp.read().decode("utf-8"))
+            return [m.get("name", "") for m in raw.get("models", [])]
+        except Exception:
+            # Upstream error or offline: advertise the default so the client's
+            # model picker is not empty.
+            return [self.server.default_model or "kalidroid-27b:latest"]
+
     def do_GET(self) -> None:
         path = urllib.parse.urlparse(self.path).path
 
@@ -338,14 +515,7 @@ class GeminiShimHandler(BaseHTTPRequestHandler):
             return
 
         if path in ("/v1beta/models", "/v1/models"):
-            try:
-                with self._upstream("/api/tags", timeout=5.0) as resp:
-                    raw = json.loads(resp.read().decode("utf-8"))
-                names = [m.get("name", "") for m in raw.get("models", [])]
-            except Exception:
-                # Upstream error or offline: return default model
-                names = [self.server.default_model or "kalidroid-27b:latest"]
-            self._send_json_response(200, {"models": [self._model_entry(n) for n in names]})
+            self._send_json_response(200, {"models": [self._model_entry(n) for n in self._upstream_models()]})
             return
 
         match = re.match(r"^/(?:v1beta|v1)/models/(.+)$", path)
@@ -392,18 +562,22 @@ class GeminiShimHandler(BaseHTTPRequestHandler):
                 self._send_json_response(200, {"totalTokens": estimate_tokens(request)})
                 return
             stream = method == "streamGenerateContent"
-            payload = build_chat(request, model, stream)
+            if self.server.upstream_kind == "openai":
+                payload, path = build_openai_chat(request, model, stream), "/chat/completions"
+            else:
+                payload, path = build_chat(request, model, stream), "/api/chat"
         except RequestError as exc:
             self._send_error(exc.code, exc.message)
             return
 
         try:
-            resp = self._upstream("/api/chat", payload)
+            resp = self._upstream(path, payload)
         except urllib.error.HTTPError as e:
             body = e.read().decode("utf-8", errors="replace")
             e.close()
             try:
-                body = json.loads(body).get("error", body)
+                detail = json.loads(body).get("error", body)
+                body = detail.get("message") or json.dumps(detail) if isinstance(detail, dict) else detail
             except (ValueError, AttributeError):
                 pass
             self._send_error(e.code, str(body or e.reason))
@@ -414,7 +588,10 @@ class GeminiShimHandler(BaseHTTPRequestHandler):
 
         with resp:
             if stream:
-                self._stream(resp, model, parsed)
+                self._stream(resp, model, parsed,
+                             self._relay_openai if self.server.upstream_kind == "openai" else self._relay_ollama)
+            elif self.server.upstream_kind == "openai":
+                self._complete_openai(resp, model)
             else:
                 self._complete(resp, model)
 
@@ -434,7 +611,120 @@ class GeminiShimHandler(BaseHTTPRequestHandler):
             "modelVersion": model,
         })
 
-    def _stream(self, resp, model: str, parsed) -> None:
+    def _complete_openai(self, resp, model: str) -> None:
+        try:
+            raw = json.loads(resp.read().decode("utf-8"))
+        except Exception as e:
+            self._send_error(502, f"Failed reading upstream response: {e}")
+            return
+        if raw.get("error"):
+            self._send_error(502, f"Upstream error: {raw['error']}")
+            return
+        choices = raw.get("choices") or [{}]
+        parts = to_parts_openai(choices[0].get("message") or {}) or [{"text": ""}]
+        # modelVersion echoes the requested id: the upstream may answer with a
+        # dated snapshot name the client has never registered.
+        self._send_json_response(200, {
+            "candidates": [candidate(parts, FINISH_OPENAI.get(choices[0].get("finish_reason"), "STOP"))],
+            "usageMetadata": usage_openai(raw),
+            "modelVersion": model,
+        })
+
+    def _relay_ollama(self, resp, model: str, emit) -> None:
+        """Read an NDJSON /api/chat stream and emit one Gemini object per chunk."""
+        finished = False
+        for raw_line in resp:
+            line = raw_line.decode("utf-8", errors="replace").strip()
+            if not line:
+                continue
+            try:
+                chunk = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(chunk, dict):
+                continue
+            if chunk.get("error"):
+                emit(error_body(500, f"Upstream error: {chunk['error']}"))
+                return
+            parts = to_parts(chunk.get("message") or {})
+            if chunk.get("done"):
+                emit({"candidates": [candidate(parts or [{"text": ""}], FINISH.get(chunk.get("done_reason"), "STOP"))],
+                      "usageMetadata": usage(chunk), "modelVersion": model})
+                finished = True
+                break
+            if parts:
+                emit({"candidates": [candidate(parts, None)], "modelVersion": model})
+        if not finished:
+            emit(error_body(502, "Upstream stream ended before completion."))
+
+    def _relay_openai(self, resp, model: str, emit) -> None:
+        """Read an SSE chat/completions stream and emit Gemini objects.
+
+        Text and reasoning deltas pass through as they arrive. Tool-call
+        arguments are fragmented across chunks and only mean something once
+        complete, so they are accumulated by index and emitted with the final
+        candidate.
+        """
+        calls: dict = {}
+        finish, usage_chunk, done = "", {}, False
+        for raw_line in resp:
+            line = raw_line.decode("utf-8", errors="replace").strip()
+            if not line.startswith("data:"):
+                continue
+            data = line[5:].strip()
+            if data == "[DONE]":
+                done = True
+                break
+            try:
+                chunk = json.loads(data)
+            except ValueError:
+                continue
+            if not isinstance(chunk, dict):
+                continue
+            if chunk.get("error"):
+                emit(error_body(500, f"Upstream error: {chunk['error']}"))
+                return
+            if chunk.get("usage"):
+                usage_chunk = chunk
+            for choice in chunk.get("choices") or []:
+                if not isinstance(choice, dict):
+                    continue
+                delta = choice.get("delta") or {}
+                parts = []
+                if delta.get("reasoning_content"):
+                    parts.append({"text": delta["reasoning_content"], "thought": True})
+                if delta.get("content"):
+                    parts.append({"text": delta["content"]})
+                for call in delta.get("tool_calls") or []:
+                    slot = calls.setdefault(call.get("index") or 0,
+                                            {"id": "", "function": {"name": "", "arguments": ""}})
+                    if call.get("id"):
+                        slot["id"] = call["id"]
+                    function = call.get("function") or {}
+                    if function.get("name"):
+                        slot["function"]["name"] = function["name"]
+                    if function.get("arguments"):
+                        slot["function"]["arguments"] += function["arguments"]
+                if parts:
+                    emit({"candidates": [candidate(parts, None)], "modelVersion": model})
+                if choice.get("finish_reason"):
+                    finish = choice["finish_reason"]
+        if not (finish or done):
+            emit(error_body(502, "Upstream stream ended before completion."))
+            return
+        final = [call_part(calls[index]) for index in sorted(calls)] or [{"text": ""}]
+        emit({"candidates": [candidate(final, FINISH_OPENAI.get(finish, "STOP"))],
+              "usageMetadata": usage_openai(usage_chunk), "modelVersion": model})
+
+    def _stream(self, resp, model: str, parsed, relay) -> None:
+        """Frame a Gemini stream, whichever upstream wire `relay` reads.
+
+        `relay(resp, model, emit)` parses the upstream stream and calls `emit`
+        once per Gemini object, ending with exactly one terminal object (a
+        candidate carrying finishReason, or an error body). The framing the
+        client asked for - SSE with ?alt=sse, otherwise one JSON array written
+        piecewise - is applied here so both relays share it.
+        """
         query = urllib.parse.parse_qs(parsed.query)
         use_sse = "sse" in query.get("alt", []) or "text/event-stream" in self.headers.get("Accept", "")
         self.send_response(200)
@@ -457,31 +747,7 @@ class GeminiShimHandler(BaseHTTPRequestHandler):
             self.wfile.flush()
 
         try:
-            finished = False
-            for raw_line in resp:
-                line = raw_line.decode("utf-8", errors="replace").strip()
-                if not line:
-                    continue
-                try:
-                    chunk = json.loads(line)
-                except ValueError:
-                    continue
-                if not isinstance(chunk, dict):
-                    continue
-                if chunk.get("error"):
-                    emit(error_body(500, f"Upstream error: {chunk['error']}"))
-                    finished = True
-                    break
-                parts = to_parts(chunk.get("message") or {})
-                if chunk.get("done"):
-                    emit({"candidates": [candidate(parts or [{"text": ""}], FINISH.get(chunk.get("done_reason"), "STOP"))],
-                          "usageMetadata": usage(chunk), "modelVersion": model})
-                    finished = True
-                    break
-                if parts:
-                    emit({"candidates": [candidate(parts, None)], "modelVersion": model})
-            if not finished:
-                emit(error_body(502, "Upstream stream ended before completion."))
+            relay(resp, model, emit)
             if not use_sse:
                 self.wfile.write(b"[]" if first else b"]")
                 self.wfile.flush()
@@ -493,16 +759,21 @@ class GeminiShimServer(ThreadingHTTPServer):
     daemon_threads = True
 
     def __init__(self, server_address: tuple[str, int], upstream: str, default_model: str,
-                 upstream_token: str = "", client_key: str = ""):  # nosec B107 - empty means no auth
+                 upstream_token: str = "", client_key: str = "",  # nosec B107 - empty means no auth
+                 upstream_kind: str = "ollama"):
         # The upstream is opened with urllib, which would also follow file:// or
-        # custom schemes; only an Ollama HTTP(S) endpoint is acceptable.
+        # custom schemes; only an HTTP(S) endpoint is acceptable.
         if urllib.parse.urlparse(upstream).scheme not in ("http", "https"):
             raise ValueError(f"--upstream must be an http(s) URL, got '{upstream}'")
+        if upstream_kind not in UPSTREAM_KINDS:
+            raise ValueError(f"--upstream-kind must be one of {'/'.join(UPSTREAM_KINDS)}, got '{upstream_kind}'")
         super().__init__(server_address, GeminiShimHandler)
         self.upstream = upstream
+        self.upstream_kind = upstream_kind
         self.default_model = default_model
-        # Bearer token for a token-protected bridge in front of Ollama. It comes
-        # from the environment, never argv, and goes only to the upstream.
+        # Bearer token for the upstream: a token-protected bridge in front of
+        # Ollama, or the API key of a hosted provider. It comes from the
+        # environment, never argv, and goes only to the upstream.
         self.upstream_auth = f"Bearer {upstream_token}" if upstream_token else ""
         # Key clients must present (see GeminiShimHandler._authorized); also
         # from the environment only. Empty leaves the shim open, as before.
@@ -510,10 +781,12 @@ class GeminiShimServer(ThreadingHTTPServer):
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Ollama Gemini Translation Shim")
+    parser = argparse.ArgumentParser(description="Gemini wire-format translation shim")
     parser.add_argument("--host", default="127.0.0.1", help="Bind host address")
     parser.add_argument("--port", type=int, default=0, help="Bind port (0 for dynamic)")
-    parser.add_argument("--upstream", default="http://127.0.0.1:11434", help="Upstream Ollama URL")
+    parser.add_argument("--upstream", default="http://127.0.0.1:11434", help="Upstream base URL")
+    parser.add_argument("--upstream-kind", default="ollama", choices=UPSTREAM_KINDS,
+                        help="Wire the upstream speaks: ollama (/api/chat) or openai (/chat/completions)")
     parser.add_argument("--default-model", default="kalidroid-27b:latest", help="Default target model")
     parser.add_argument("--print-port", action="store_true", help="Print bound port to stdout")
     args = parser.parse_args()
@@ -521,7 +794,8 @@ def main() -> None:
     try:
         server = GeminiShimServer((args.host, args.port), args.upstream, args.default_model,
                                   os.environ.get("KIMO_SHIM_UPSTREAM_TOKEN", ""),
-                                  client_key=os.environ.get("KIMO_SHIM_CLIENT_KEY", ""))
+                                  client_key=os.environ.get("KIMO_SHIM_CLIENT_KEY", ""),
+                                  upstream_kind=args.upstream_kind)
     except ValueError as exc:
         parser.error(str(exc))
     bound_port = server.server_address[1]

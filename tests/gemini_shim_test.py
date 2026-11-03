@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-"""Contract tests for lib/ollama-gemini-shim.py against a scripted Ollama upstream.
+"""Contract tests for lib/ollama-gemini-shim.py against both upstream wires:
+a scripted Ollama /api/chat daemon, and a scripted OpenAI-compatible
+/chat/completions API shaped like Model Studio's compatible-mode surface.
 
 Run: tests/lib/run-hermetic.sh python3 tests/gemini_shim_test.py
 """
@@ -64,7 +66,32 @@ def serve(server):
     return server
 
 
-class ShimTest(unittest.TestCase):
+def sse(obj):
+    """One OpenAI-compatible SSE event line."""
+    return "data: " + json.dumps(obj)
+
+
+class GeminiClientMixin:
+    """Request helpers shared by the Ollama- and OpenAI-upstream suites."""
+
+    base = ""
+
+    def post(self, path, body, raw=None, headers=None):
+        data = raw if raw is not None else json.dumps(body).encode()
+        req = urllib.request.Request(self.base + path, data=data, method="POST",
+                                     headers={"Content-Type": "application/json", **(headers or {})})
+        try:
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                return resp.status, resp.read().decode()
+        except urllib.error.HTTPError as e:
+            with e:
+                return e.code, e.read().decode()
+
+    def user(self, text="hello"):
+        return {"contents": [{"role": "user", "parts": [{"text": text}]}]}
+
+
+class ShimTest(GeminiClientMixin, unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.upstream = serve(ThreadingHTTPServer(("127.0.0.1", 0), Upstream))
@@ -82,20 +109,6 @@ class ShimTest(unittest.TestCase):
         Upstream.requests = []
         Upstream.reply = {"message": {"role": "assistant", "content": "hi"}, "done": True,
                           "done_reason": "stop", "prompt_eval_count": 7, "eval_count": 3}
-
-    def post(self, path, body, raw=None, headers=None):
-        data = raw if raw is not None else json.dumps(body).encode()
-        req = urllib.request.Request(self.base + path, data=data, method="POST",
-                                     headers={"Content-Type": "application/json", **(headers or {})})
-        try:
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                return resp.status, resp.read().decode()
-        except urllib.error.HTTPError as e:
-            with e:
-                return e.code, e.read().decode()
-
-    def user(self, text="hello"):
-        return {"contents": [{"role": "user", "parts": [{"text": text}]}]}
 
     # --- paths -------------------------------------------------------------
     def test_tagged_model_streams_with_full_name(self):
@@ -344,6 +357,369 @@ class ShimTest(unittest.TestCase):
             models = json.loads(resp.read())["models"]
         self.assertEqual(models[0]["name"], "models/custom:latest")
         self.assertEqual(models[0]["supportedGenerationMethods"], ["generateContent", "streamGenerateContent", "countTokens"])
+
+
+class OpenAIUpstream(BaseHTTPRequestHandler):
+    """Fake hosted OpenAI-compatible API, shaped like Model Studio compatible-mode."""
+
+    protocol_version = "HTTP/1.1"
+    requests: list = []
+    paths: list = []
+    auth: list = []
+    status: int = 200
+    reply: object = None  # dict -> JSON body; list -> SSE event lines
+
+    def log_message(self, format, *args):  # noqa: A002  # pylint: disable=redefined-builtin
+        pass
+
+    def do_GET(self):
+        OpenAIUpstream.paths.append(self.path)
+        OpenAIUpstream.auth.append(self.headers.get("Authorization"))
+        body = json.dumps({"object": "list", "data": [{"id": "qwen3.8-max"},
+                                                      {"id": "qwen3-coder-plus"}]}).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length") or 0)
+        OpenAIUpstream.requests.append(json.loads(self.rfile.read(length)))
+        OpenAIUpstream.paths.append(self.path)
+        OpenAIUpstream.auth.append(self.headers.get("Authorization"))
+        reply = OpenAIUpstream.reply
+        if isinstance(reply, list):
+            self.send_response(OpenAIUpstream.status)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            for event in reply:  # pylint: disable=not-an-iterable
+                self.wfile.write((event + "\n\n").encode())
+            self.close_connection = True  # pylint: disable=attribute-defined-outside-init
+        else:
+            body = json.dumps(reply).encode()
+            self.send_response(OpenAIUpstream.status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+
+class OpenAIShimTest(GeminiClientMixin, unittest.TestCase):
+    """The --upstream-kind openai path: Gemini wire onto a hosted provider."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.upstream = serve(ThreadingHTTPServer(("127.0.0.1", 0), OpenAIUpstream))
+        cls.origin = f"http://127.0.0.1:{cls.upstream.server_address[1]}/compatible-mode/v1"
+        cls.shim = serve(shim.GeminiShimServer(("127.0.0.1", 0), cls.origin,
+                                               "qwen3.8-max", upstream_kind="openai"))
+        cls.base = f"http://127.0.0.1:{cls.shim.server_address[1]}"
+
+    @classmethod
+    def tearDownClass(cls):
+        for server in (cls.shim, cls.upstream):
+            server.shutdown()
+            server.server_close()
+
+    def setUp(self):
+        OpenAIUpstream.requests = []
+        OpenAIUpstream.paths = []
+        OpenAIUpstream.auth = []
+        OpenAIUpstream.status = 200
+        OpenAIUpstream.reply = {"id": "chatcmpl-1", "model": "qwen3.8-max-0902",
+                                "choices": [{"index": 0, "finish_reason": "stop",
+                                             "message": {"role": "assistant", "content": "hi"}}],
+                                "usage": {"prompt_tokens": 7, "completion_tokens": 3,
+                                          "total_tokens": 10}}
+
+    # --- request translation ------------------------------------------------
+    def test_sampling_controls_land_at_the_top_level(self):
+        request = {**self.user(), "generationConfig": {
+            "temperature": 0.1, "topP": 0.9, "topK": 20, "maxOutputTokens": 64,
+            "stopSequences": ["END"], "seed": 5, "presencePenalty": 0.2,
+            "frequencyPenalty": 0.3}}
+        status, _ = self.post("/v1beta/models/qwen3.8-max:generateContent", request)
+        self.assertEqual(status, 200)
+        sent = OpenAIUpstream.requests[0]
+        self.assertEqual(OpenAIUpstream.paths[0], "/compatible-mode/v1/chat/completions")
+        self.assertEqual(sent["model"], "qwen3.8-max")
+        self.assertEqual(sent["temperature"], 0.1)
+        self.assertEqual(sent["top_p"], 0.9)
+        self.assertEqual(sent["max_tokens"], 64)
+        self.assertEqual(sent["stop"], ["END"])
+        self.assertEqual(sent["seed"], 5)
+        self.assertEqual(sent["presence_penalty"], 0.2)
+        self.assertEqual(sent["frequency_penalty"], 0.3)
+        self.assertNotIn("options", sent, "the OpenAI wire has no options object")
+        self.assertNotIn("top_k", sent, "the OpenAI wire has no top_k")
+        self.assertIs(sent["stream"], False)
+        self.assertNotIn("stream_options", sent)
+
+    def test_stream_asks_for_usage(self):
+        OpenAIUpstream.reply = [sse({"choices": [{"index": 0, "delta": {"content": "hi"}}]}),
+                                "data: [DONE]"]
+        self.post("/v1beta/models/m:streamGenerateContent", self.user())
+        sent = OpenAIUpstream.requests[0]
+        self.assertIs(sent["stream"], True)
+        self.assertEqual(sent["stream_options"], {"include_usage": True})
+
+    def test_system_instruction_and_roles(self):
+        request = {"systemInstruction": {"parts": [{"text": "be brief"}]},
+                   "contents": [{"role": "user", "parts": [{"text": "hi"}]},
+                                {"role": "model", "parts": [{"text": "hello"}]}]}
+        self.post("/v1beta/models/m:generateContent", request)
+        self.assertEqual(OpenAIUpstream.requests[0]["messages"], [
+            {"role": "system", "content": "be brief"},
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "hello"}])
+
+    def test_image_becomes_a_data_url_part(self):
+        request = {"contents": [{"role": "user", "parts": [
+            {"text": "what is this"}, {"inlineData": {"mimeType": "image/png", "data": "iVBORw0K"}}]}]}
+        status, _ = self.post("/v1beta/models/m:generateContent", request)
+        self.assertEqual(status, 200)
+        self.assertEqual(OpenAIUpstream.requests[0]["messages"][0], {"role": "user", "content": [
+            {"type": "text", "text": "what is this"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,iVBORw0K"}}]})
+
+    def test_unsupported_content_is_still_rejected(self):
+        for part in ({"inlineData": {"mimeType": "application/pdf", "data": "x"}},
+                     {"fileData": {"mimeType": "image/png", "fileUri": "gs://b/x"}}):
+            status, body = self.post("/v1beta/models/m:generateContent",
+                                     {"contents": [{"role": "user", "parts": [part]}]})
+            self.assertEqual(status, 400, part)
+            self.assertEqual(json.loads(body)["error"]["status"], "INVALID_ARGUMENT")
+        self.assertEqual(OpenAIUpstream.requests, [])
+
+    def test_tool_history_and_choice_are_rendered_for_openai(self):
+        request = {"contents": [
+            {"role": "user", "parts": [{"text": "list files"}]},
+            {"role": "model", "parts": [{"functionCall": {"name": "ls", "args": {"path": "."},
+                                                          "id": "call_9"}}]},
+            {"role": "user", "parts": [{"functionResponse": {"name": "ls",
+                                                             "response": {"files": ["a"]}}}]},
+        ], "tools": [{"functionDeclarations": [{"name": "ls", "description": "List",
+                                                "parameters": {"type": "OBJECT", "properties": {
+                                                    "path": {"type": "STRING"}}}}]}],
+            "toolConfig": {"functionCallingConfig": {"mode": "ANY"}}}
+        self.post("/v1beta/models/m:generateContent", request)
+        sent = OpenAIUpstream.requests[0]
+        self.assertEqual(sent["messages"][1]["tool_calls"], [{
+            "id": "call_9", "type": "function",
+            "function": {"name": "ls", "arguments": '{"path": "."}'}}])
+        self.assertEqual(sent["messages"][2], {"role": "tool", "tool_call_id": "call_9",
+                                               "content": '{"files": ["a"]}'})
+        self.assertEqual(sent["tools"], [{"type": "function", "function": {
+            "name": "ls", "description": "List",
+            "parameters": {"type": "object", "properties": {"path": {"type": "string"}}}}}])
+        self.assertEqual(sent["tool_choice"], "required")
+
+    def test_tool_result_without_an_id_is_matched_by_name(self):
+        request = {"contents": [
+            {"role": "model", "parts": [{"functionCall": {"name": "ls", "args": {}}}]},
+            {"role": "user", "parts": [{"functionResponse": {"name": "ls",
+                                                             "response": {"ok": True}}}]},
+        ]}
+        self.post("/v1beta/models/m:generateContent", request)
+        sent = OpenAIUpstream.requests[0]
+        self.assertEqual(sent["messages"][1]["tool_call_id"],
+                         sent["messages"][0]["tool_calls"][0]["id"])
+
+    def test_mode_none_drops_tools_and_choice(self):
+        request = {**self.user(), "tools": [{"functionDeclarations": [{"name": "ls"}]}],
+                   "toolConfig": {"functionCallingConfig": {"mode": "NONE"}}}
+        self.post("/v1beta/models/m:generateContent", request)
+        self.assertNotIn("tools", OpenAIUpstream.requests[0])
+        self.assertNotIn("tool_choice", OpenAIUpstream.requests[0])
+
+    def test_json_modes(self):
+        self.post("/v1beta/models/m:generateContent",
+                  {**self.user(), "generationConfig": {"responseMimeType": "application/json"}})
+        self.assertEqual(OpenAIUpstream.requests[0]["response_format"], {"type": "json_object"})
+        self.post("/v1beta/models/m:generateContent", {**self.user(), "generationConfig": {
+            "responseSchema": {"type": "OBJECT", "properties": {"a": {"type": "INTEGER"}}}}})
+        self.assertEqual(OpenAIUpstream.requests[1]["response_format"], {
+            "type": "json_schema",
+            "json_schema": {"name": "response_schema", "strict": True,
+                            "schema": {"type": "object",
+                                       "properties": {"a": {"type": "integer"}}}}})
+
+    def test_thinking_is_forwarded_only_when_the_surface_allows_it(self):
+        off = {"generationConfig": {"thinkingConfig": {"thinkingBudget": 0}}}
+        self.post("/v1beta/models/m:generateContent", {**self.user(), **off})
+        self.assertIs(OpenAIUpstream.requests[0]["enable_thinking"], False)
+        on = {"generationConfig": {"thinkingConfig": {"includeThoughts": True,
+                                                      "thinkingBudget": 512}}}
+        self.post("/v1beta/models/m:generateContent", {**self.user(), **on})
+        self.assertNotIn("enable_thinking", OpenAIUpstream.requests[1],
+                         "compatible-mode refuses enable_thinking=true without streaming")
+        OpenAIUpstream.reply = [sse({"choices": [{"index": 0, "delta": {"content": "x"}}]}),
+                                "data: [DONE]"]
+        self.post("/v1beta/models/m:streamGenerateContent", {**self.user(), **on})
+        sent = OpenAIUpstream.requests[2]
+        self.assertIs(sent["enable_thinking"], True)
+        self.assertEqual(sent["thinking_budget"], 512)
+
+    # --- response translation -----------------------------------------------
+    def test_completion_becomes_a_gemini_candidate(self):
+        OpenAIUpstream.reply = {"model": "qwen3.8-max-0902",
+                                "choices": [{"index": 0, "finish_reason": "stop",
+                                             "message": {"role": "assistant", "content": "42",
+                                                         "reasoning_content": "let me think"}}],
+                                "usage": {"prompt_tokens": 10, "completion_tokens": 5,
+                                          "total_tokens": 15}}
+        _, body = self.post("/v1beta/models/qwen3.8-max:generateContent", self.user())
+        data = json.loads(body)
+        self.assertEqual(data["candidates"][0]["content"]["parts"],
+                         [{"text": "let me think", "thought": True}, {"text": "42"}])
+        self.assertEqual(data["candidates"][0]["finishReason"], "STOP")
+        self.assertEqual(data["usageMetadata"], {"promptTokenCount": 10,
+                                                 "candidatesTokenCount": 5, "totalTokenCount": 15})
+        self.assertEqual(data["modelVersion"], "qwen3.8-max",
+                         "the requested id is echoed, not the upstream's snapshot name")
+
+    def test_length_finish_reason_maps_to_max_tokens(self):
+        OpenAIUpstream.reply = {"choices": [{"index": 0, "finish_reason": "length",
+                                             "message": {"content": "cut"}}], "usage": {}}
+        _, body = self.post("/v1beta/models/m:generateContent", self.user())
+        data = json.loads(body)
+        self.assertEqual(data["candidates"][0]["finishReason"], "MAX_TOKENS")
+        self.assertEqual(data["usageMetadata"], {"promptTokenCount": 0,
+                                                 "candidatesTokenCount": 0, "totalTokenCount": 0})
+
+    def test_upstream_tool_call_becomes_a_function_call(self):
+        OpenAIUpstream.reply = {"choices": [{"index": 0, "finish_reason": "tool_calls",
+                                             "message": {"content": "", "tool_calls": [
+                                                 {"id": "call_1", "type": "function",
+                                                  "function": {"name": "ls",
+                                                               "arguments": '{"path": "/tmp"}'}}]}}],
+                                "usage": {}}
+        _, body = self.post("/v1beta/models/m:generateContent", self.user())
+        candidate_ = json.loads(body)["candidates"][0]
+        self.assertEqual(candidate_["content"]["parts"],
+                         [{"functionCall": {"name": "ls", "args": {"path": "/tmp"}, "id": "call_1"}}])
+        self.assertEqual(candidate_["finishReason"], "STOP")
+
+    def test_streamed_text_is_relayed_piecewise(self):
+        OpenAIUpstream.reply = [
+            sse({"choices": [{"index": 0, "delta": {"content": "Hel"}}]}),
+            sse({"choices": [{"index": 0, "delta": {"content": "lo"}}]}),
+            sse({"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                 "usage": {"prompt_tokens": 4, "completion_tokens": 2, "total_tokens": 6}}),
+            "data: [DONE]",
+        ]
+        _, body = self.post("/v1beta/models/m:streamGenerateContent", self.user())
+        chunks = json.loads(body)
+        self.assertEqual("".join(p["text"] for c in chunks
+                                 for p in c["candidates"][0]["content"]["parts"]), "Hello")
+        self.assertEqual(chunks[-1]["candidates"][0]["finishReason"], "STOP")
+        self.assertEqual(chunks[-1]["usageMetadata"], {"promptTokenCount": 4,
+                                                       "candidatesTokenCount": 2,
+                                                       "totalTokenCount": 6})
+
+    def test_sse_framing_is_honoured(self):
+        OpenAIUpstream.reply = [sse({"choices": [{"index": 0, "delta": {"content": "x"}}]}),
+                                sse({"choices": [{"index": 0, "delta": {},
+                                                  "finish_reason": "stop"}]}),
+                                "data: [DONE]"]
+        _, body = self.post("/v1beta/models/m:streamGenerateContent?alt=sse", self.user())
+        events = [json.loads(line[6:]) for line in body.splitlines() if line.startswith("data: ")]
+        # A chunk carrying only finish_reason yields no candidate of its own;
+        # it closes the terminal one.
+        self.assertEqual(len(events), 2)
+        self.assertEqual(events[0]["candidates"][0]["content"]["parts"], [{"text": "x"}])
+        self.assertNotIn("finishReason", events[0]["candidates"][0])
+        self.assertEqual(events[-1]["candidates"][0]["finishReason"], "STOP")
+
+    def test_streamed_tool_call_fragments_are_reassembled(self):
+        OpenAIUpstream.reply = [
+            sse({"choices": [{"index": 0, "delta": {"reasoning_content": "hmm"}}]}),
+            sse({"choices": [{"index": 0, "delta": {"tool_calls": [
+                {"index": 0, "id": "call_1", "type": "function",
+                 "function": {"name": "ls", "arguments": '{"pa'}}]}}]}),
+            sse({"choices": [{"index": 0, "delta": {"tool_calls": [
+                {"index": 0, "function": {"arguments": 'th": "/tmp"}'}}]}}]}),
+            sse({"choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}],
+                 "usage": {"prompt_tokens": 4, "completion_tokens": 6, "total_tokens": 10}}),
+            "data: [DONE]",
+        ]
+        _, body = self.post("/v1beta/models/m:streamGenerateContent?alt=sse", self.user())
+        events = [json.loads(line[6:]) for line in body.splitlines() if line.startswith("data: ")]
+        self.assertEqual(events[0]["candidates"][0]["content"]["parts"],
+                         [{"text": "hmm", "thought": True}])
+        self.assertNotIn("finishReason", events[0]["candidates"][0])
+        final = events[-1]["candidates"][0]
+        self.assertEqual(final["content"]["parts"], [{"functionCall": {
+            "name": "ls", "args": {"path": "/tmp"}, "id": "call_1"}}])
+        self.assertEqual(final["finishReason"], "STOP")
+        self.assertEqual(events[-1]["usageMetadata"], {"promptTokenCount": 4,
+                                                       "candidatesTokenCount": 6,
+                                                       "totalTokenCount": 10})
+
+    def test_done_without_a_finish_reason_still_terminates(self):
+        OpenAIUpstream.reply = [sse({"choices": [{"index": 0, "delta": {"content": "ok"}}]}),
+                                "data: [DONE]"]
+        _, body = self.post("/v1beta/models/m:streamGenerateContent", self.user())
+        chunks = json.loads(body)
+        self.assertEqual(chunks[-1]["candidates"][0]["finishReason"], "STOP")
+        self.assertNotIn("error", chunks[-1])
+
+    def test_truncated_stream_is_reported(self):
+        OpenAIUpstream.reply = [sse({"choices": [{"index": 0, "delta": {"content": "part"}}]})]
+        _, body = self.post("/v1beta/models/m:streamGenerateContent", self.user())
+        self.assertIn("ended before completion", json.loads(body)[-1]["error"]["message"])
+
+    def test_mid_stream_error_is_reported(self):
+        OpenAIUpstream.reply = [sse({"choices": [{"index": 0, "delta": {"content": "part"}}]}),
+                                sse({"error": {"message": "upstream broke"}})]
+        _, body = self.post("/v1beta/models/m:streamGenerateContent", self.user())
+        self.assertIn("upstream broke", json.loads(body)[-1]["error"]["message"])
+
+    # --- catalogue and credentials -------------------------------------------
+    def test_model_listing_reads_the_openai_catalogue(self):
+        with urllib.request.urlopen(self.base + "/v1beta/models", timeout=10) as resp:
+            models = json.loads(resp.read())["models"]
+        self.assertEqual(OpenAIUpstream.paths[0], "/compatible-mode/v1/models")
+        self.assertEqual([m["name"] for m in models],
+                         ["models/qwen3.8-max", "models/qwen3-coder-plus"])
+
+    def test_provider_key_reaches_the_upstream_as_bearer(self):
+        keyed = serve(shim.GeminiShimServer(("127.0.0.1", 0), self.origin, "qwen3.8-max",
+                                            "sk-sp-fixture", upstream_kind="openai"))
+        try:
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{keyed.server_address[1]}/v1beta/models/m:generateContent",
+                data=json.dumps(self.user()).encode(), method="POST")
+            with urllib.request.urlopen(req, timeout=10):
+                pass
+            self.assertEqual(OpenAIUpstream.auth[-1], "Bearer sk-sp-fixture")
+        finally:
+            keyed.shutdown()
+            keyed.server_close()
+
+    def test_upstream_error_message_is_extracted(self):
+        OpenAIUpstream.status = 400
+        OpenAIUpstream.reply = {"error": {"message": "model 'qwen9' not found",
+                                          "type": "invalid_request_error",
+                                          "code": "Model.NotFound"}}
+        status, body = self.post("/v1beta/models/qwen9:generateContent", self.user())
+        self.assertEqual(status, 400)
+        error = json.loads(body)["error"]
+        self.assertEqual(error["message"], "model 'qwen9' not found")
+        self.assertEqual(error["status"], "INVALID_ARGUMENT")
+
+    def test_count_tokens_never_reaches_the_upstream(self):
+        status, body = self.post("/v1beta/models/m:countTokens", self.user("x" * 40))
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body), {"totalTokens": 10})
+        self.assertEqual(OpenAIUpstream.requests, [])
+
+    def test_unknown_upstream_kind_is_refused(self):
+        with self.assertRaises(ValueError):
+            shim.GeminiShimServer(("127.0.0.1", 0), "http://127.0.0.1:1", "d",
+                                  upstream_kind="gemini")
 
 
 if __name__ == "__main__":

@@ -9,9 +9,12 @@
 #   * the shim answers /healthz, and is reaped when kimo exits
 #   * settings.json is patched for the session (modelProvider=gemini +
 #     customModelsConfig.customModels[<model>]) and restored on exit
-#   * GEMINI_API_KEY is NOT scrubbed - it only ever reaches the localhost shim,
-#     whose upstream requests carry no auth (unlike qwen/claude); the shim
-#     answers only that key (a random one per session when it is unset)
+#   * GEMINI_API_KEY is NOT scrubbed - it is the shim's own session key rather
+#     than a provider credential, and it only ever reaches the localhost shim;
+#     the shim answers only that key (a random one per session when it is unset).
+#     This Ollama path carries no upstream auth at all; the '--provider
+#     dashscope' path, where the shim does hold a provider key, is covered by
+#     tests/dashscope-smoke.sh
 #
 # The real shim is started (it is local and reaped), but AGY_SETTINGS is pointed
 # at a temp file so the user's real settings.json is never touched.

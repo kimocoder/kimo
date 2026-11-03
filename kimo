@@ -158,8 +158,8 @@ _kimo_config_check() {
             ;;
         cloud_provider)
             case "${val}" in
-                ""|none|ollama|abliteration|codex|openai|dashscope|qwencloud|xai|grok|anthropic|claude|gemini) ;;
-                *) echo "expected one of: ollama, abliteration, codex, openai, dashscope, qwencloud, xai (grok), anthropic, claude, gemini (got '${val}')"; return 1 ;;
+                ""|none|ollama|abliteration|codex|openai|dashscope|alibaba|qwencloud|xai|grok|anthropic|claude|gemini|vllm) ;;
+                *) echo "expected one of: ollama, abliteration, codex, openai, dashscope, alibaba, qwencloud, xai (grok), anthropic, claude, gemini, vllm (got '${val}')"; return 1 ;;
             esac
             ;;
         web_max_results)
@@ -361,9 +361,15 @@ DASHSCOPE_DEFAULT_MODEL="qwen3.8-max"
 # qwen3.8-max's context window as the user's own model registrations declare
 # it; --ctx and KIMO_DASHSCOPE_CTX override.
 DASHSCOPE_DEFAULT_CTX="${KIMO_DASHSCOPE_CTX:-1000000}"
-# CLIs whose launch branch knows how to reach DashScope.
+# Alibaba Model Studio / free tier context window (default 500,000 tokens
+# to prevent DeepSeek compaction loops; --ctx and KIMO_ALIBABA_CTX override).
+ALIBABA_DEFAULT_CTX="${KIMO_ALIBABA_CTX:-500000}"
+# CLIs whose launch branch knows how to reach DashScope / Alibaba.
 # codex rides the OpenAI-compatible Responses surface, not the Anthropic app.
-DASHSCOPE_CLIS="claude kimi codex"
+# agy speaks only the Gemini wire, so it rides the loopback shim in its
+# OpenAI-compatible mode (see agy_start_shim).
+DASHSCOPE_CLIS="claude kimi codex agy"
+ALIBABA_CLIS="${DASHSCOPE_CLIS}"
 # The token-plan (subscription) surface. Key class picks the surface: sk-sp-
 # keys belong here and 401 on pay-as-you-go intl, sk-ws-/sk- keys the other
 # way round. Both surfaces also speak the Anthropic wire under /apps/anthropic
@@ -408,6 +414,17 @@ ANTHROPIC_CODEX_CTX="${KIMO_ANTHROPIC_CTX:-1000000}"
 GEMINI_CODEX_BASE_URL="${KIMO_GEMINI_BASE_URL:-https://generativelanguage.googleapis.com/v1beta/openai}"
 GEMINI_CODEX_MODEL="${KIMO_GEMINI_MODEL:-gemini-2.5-flash}"
 GEMINI_CODEX_CTX="${KIMO_GEMINI_CTX:-1000000}"
+
+# vLLM's OpenAI-compatible server. Selected with 'launch --provider vllm'.
+# It is a self-hosted inference process, not an Ollama daemon and not a hosted
+# cloud API: no /api/tags, no VRAM eviction, no tune registry. The default
+# listen address is 127.0.0.1:8000 and the chat routes live under /v1.
+# KIMO_VLLM_CTX is the window used when the server does not report
+# max_model_len and the user did not pass --ctx.
+VLLM_BASE_URL_DEFAULT="http://127.0.0.1:8000/v1"
+VLLM_DEFAULT_CTX="${KIMO_VLLM_CTX:-32768}"
+# CLIs whose launch branch knows how to reach a vLLM server.
+VLLM_CLIS="kimi"
 
 # True when <url> can be embedded in a Codex -c TOML string: https, no query,
 # no spaces, no quotes.
@@ -548,19 +565,73 @@ sys.exit(1)
 PY
 }
 
+# Updates max_context_size for a registered model in Kimi Code's config.toml
+# so auto-compaction does not loop prematurely on smaller default allocations.
+_kimi_sync_model_context() {
+    local config_file="$1"
+    local model_alias="$2"
+    local target_ctx="$3"
+    [[ -f "${config_file}" && -n "${target_ctx}" ]] || return 0
+    python3 - "${config_file}" "${model_alias}" "${target_ctx}" <<'PY' 2>/dev/null || true
+import sys
+try:
+    import tomlkit
+    path = sys.argv[1]
+    alias = sys.argv[2]
+    ctx = int(sys.argv[3])
+    with open(path, "r", encoding="utf-8") as fh:
+        doc = tomlkit.parse(fh.read())
+    models = doc.get("models")
+    if models is not None:
+        target_key = None
+        if alias in models:
+            target_key = alias
+        elif f"alibaba/{alias}" in models:
+            target_key = f"alibaba/{alias}"
+        elif alias.startswith("alibaba/") and alias[len("alibaba/"):] in models:
+            target_key = alias[len("alibaba/"):]
+        if target_key:
+            mdl = models[target_key]
+            if mdl.get("max_context_size") != ctx:
+                mdl["max_context_size"] = ctx
+                with open(path, "w", encoding="utf-8") as fh:
+                    fh.write(tomlkit.dumps(doc))
+        elif "alibaba" in doc.get("providers", {}):
+            bare_model = alias[len("alibaba/"):] if alias.startswith("alibaba/") else alias
+            key_name = alias if alias.startswith("alibaba/") else f"alibaba/{alias}"
+            tbl = tomlkit.table()
+            tbl["provider"] = "alibaba"
+            tbl["model"] = bare_model
+            tbl["max_context_size"] = ctx
+            tbl["max_output_size"] = 32768
+            models[key_name] = tbl
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(tomlkit.dumps(doc))
+except Exception:
+    pass
+PY
+}
+
 # Backend names 'launch --provider' accepts, in the order they are offered by
 # completion and listed in errors. 'none' and '' are synonyms for ollama.
-KIMO_LAUNCH_PROVIDERS="ollama abliteration codex openai dashscope qwencloud xai anthropic claude gemini"
+KIMO_LAUNCH_PROVIDERS="ollama abliteration codex openai dashscope alibaba qwencloud xai anthropic claude gemini vllm"
 
 # True when <name> is a hosted inference API rather than a self-hosted Ollama
 # daemon: no host probing, no /api/tags resolution, no VRAM eviction, no tune
 # registry, and the selected provider's own credential is forwarded instead of
 # being scrubbed (scrubbing it would make every request 401).
+# vLLM is intentionally absent: it is self-hosted, often on another machine,
+# so unrelated credentials are still scrubbed. Its own key stays in VLLM_API_KEY.
 hosted_provider() {
     case "${1:-}" in
-        abliteration|codex|openai|dashscope|qwencloud|xai|anthropic|claude|gemini) return 0 ;;
+        abliteration|codex|openai|dashscope|alibaba|qwencloud|xai|anthropic|claude|gemini) return 0 ;;
         *) return 1 ;;
     esac
+}
+
+# True when this launch must not talk to an Ollama daemon at all.
+skips_ollama_daemon() {
+    hosted_provider "${1:-}" || [[ "${1:-}" == vllm ]]
 }
 
 # True when <name> is one of OpenAI's own backends (as opposed to abliteration).
@@ -752,6 +823,11 @@ OPT_REMOTE=false
 OPT_LOCAL=false
 OPT_HOST=""
 OPT_HOSTS=()
+# A --host the user typed, before default_host from the config file is applied.
+# --provider vllm uses this raw value; a configured Ollama host must not
+# silently become the vLLM server.
+OPT_HOST_FROM_CLI=false
+OPT_HOST_RAW=""
 OPT_JSON=false
 # Keep a no_color=true the config loader already applied; --no-color adds to it.
 FORCE_NO_COLOR="${FORCE_NO_COLOR:-false}"
@@ -809,6 +885,8 @@ while [[ $# -gt 0 ]]; do
                 echo "Error: --host requires an address argument." >&2
                 exit 1
             fi
+            OPT_HOST_FROM_CLI=true
+            [[ -z "${OPT_HOST_RAW}" ]] && OPT_HOST_RAW="$1"
             OPT_HOSTS+=("$1")
             shift
             ;;
@@ -818,6 +896,8 @@ while [[ $# -gt 0 ]]; do
                 shift
                 continue
             fi
+            OPT_HOST_FROM_CLI=true
+            [[ -z "${OPT_HOST_RAW}" ]] && OPT_HOST_RAW="${1#*=}"
             OPT_HOSTS+=("${1#*=}")
             shift
             ;;
@@ -984,9 +1064,10 @@ command_needs_remote() {
                 esac
             done
             case "${backend}" in
-                codex|openai|abliteration|dashscope|qwencloud|xai|grok|anthropic|claude|gemini) return 1 ;;
+                codex|openai|abliteration|dashscope|alibaba|qwencloud|xai|grok|anthropic|claude|gemini|vllm) return 1 ;;
                 "")
                     [[ "${model}" == codex/* || "${model}" == codex ]] && return 1
+                    [[ "${model}" == vllm/* ]] && return 1
                     if [[ "${cli}" == codex || "${cli}" == kimi ]] && ! ${explicit} \
                         && [[ -n "${CODEX_API_KEY:-}${CODEX_AUTH_TOKEN:-}" ]]; then
                         return 1
@@ -1430,6 +1511,247 @@ abliteration_sync_kimi() (
         flock -w 15 9 || { echo "Error: Kimi config is busy; retry the abliteration sync." >&2; return 1; }
     fi
     _kimi_write_models "${KIMI_CONFIG}" "abliteration" "${url}" "${specs}" "${alias}" "ABLITERATION_API_KEY" || rc=$?
+    if ((rc != 0)); then
+        _kimi_config_error "${rc}"
+        return 1
+    fi
+    printf '%s' "${alias}"
+)
+
+# Normalize a vLLM server address into an OpenAI base URL (.../v1).
+# Accepts a bare host, host:port, or an http(s) URL with or without /v1.
+# A missing port becomes 8000 (vLLM's default), never Ollama's 11434.
+# Prints the base on success. Returns 1 when the value cannot be a base URL
+# (userinfo, query, spaces, or a non-http scheme).
+vllm_normalize_base() {
+    local raw="${1:-}" scheme rest authority path="" hostport url
+    [[ -n "${raw}" ]] || return 1
+    while [[ "${raw}" == */ ]]; do raw="${raw%/}"; done
+    if [[ "${raw}" != *://* ]]; then
+        raw="http://${raw}"
+    fi
+    [[ "${raw}" =~ ^([Hh][Tt][Tt][Pp][Ss]?)://(.*)$ ]] || return 1
+    scheme="${BASH_REMATCH[1],,}"
+    rest="${BASH_REMATCH[2]}"
+    while [[ "${rest}" == */ ]]; do rest="${rest%/}"; done
+    [[ -n "${rest}" && "${rest}" != /* ]] || return 1
+    authority="${rest%%/*}"
+    if [[ "${rest}" == */* ]]; then
+        path="/${rest#*/}"
+        while [[ "${path}" == */ ]]; do path="${path%/}"; done
+        while [[ "${path}" == //* ]]; do path="/${path#/}"; done
+    fi
+    # A user:pass@host URL would put a secret in the config and in process
+    # listings. The API key belongs in VLLM_API_KEY.
+    [[ "${authority}" != *@* && -n "${authority}" ]] || return 1
+    hostport="${authority}"
+    if [[ "${hostport}" == *:*:* && "${hostport}" != \[* && "${hostport}" =~ ^[0-9A-Fa-f:.]+$ ]]; then
+        hostport="[${hostport}]"
+        authority="${hostport}"
+    fi
+    if [[ ! "${hostport}" =~ ^(\[[^]]+\]|[^:]+):[0-9]+$ ]]; then
+        authority="${authority}:8000"
+    fi
+    if [[ "${path}" != */v1 ]]; then
+        path="${path}/v1"
+    fi
+    url="${scheme}://${authority}${path}"
+    [[ "${url}" =~ ^https?://(\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9._-]+):[0-9]+(/[A-Za-z0-9._~/-]+)?$ ]] || return 1
+    printf '%s\n' "${url}"
+}
+
+# The vLLM OpenAI base for this launch.
+# Precedence: $KIMO_VLLM_BASE_URL, $VLLM_BASE_URL, a --host typed on the
+# command line, then http://127.0.0.1:8000/v1. A default_host from the config
+# file is an Ollama address and is not consulted.
+vllm_resolve_base() {
+    local raw="" url
+    if [[ -n "${KIMO_VLLM_BASE_URL:-}" ]]; then
+        raw="${KIMO_VLLM_BASE_URL}"
+    elif [[ -n "${VLLM_BASE_URL:-}" ]]; then
+        raw="${VLLM_BASE_URL}"
+    elif [[ "${OPT_HOST_FROM_CLI:-false}" == true && -n "${OPT_HOST_RAW:-}" ]]; then
+        raw="${OPT_HOST_RAW}"
+    else
+        raw="${VLLM_BASE_URL_DEFAULT}"
+    fi
+    if ! url=$(vllm_normalize_base "${raw}"); then
+        echo "${C_RED}Error: vLLM base URL must be an http(s) origin without userinfo, query or spaces (got '${raw}').${C_RESET}" >&2
+        echo "${C_DIM}    Set KIMO_VLLM_BASE_URL (for example http://127.0.0.1:8000/v1) or pass --host before 'launch'.${C_RESET}" >&2
+        return 1
+    fi
+    printf '%s\n' "${url}"
+}
+
+# Provider id written into kimi's config. The default localhost server keeps
+# the short name 'vllm'; any other base gets its own block so two servers do
+# not overwrite each other's base_url.
+vllm_provider_id() {
+    local base="$1" slug
+    case "${base}" in
+        http://127.0.0.1:8000/v1|http://localhost:8000/v1|http://[::1]:8000/v1)
+            printf 'vllm\n'
+            ;;
+        *)
+            slug="${base#*://}"
+            slug="${slug//[^a-zA-Z0-9]/-}"
+            printf 'vllm-%s\n' "${slug}"
+            ;;
+    esac
+}
+
+# The optional vLLM API key. Empty (return 1) when the server was started
+# without --api-key. Return 2 when the value cannot be a bearer token.
+# 'ollama' is kimo's own placeholder and is not a vLLM credential.
+vllm_api_key() {
+    local k="${VLLM_API_KEY:-}"
+    [[ -n "${k}" && "${k}" != "ollama" ]] || return 1
+    if [[ "${k}" =~ [[:space:][:cntrl:]] ]]; then
+        echo "${C_RED}Error: VLLM_API_KEY contains whitespace or control characters, so it cannot be sent as a bearer token.${C_RESET}" >&2
+        return 2
+    fi
+    printf '%s\n' "${k}"
+}
+
+# True when the served model id is one vLLM is commonly started with a
+# reasoning parser for. The check is the id only; KIMO_KIMI_CAPABILITIES
+# still overrides the launched model.
+vllm_model_thinking() {
+    local id="${1,,}"
+    [[ "${id}" =~ (deepseek-r1|qwq|thinking|reasoner|reasoning) ]] && return 0
+    [[ "${id}" =~ (^|[-_/])r1($|[-_/.]) ]] && return 0
+    return 1
+}
+
+# GET <base>/models. Prints the JSON body on success.
+# rc: 0 = a list of ids, 2 = 401/403, 1 = unreachable or unusable.
+# The key, when set, rides curl_bearer so it never appears in argv.
+vllm_fetch_models() {
+    local base="$1" key="${2:-}" tmp status rc=0
+    tmp=$(mktemp) || return 1
+    if [[ -n "${key}" ]]; then
+        status=$(curl_bearer "${key}" -s --connect-timeout 2 -m 5 \
+            -o "${tmp}" -w '%{http_code}' "${base}/models" 2>/dev/null) || rc=$?
+    else
+        status=$(curl -s --connect-timeout 2 -m 5 \
+            -o "${tmp}" -w '%{http_code}' "${base}/models" 2>/dev/null) || rc=$?
+    fi
+    if ((rc != 0)); then
+        rm -f "${tmp}"
+        return 1
+    fi
+    case "${status}" in
+        200) ;;
+        401|403)
+            rm -f "${tmp}"
+            return 2
+            ;;
+        *)
+            rm -f "${tmp}"
+            return 1
+            ;;
+    esac
+    if ! jq -e '[.data[]?.id | select(type == "string" and length > 0)] | length > 0' \
+        "${tmp}" >/dev/null 2>&1; then
+        rm -f "${tmp}"
+        return 1
+    fi
+    cat "${tmp}"
+    rm -f "${tmp}"
+}
+
+# Pick the context window for one launch.
+# argv: requested-or-empty maxlen-or-empty
+# --ctx / KIMO_KIMI_CONTEXT win, then the server's max_model_len, then
+# KIMO_VLLM_CTX (default 32768). A request above max_model_len is capped.
+vllm_choose_ctx() {
+    local requested="$1" maxlen="$2" ctx="${KIMO_VLLM_CTX:-32768}"
+    if [[ -n "${requested}" ]]; then
+        ctx="${requested}"
+        if [[ ! "${ctx}" =~ ^[1-9][0-9]*$ ]]; then
+            echo "${C_RED}Error: vLLM context window must be a positive integer (got '${ctx}').${C_RESET}" >&2
+            return 1
+        fi
+        if [[ "${maxlen}" =~ ^[0-9]+$ ]] && ((ctx > maxlen)); then
+            echo "${C_YELLOW}[!] Warning: Requested context (${ctx}) exceeds the vLLM window (${maxlen}). Capping to ${maxlen}.${C_RESET}" >&2
+            ctx="${maxlen}"
+        fi
+    elif [[ "${maxlen}" =~ ^[0-9]+$ ]]; then
+        ctx="${maxlen}"
+    fi
+    if [[ ! "${ctx}" =~ ^[1-9][0-9]*$ ]]; then
+        echo "${C_RED}Error: vLLM context window must be a positive integer (got '${ctx}').${C_RESET}" >&2
+        return 1
+    fi
+    printf '%s\n' "${ctx}"
+}
+
+# Register [providers.<pid>] and one alias per served model. A real key is
+# stored as api_key_env = VLLM_API_KEY (the name only). With no key the
+# placeholder is EMPTY, which a vLLM started without --api-key accepts.
+# Prints the launched alias. argv:
+#   pid base models_json resolved ctx caps efforts deff off rkey has_key
+vllm_sync_kimi() (
+    local pid="$1" base="$2" models_json="$3" resolved="$4"
+    local tctx="$5" tcaps="$6" tefforts="$7" tdeff="$8" toff="$9" trkey="${10}"
+    local has_key="${11}"
+    local specs="" spec alias="${pid}/${resolved}" rc=0
+    [[ "${models_json}" == \{* ]] || models_json='{"data":[]}'
+    if ! command -v jq >/dev/null 2>&1; then
+        return 1
+    fi
+    specs=$(printf '%s' "${models_json}" | jq -c \
+        --arg pid "${pid}" --arg resolved "${resolved}" \
+        --arg tctx "${tctx}" --arg tcaps "${tcaps}" --arg tefforts "${tefforts}" \
+        --arg tdeff "${tdeff}" --arg toff "${toff}" --arg trkey "${trkey}" \
+        --arg defctx "${VLLM_DEFAULT_CTX}" '
+        def thinking($id):
+          ($id | ascii_downcase) as $s
+          | ($s | test("deepseek-r1|qwq|thinking|reasoner|reasoning|(^|[-_/])r1($|[-_/.])"));
+        def caps($id): if thinking($id) then "thinking,tool_use" else "tool_use" end;
+        def row($id; $ctx; $caps; $efforts; $deff; $off; $rkey):
+          {alias: ($pid + "/" + $id), model: $id, ctx: $ctx, caps: $caps,
+           efforts: $efforts, deff: $deff, off: $off, rkey: $rkey,
+           display_name: ($id + " (vllm)")};
+        [.data[]?
+          | select(.id? | type == "string" and test("^[A-Za-z0-9._:/-]+$"))
+          | . as $m
+          | ($m.id) as $id
+          | if $id == $resolved then
+              row($id; $tctx; $tcaps; $tefforts; $tdeff; $toff; $trkey)
+            else
+              (if thinking($id) then "low,medium,high" else "" end) as $eff
+              | row($id;
+                  (($m.max_model_len // $m.context_length // $defctx) | tostring);
+                  caps($id); $eff;
+                  (if $eff != "" then "high" else "" end);
+                  (if $eff != "" then "low" else "" end);
+                  (if $eff != "" then "reasoning_content" else "" end))
+            end]
+        ') || return 1
+    [[ "${specs}" == \[* ]] || specs="[]"
+    if ! printf '%s' "${specs}" | jq -e --arg id "${resolved}" 'any(.[]; .model == $id)' >/dev/null 2>&1; then
+        spec=$(jq -nc \
+            --arg alias "${alias}" --arg model "${resolved}" --arg ctx "${tctx}" \
+            --arg caps "${tcaps}" --arg efforts "${tefforts}" --arg deff "${tdeff}" \
+            --arg off "${toff}" --arg rkey "${trkey}" --arg dn "${resolved} (vllm)" \
+            '{alias: $alias, model: $model, ctx: $ctx, caps: $caps, efforts: $efforts, deff: $deff, off: $off, rkey: $rkey, display_name: $dn}') || return 1
+        specs=$(printf '%s' "${specs}" | jq -c --argjson s "${spec}" '. + [$s]') || return 1
+    fi
+    if ! printf '%s' "${specs}" | jq -e 'length > 0' >/dev/null 2>&1; then
+        return 1
+    fi
+    ensure_private_dir "${KIMO_RUNTIME_DIR}" 2>/dev/null || true
+    mkdir -p "$(dirname "${KIMI_CONFIG_LOCK}")" "$(dirname "${KIMI_CONFIG}")" || return 1
+    if command -v flock >/dev/null 2>&1; then
+        exec 9>>"${KIMI_CONFIG_LOCK}" || return 1
+        flock -w 15 9 || { echo "Error: Kimi config is busy; retry the vLLM sync." >&2; return 1; }
+    fi
+    if [[ "${has_key}" == yes ]]; then
+        _kimi_write_models "${KIMI_CONFIG}" "${pid}" "${base}" "${specs}" "${alias}" "VLLM_API_KEY" || rc=$?
+    else
+        _kimi_write_models "${KIMI_CONFIG}" "${pid}" "${base}" "${specs}" "${alias}" "" "EMPTY" || rc=$?
+    fi
     if ((rc != 0)); then
         _kimi_config_error "${rc}"
         return 1
@@ -5336,7 +5658,9 @@ cmd_sync() {
 # --model alone therefore does nothing: agy rejects the unknown id with a
 # warning and quietly runs a Google model instead, while this script's banner
 # claims an Ollama model and host. A per-session shim translates the Gemini
-# wire format to /api/chat against whichever host the model resolved to.
+# wire format to /api/chat against whichever host the model resolved to, or to
+# /chat/completions when the host is a hosted OpenAI-compatible API instead
+# ('--provider dashscope': Model Studio exposes no Gemini endpoint).
 AGY_SETTINGS="${AGY_SETTINGS:-${HOME:-/root}/.gemini/antigravity-cli/settings.json}"
 GEMINI_SHIM_PATHS=(
     "${KIMO_GEMINI_SHIM:-}"
@@ -5493,8 +5817,20 @@ agy_cleanup() {
 # listener answers /healthz. Must not be called in a command substitution: the
 # background python has to stay a child of this shell or agy_cleanup can
 # neither wait on it nor kill it, and every launch would leak a listener.
+#
+# <kind> is the wire the upstream speaks: 'ollama' (default) posts /api/chat,
+# 'openai' posts /chat/completions, which is how a hosted OpenAI-compatible
+# API such as Model Studio is reached. <token_var> names the environment
+# variable holding that API's key; the value reaches the shim by environment
+# and is never expanded into argv or exported to agy.
 agy_start_shim() {
-    local shim="$1" upstream="$2" model="$3" tries=0
+    local shim="$1" upstream="$2" model="$3" kind="${4:-ollama}" token_var="${5:-}" tries=0
+    # An ambient KIMO_SHIM_UPSTREAM_TOKEN still works for a token-protected
+    # Ollama bridge; a provider key named by <token_var> takes over.
+    local upstream_token="${KIMO_SHIM_UPSTREAM_TOKEN:-}"
+    if [[ -n "${token_var}" ]]; then
+        upstream_token="${!token_var:-}"
+    fi
     AGY_SHIM_PORT=""
     AGY_SHIM_OUT=$(mktemp) || return 1
     AGY_SHIM_ERR=$(mktemp) || return 1
@@ -5506,9 +5842,13 @@ agy_start_shim() {
     if [[ -z "${AGY_SHIM_KEY}" || "${AGY_SHIM_KEY}" == ollama ]]; then
         AGY_SHIM_KEY=$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))') || return 1
     fi
-    # Environment, not argv: argv is world-readable in /proc and ps.
-    KIMO_SHIM_CLIENT_KEY="${AGY_SHIM_KEY}" python3 -u "${shim}" --host 127.0.0.1 --port 0 \
-        --upstream "${upstream}" --default-model "${model}" --print-port \
+    # Environment, not argv: argv is world-readable in /proc and ps. The
+    # assignment prefix scopes both to this process alone, so agy inherits
+    # neither the session key nor the provider credential.
+    KIMO_SHIM_CLIENT_KEY="${AGY_SHIM_KEY}" KIMO_SHIM_UPSTREAM_TOKEN="${upstream_token}" \
+        python3 -u "${shim}" --host 127.0.0.1 --port 0 \
+        --upstream "${upstream}" --upstream-kind "${kind}" \
+        --default-model "${model}" --print-port \
         >"${AGY_SHIM_OUT}" 2>"${AGY_SHIM_ERR}" &
     AGY_SHIM_PID=$!
 
@@ -6130,11 +6470,14 @@ _codex_kimi_model() {
 # heredoc already owns. argv[5], when present, is the launched alias written to
 # default_model (kimi's headless prompt mode requires it). Exits 3 when tomlkit
 # is missing, 4 on unparseable TOML.
-# argv: path pid base_url specs-json [default_alias] [key_env]
+# argv: path pid base_url specs-json [default_alias] [key_env] [static_key]
 # specs-json: [{"alias","model","ctx","caps","efforts","deff","off","rkey","display_name"}, ...]
 # key_env, when present, names the environment variable holding the provider's
 # credential: the config then stores api_key_env = <name> (the NAME, never a
-# value) instead of the static Ollama placeholder key.
+# value) instead of a static placeholder key.
+# static_key is the placeholder written when key_env is empty. Ollama callers
+# leave it unset ("ollama", which the daemon ignores). vLLM with no API key
+# passes EMPTY, the value a server started without --api-key accepts.
 _kimi_write_models() {
     python3 - "$@" <<'PY'
 import sys
@@ -6148,6 +6491,7 @@ except ImportError:
 path, pid, base_url, specs_raw = sys.argv[1:5]
 default_alias = sys.argv[5] if len(sys.argv) > 5 else ""
 key_env = sys.argv[6] if len(sys.argv) > 6 else ""
+static_key = sys.argv[7] if len(sys.argv) > 7 and sys.argv[7] else "ollama"
 
 try:
     specs = json.loads(specs_raw)
@@ -6184,7 +6528,7 @@ else:
     # Static placeholder, never the caller's real key: this provider points at
     # the LAN/tunnel Ollama host and forwarding a real secret there would leak
     # it off this box. Ollama ignores the value.
-    prov["api_key"] = "ollama"
+    prov["api_key"] = static_key
     if "api_key_env" in prov:
         del prov["api_key_env"]
 
@@ -6415,7 +6759,8 @@ ${C_YELLOW}Launch Options:${C_RESET}
                             default_model, else the preset per CLI)
   -c, --ctx, --context <N>  Override context window length in tokens (for kimi, grok, etc.)
                             Codex keeps -c for its native key=value config overrides.
-  --provider <name>         Inference backend: 'ollama' (default), 'abliteration',
+  --provider <name>         Inference backend: 'ollama' (default), 'vllm' (OpenAI-
+                            compatible vLLM server, kimi only), 'abliteration',
                             'codex' (ChatGPT plan via OAuth), 'openai' (metered
                             platform API via an sk- key), 'dashscope' (Alibaba
                             Model Studio), 'qwencloud', 'xai' (xAI Grok; 'grok'
@@ -6516,13 +6861,46 @@ ${C_YELLOW}Cloud Provider: DashScope (--provider dashscope):${C_RESET}
   (subagents 'auto', context ${DASHSCOPE_CLAUDE_MAX_CONTEXT}), so its internal
   requests stay on models these keys can serve. codex rides the same
   compatible-mode origin on the Responses wire (wire_api=responses), passed as
-  -c model_providers.dashscope overlays; config.toml is not modified. Without
-  -m the default model is ${DASHSCOPE_DEFAULT_MODEL} (context ${DASHSCOPE_DEFAULT_CTX} tokens; --ctx or \$KIMO_DASHSCOPE_CTX
+  -c model_providers.dashscope overlays; config.toml is not modified. agy rides
+  the loopback Gemini shim in its OpenAI-compatible mode: the shim posts
+  {base}/chat/completions and holds the key itself, so agy's own environment
+  carries no DashScope credential. Without -m the default model is
+  ${DASHSCOPE_DEFAULT_MODEL} (context ${DASHSCOPE_DEFAULT_CTX} tokens; --ctx or \$KIMO_DASHSCOPE_CTX
   override); claude defaults to 'auto'. With no usable env key at all, kimi
   falls back to the freetier-managed [providers.alibaba] aliases (free-quota
   models, kimi's own stored credential) - 'bl auth login --console' plus
   '${0##*/} freetier' keeps that block fresh. Like every hosted backend it
   skips host probing, Ollama tag resolution, eviction and tune settings.
+
+${C_YELLOW}Self-hosted: vLLM (--provider vllm):${C_RESET}
+  An OpenAI-compatible vLLM server, not an Ollama daemon. Wired for
+  ${C_BOLD}${VLLM_CLIS}${C_RESET} only. The default base is ${VLLM_BASE_URL_DEFAULT}.
+  Override it with \$KIMO_VLLM_BASE_URL (\$VLLM_BASE_URL is accepted too), or
+  with a global --host placed before 'launch'. A bare host gets port 8000,
+  and /v1 is added when the URL does not already end in it. A default_host
+  from the config file is an Ollama address and is not used here.
+
+  What changes versus Ollama routing: no host probing, no /api/tags, no
+  /api/show, no VRAM eviction and no tune registry. kimi is registered with
+  a [providers.vllm] block (vllm-<host> when the base is not the default)
+  and an alias for every model GET /v1/models returns, so the /model picker
+  lists that server's catalogue. The launched alias is pinned to
+  default_model. Context is --ctx, else \$KIMO_KIMI_CONTEXT, else the
+  model's max_model_len, else \$KIMO_VLLM_CTX (default ${VLLM_DEFAULT_CTX}).
+  A request above max_model_len is capped.
+
+  \$VLLM_API_KEY, when the server was started with --api-key, is referenced
+  by name (api_key_env). The value is never written to config.toml and never
+  placed in argv. With no key the placeholder is EMPTY, which vLLM accepts
+  when authentication is off. A 401/403 aborts the launch. If the server
+  cannot be reached and --model names the served id, kimi falls back to the
+  KIMI_MODEL_* env channel; with no model name the launch stops, because a
+  vLLM id cannot be guessed from the Ollama preset. Reasoning-style ids
+  (r1, qwq, thinking, reasoner) declare thinking with
+  reasoning_key=reasoning_content. \$KIMO_KIMI_CAPABILITIES overrides that.
+
+  A remote vLLM host still has every unrelated credential scrubbed. Only
+  \$VLLM_API_KEY is forwarded, because that key belongs to this server.
 
 ${C_YELLOW}Codex Responses providers (--provider qwencloud | xai | anthropic):${C_RESET}
   ${C_BOLD}codex${C_RESET} only. Each one is a Responses endpoint (Codex posts {base}/responses
@@ -6557,8 +6935,14 @@ ${C_YELLOW}CLI Integration Mechanics:${C_RESET}
   ${C_BOLD}agy${C_RESET}          Google Antigravity CLI speaks only the Gemini wire protocol. A per-session
                 shim is spawned on a free localhost port and modelProvider is patched
                 for the duration of the session, then cleanly restored on exit.
-                GEMINI_API_KEY is never scrubbed: it only reaches the loopback shim,
-                whose upstream requests carry no auth, so the secret never leaves this box.
+                Against Ollama the shim translates to /api/chat; with '--provider dashscope'
+                it translates to /chat/completions on the Model Studio surface instead and
+                carries that provider's key upstream itself.
+                GEMINI_API_KEY is never scrubbed: it is the shim's own session key rather
+                than a provider credential, and it only ever reaches the loopback shim, so
+                no secret leaves this box. A provider key is passed to the shim by
+                environment and unset before agy starts - a Google client is never handed
+                an Alibaba credential it has no use for.
                 The shim answers only requests carrying that key (a random one per
                 session when GEMINI_API_KEY is unset), so other local processes can't use it.
   ${C_BOLD}grok${C_RESET}         Grok Build takes no endpoint flag; its catalog and inference are directed
@@ -6609,9 +6993,16 @@ ${C_YELLOW}Environment Overrides:${C_RESET}
   CODEX_AUTH_TOKEN          ChatGPT OAuth bearer token for the codex backend (auto-resolved from ~/.codex/auth.json)
   CODEX_API_KEY             Codex / OpenAI API key or bearer token (auto-maps to CODEX_AUTH_TOKEN / OPENAI_API_KEY)
   OPENAI_API_KEY            OpenAI platform sk- key; the credential for '--provider openai'
-  KIMO_CLOUD_PROVIDER       Default backend for launch: ollama | abliteration | codex | openai
+  KIMO_CLOUD_PROVIDER       Default backend for launch: ollama | vllm | abliteration | codex | openai
                             | dashscope | qwencloud | xai | anthropic
                             (or 'kimo config set cloud_provider abliteration')
+  KIMO_VLLM_BASE_URL        vLLM OpenAI base for '--provider vllm' (default http://127.0.0.1:8000/v1;
+                            \$VLLM_BASE_URL is accepted too). A global --host before 'launch' is the
+                            next fallback. /v1 is appended when missing; a bare host uses port 8000.
+  VLLM_API_KEY              Optional bearer token when the vLLM server was started with --api-key.
+                            Stored in kimi's config as the variable name only, never the value.
+  KIMO_VLLM_CTX             Context window used when vLLM does not report max_model_len (default 32768)
+  KIMO_VLLM_MODEL           Served model id to launch when --model is omitted and the server lists several
   KIMO_ABLITERATION_BASE_URL  Override the API origin (default: https://api.abliteration.ai)
   KIMO_CODEX_BACKEND_URL    Override the ChatGPT Codex endpoint (default: https://chatgpt.com/backend-api/codex)
   KIMO_OPENAI_BACKEND_URL   Override the platform origin (default: https://api.openai.com)
@@ -6686,6 +7077,13 @@ ${C_YELLOW}Examples:${C_RESET}
   ${0##*/} launch claude --provider dashscope            ${C_DIM}# Anthropic wire on /apps/anthropic${C_RESET}
   ${0##*/} launch kimi --provider dashscope              ${C_DIM}# no env key: rides kimi's freetier block${C_RESET}
   ${0##*/} launch codex --provider dashscope             ${C_DIM}# Responses wire, default qwen3.8-max${C_RESET}
+  ${0##*/} launch agy --provider dashscope               ${C_DIM}# Gemini wire via the shim's OpenAI mode${C_RESET}
+
+  ${C_DIM}# vLLM (OpenAI-compatible server, default http://127.0.0.1:8000/v1)${C_RESET}
+  ${0##*/} launch kimi --provider vllm
+  ${0##*/} launch kimi --provider vllm --model org/Llama-3.1-8B-Instruct --ctx 8192
+  ${0##*/} --host 10.0.0.5:8000 launch kimi --provider vllm --dry-run
+
   ${0##*/} launch codex --provider qwencloud --model qwen3-coder-plus
   ${0##*/} launch codex --provider xai                   ${C_DIM}# grok is an alias; default grok-4.7${C_RESET}
   ${0##*/} launch codex --provider anthropic --dry-run   ${C_DIM}# key masked, config.toml untouched${C_RESET}
@@ -6834,7 +7232,7 @@ cmd_launch() {
     local provider_selected="${cloud_provider}"
     case "${cloud_provider}" in
         ""|none|ollama) cloud_provider="" ;;
-        abliteration|codex|openai|dashscope|qwencloud|xai|anthropic|gemini) ;;
+        abliteration|codex|openai|dashscope|alibaba|qwencloud|xai|anthropic|gemini|vllm) ;;
         *)
             echo "${C_RED}Error: unknown --provider '${cloud_provider}' (expected one of: ${KIMO_LAUNCH_PROVIDERS}; grok is an alias of xai, claude is an alias of anthropic).${C_RESET}" >&2
             exit 1
@@ -6849,6 +7247,7 @@ cmd_launch() {
         case "${target_model}" in
             codex/*|codex) cloud_provider="codex" ;;
             openai/*|openai) cloud_provider="openai" ;;
+            vllm/*) cloud_provider="vllm" ;;
         esac
     fi
     if [[ -z "${cloud_provider}" && -z "${provider_selected}" && "${opt_model_explicit}" != true ]] \
@@ -6873,6 +7272,12 @@ cmd_launch() {
     # key, and the OpenAI-surface base URL. Ollama routing leaves them empty.
     local ablit_key="" ablit_ctx="" ablit_openai_url="" ablit_caps="" ablit_efforts=""
     local dashscope_key=""
+    # vLLM: OpenAI base (already including /v1), optional bearer, and the
+    # served-model catalogue captured before dry-run returns. vllm_wire is
+    # empty when the launch must ask /v1/models which id to use.
+    local vllm_base="" vllm_key="" vllm_ctx="" vllm_pid="" vllm_wire="" vllm_has_key="no"
+    local vllm_caps="" vllm_efforts="" vllm_deff="" vllm_off="" vllm_rkey="" vllm_models_json=""
+    local vllm_requested="" vllm_maxlen="" vllm_key_rc=0 vllm_fetch_rc=0
     # Set when Codex should use a custom Responses model_provider. Empty for
     # Ollama and for the native ChatGPT / platform backends.
     local codex_mp_id="" codex_mp_name="" codex_mp_base="" codex_mp_env="" codex_mp_ctx=""
@@ -6939,11 +7344,15 @@ cmd_launch() {
                 fi
             fi
         fi
-    elif [[ "${cloud_provider}" == "dashscope" ]]; then
+    elif [[ "${cloud_provider}" == "dashscope" || "${cloud_provider}" == "alibaba" ]]; then
         if [[ " ${DASHSCOPE_CLIS} " != *" ${provider} "* ]]; then
-            echo "${C_RED}Error: '--provider dashscope' supports ${DASHSCOPE_CLIS}; '${provider}' has no DashScope launch branch yet.${C_RESET}" >&2
+            echo "${C_RED}Error: '--provider ${cloud_provider}' supports ${DASHSCOPE_CLIS}; '${provider}' has no ${cloud_provider} launch branch yet.${C_RESET}" >&2
             echo "${C_DIM}    Those CLIs are wired for a self-hosted Ollama host. Drop --provider to route '${provider}' to Ollama.${C_RESET}" >&2
             return 1
+        fi
+        local dashscope_default_ctx="${DASHSCOPE_DEFAULT_CTX}"
+        if [[ "${cloud_provider}" == "alibaba" || "${provider_selected}" == "alibaba" ]]; then
+            dashscope_default_ctx="${ALIBABA_DEFAULT_CTX}"
         fi
         # The key's class picks the surface: token-plan keys (sk-sp-...) belong
         # to the subscription endpoint and 401 on pay-as-you-go intl, sk-ws-/
@@ -6955,7 +7364,24 @@ cmd_launch() {
             dashscope_env="${dashscope_var}"
             break
         done
-        if [[ -n "${dashscope_key}" ]]; then
+        if [[ "${provider}" == kimi && ( "${cloud_provider}" == "alibaba" || "${provider_selected}" == "alibaba" ) ]]; then
+            # Provider alibaba explicitly targets Kimi's managed [providers.alibaba] block
+            dashscope_surface="freetier"
+            active_host="${KIMI_FT_BASE_URL_DEFAULT}"
+            if ${opt_model_explicit}; then
+                resolved_model="${target_model}"
+                if [[ "${resolved_model}" != */* ]]; then
+                    resolved_model="alibaba/${resolved_model}"
+                fi
+            elif ! resolved_model=$(_kimi_freetier_alias); then
+                resolved_model=""
+            fi
+            if [[ -z "${resolved_model}" ]]; then
+                echo "${C_RED}Error: '--provider alibaba' needs a free-tier model in kimi's config.${C_RESET}" >&2
+                echo "${C_DIM}    Sync the free-tier block: 'bl auth login --console --console-site international' then '${0##*/} freetier'.${C_RESET}" >&2
+                return 1
+            fi
+        elif [[ -n "${dashscope_key}" ]]; then
             if [[ "${provider}" == codex && ( "${dashscope_key}" == xai-* || "${dashscope_key}" == sk-ant-* ) ]]; then
                 echo "${C_RED}Error: ${dashscope_env} does not match expected DashScope API key format (got '${dashscope_key:0:7}...').${C_RESET}" >&2
                 echo "${C_DIM}    DashScope API keys start with 'sk-sp-' (token plan) or 'sk-' (pay-as-you-go).${C_RESET}" >&2
@@ -6981,10 +7407,11 @@ cmd_launch() {
                 else
                     resolved_model="${DASHSCOPE_CLAUDE_OPUS}"
                 fi
-            elif ! ${opt_model_explicit} || [[ -z "${target_model}" || "${target_model}" == kimi || "${target_model}" == claude || "${target_model}" == codex ]]; then
+            elif ! ${opt_model_explicit} || [[ -z "${target_model}" || "${target_model}" == kimi || "${target_model}" == claude || "${target_model}" == codex || "${target_model}" == agy ]]; then
                 resolved_model="${DASHSCOPE_DEFAULT_MODEL}"
             else
                 resolved_model="${target_model#dashscope/}"
+                resolved_model="${resolved_model#alibaba/}"
             fi
             if [[ "${provider}" == codex ]]; then
                 active_host="${active_host%/}"
@@ -6992,8 +7419,8 @@ cmd_launch() {
                     echo "${C_RED}Error: DashScope base URL is not an https URL without query or spaces (got '${active_host}').${C_RESET}" >&2
                     return 1
                 fi
-                if [[ ! "${DASHSCOPE_DEFAULT_CTX}" =~ ^[1-9][0-9]*$ ]]; then
-                    echo "${C_RED}Error: DashScope context window must be a positive integer (got '${DASHSCOPE_DEFAULT_CTX}').${C_RESET}" >&2
+                if [[ ! "${dashscope_default_ctx}" =~ ^[1-9][0-9]*$ ]]; then
+                    echo "${C_RED}Error: DashScope context window must be a positive integer (got '${dashscope_default_ctx}').${C_RESET}" >&2
                     return 1
                 fi
                 # Codex posts {base}/responses. The key stays in dashscope_var.
@@ -7001,7 +7428,7 @@ cmd_launch() {
                 codex_mp_name="DashScope"
                 codex_mp_base="${active_host}"
                 codex_mp_env="${dashscope_env}"
-                codex_mp_ctx="${DASHSCOPE_DEFAULT_CTX}"
+                codex_mp_ctx="${dashscope_default_ctx}"
             fi
         elif [[ "${provider}" == kimi ]] && { ! ${opt_model_explicit} || [[ "${target_model}" == alibaba/* || "${target_model}" == modelscope/* ]]; }; then
             # No usable env key: kimi can still ride the freetier-managed
@@ -7015,12 +7442,12 @@ cmd_launch() {
                 resolved_model=""
             fi
             if [[ -z "${resolved_model}" ]]; then
-                echo "${C_RED}Error: '--provider dashscope' needs a DashScope API key, and none was found.${C_RESET}" >&2
+                echo "${C_RED}Error: '--provider ${cloud_provider}' needs a DashScope API key, and none was found.${C_RESET}" >&2
                 echo "${C_DIM}    Export DASHSCOPE_API_KEY=sk-... (MODELSTUDIO_API_KEY is accepted too), or sync the free-tier block: 'bl auth login --console --console-site international' then '${0##*/} freetier'.${C_RESET}" >&2
                 return 1
             fi
         else
-            echo "${C_RED}Error: '--provider dashscope' needs a DashScope API key, and none was found.${C_RESET}" >&2
+            echo "${C_RED}Error: '--provider ${cloud_provider}' needs a DashScope API key, and none was found.${C_RESET}" >&2
             echo "${C_DIM}    Export DASHSCOPE_API_KEY=sk-... (MODELSTUDIO_API_KEY is accepted too), or sync the free-tier block: 'bl auth login --console --console-site international' then '${0##*/} freetier'.${C_RESET}" >&2
             if [[ "${provider}" == codex ]]; then
                 echo "${C_DIM}    Codex reads that variable by name (env_key). Nothing is written to config.toml or argv.${C_RESET}" >&2
@@ -7248,6 +7675,107 @@ cmd_launch() {
                 ablit_ctx="${opt_launch_ctx}"
             fi
         fi
+    elif [[ "${cloud_provider}" == "vllm" ]]; then
+        # vLLM is an OpenAI-compatible server, not an Ollama daemon. Do not
+        # consult TARGET_HOST: normalize_host_url would stamp Ollama's port
+        # 11434 onto a bare host. The base comes from KIMO_VLLM_BASE_URL,
+        # VLLM_BASE_URL, or a global --host typed before 'launch'.
+        if [[ " ${VLLM_CLIS} " != *" ${provider} "* ]]; then
+            echo "${C_RED}Error: '--provider vllm' supports ${VLLM_CLIS}; '${provider}' has no vLLM launch branch yet.${C_RESET}" >&2
+            echo "${C_DIM}    Those CLIs are wired for a self-hosted Ollama host. Drop --provider to route '${provider}' to Ollama.${C_RESET}" >&2
+            return 1
+        fi
+        vllm_base=$(vllm_resolve_base) || return 1
+        vllm_pid=$(vllm_provider_id "${vllm_base}")
+        vllm_key=""
+        vllm_key_rc=0
+        vllm_key=$(vllm_api_key) || vllm_key_rc=$?
+        if ((vllm_key_rc == 2)); then
+            return 1
+        fi
+        [[ "${vllm_key_rc}" -eq 0 && -n "${vllm_key}" ]] && vllm_has_key="yes"
+        vllm_wire=""
+        # The Ollama preset (DEFAULT_MODELS) is not a vLLM id. Use it only when
+        # the user named a model, set KIMO_VLLM_MODEL, or stored a default that
+        # is neither that preset nor the bare words 'kimi' / 'vllm'.
+        if ${opt_model_explicit}; then
+            vllm_wire="${target_model#vllm/}"
+        elif [[ -n "${KIMO_VLLM_MODEL:-}" ]]; then
+            vllm_wire="${KIMO_VLLM_MODEL#vllm/}"
+        elif [[ -n "${target_model}" && "${target_model}" != "${DEFAULT_MODELS[$provider]:-}" \
+            && "${target_model}" != "${provider}" && "${target_model}" != "vllm" ]]; then
+            vllm_wire="${target_model#vllm/}"
+        fi
+        if [[ -n "${vllm_wire}" && ! "${vllm_wire}" =~ ^[A-Za-z0-9._:/-]+$ ]]; then
+            echo "${C_RED}Error: vLLM model id '${vllm_wire}' contains characters kimi cannot store as an alias.${C_RESET}" >&2
+            return 1
+        fi
+        vllm_requested="${opt_launch_ctx:-${KIMO_KIMI_CONTEXT:-}}"
+        vllm_models_json=""
+        vllm_maxlen=""
+        if ! ${opt_dry_run}; then
+            vllm_fetch_rc=0
+            vllm_models_json=$(vllm_fetch_models "${vllm_base}" "${vllm_key}") || vllm_fetch_rc=$?
+            if ((vllm_fetch_rc == 2)); then
+                echo "${C_RED}Error: the vLLM server rejected the API key (HTTP 401/403 on ${vllm_base}/models).${C_RESET}" >&2
+                echo "${C_DIM}    Export VLLM_API_KEY to match the server's --api-key, or start vLLM without --api-key.${C_RESET}" >&2
+                return 1
+            fi
+            if ((vllm_fetch_rc == 0)); then
+                if [[ -z "${vllm_wire}" ]]; then
+                    vllm_wire=$(printf '%s' "${vllm_models_json}" | jq -r \
+                        'first(.data[]?.id | select(type == "string" and test("^[A-Za-z0-9._:/-]+$"))) // empty') || vllm_wire=""
+                fi
+                if [[ -z "${vllm_wire}" ]]; then
+                    echo "${C_RED}Error: ${vllm_base}/models returned no usable model id.${C_RESET}" >&2
+                    echo "${C_DIM}    Pass --model <served-id>, or check that 'vllm serve' is publishing a chat model.${C_RESET}" >&2
+                    return 1
+                fi
+                vllm_maxlen=$(printf '%s' "${vllm_models_json}" | jq -r --arg id "${vllm_wire}" \
+                    'first(.data[]? | select(.id == $id) | (.max_model_len // .context_length // empty)) // empty') || vllm_maxlen=""
+                # Register only the launched alias. The catalogue is dropped
+                # after the id and its window have been read.
+                if [[ "${KIMO_KIMI_REGISTER_ALL:-1}" == "0" ]]; then
+                    vllm_models_json='{"data":[]}'
+                fi
+            else
+                vllm_models_json=""
+                if [[ -z "${vllm_wire}" ]]; then
+                    echo "${C_RED}Error: cannot reach a vLLM server at ${vllm_base}, and no model id was given.${C_RESET}" >&2
+                    echo "${C_DIM}    Start one with 'vllm serve <model> --host 127.0.0.1 --port 8000', set KIMO_VLLM_BASE_URL, or pass --model <served-id>.${C_RESET}" >&2
+                    return 1
+                fi
+                echo "${C_YELLOW}[!] Warning: could not read ${vllm_base}/models; falling back to kimi's KIMI_MODEL_* env channel (shows as __kimi_env__).${C_RESET}" >&2
+            fi
+        fi
+        vllm_ctx=$(vllm_choose_ctx "${vllm_requested}" "${vllm_maxlen}") || return 1
+        if [[ -n "${vllm_wire}" ]]; then
+            if [[ -n "${KIMO_KIMI_CAPABILITIES:-${OM_KIMI_CAPABILITIES:-}}" ]]; then
+                vllm_caps="${KIMO_KIMI_CAPABILITIES:-${OM_KIMI_CAPABILITIES}}"
+            elif vllm_model_thinking "${vllm_wire}"; then
+                vllm_caps="thinking,tool_use"
+            else
+                vllm_caps="tool_use"
+            fi
+            if [[ ",${vllm_caps}," == *",thinking,"* ]]; then
+                vllm_efforts="${KIMO_KIMI_EFFORTS:-${OM_KIMI_EFFORTS:-low,medium,high}}"
+                vllm_off="low"
+                vllm_rkey="${KIMO_KIMI_REASONING_KEY:-${OM_KIMI_REASONING_KEY:-reasoning_content}}"
+                vllm_deff="${KIMO_KIMI_EFFORT:-${OM_KIMI_EFFORT:-high}}"
+                if [[ ",${vllm_efforts}," != *",${vllm_deff},"* ]]; then
+                    echo "${C_YELLOW}[!] Warning: thinking effort '${vllm_deff}' is not in (${vllm_efforts}); using high when that is offered, else the first listed effort.${C_RESET}" >&2
+                    if [[ ",${vllm_efforts}," == *",high,"* ]]; then
+                        vllm_deff="high"
+                    else
+                        vllm_deff="${vllm_efforts%%,*}"
+                    fi
+                fi
+            fi
+            resolved_model="${vllm_wire}"
+        else
+            resolved_model="<first model vLLM is serving>"
+        fi
+        active_host="${vllm_base}"
     elif [[ -n "${TARGET_HOST}" ]]; then
         active_host="${TARGET_HOST}"
         local res
@@ -7282,8 +7810,8 @@ cmd_launch() {
     # Other models on the target host are only unloaded when asked (--evict,
     # KIMO_LAUNCH_EVICT=always, or yes at the prompt): they may belong to other
     # users or sessions sharing that GPU. There is no VRAM to free on a hosted
-    # API, so a cloud provider never evicts.
-    if ! hosted_provider "${cloud_provider}"; then
+    # API or a vLLM server, so those launches never evict.
+    if ! skips_ollama_daemon "${cloud_provider}"; then
         ${opt_dry_run} || evict_other_models "${active_host}" "${resolved_model}" "${opt_evict}"
     fi
 
@@ -7310,12 +7838,29 @@ cmd_launch() {
         # both backends take their base URL from kimi's config.toml (or from
         # codex's own default), never from the environment.
         unset OPENAI_BASE_URL OPENAI_API_BASE API_BASE
-    elif [[ "${cloud_provider}" == "dashscope" || "${cloud_provider}" == "qwencloud" || "${cloud_provider}" == "xai" || "${cloud_provider}" == "anthropic" ]]; then
+    elif [[ "${cloud_provider}" == "dashscope" || "${cloud_provider}" == "alibaba" || "${cloud_provider}" == "qwencloud" || "${cloud_provider}" == "xai" || "${cloud_provider}" == "anthropic" ]]; then
         unset OLLAMA_HOST OLLAMA_BASE_URL CODEX_OSS_BASE_URL
         # Codex takes the Responses base from -c model_providers, and kimi takes
         # DashScope from KIMI_MODEL_*. A stale wrapper endpoint must not redirect
         # either of them.
         unset OPENAI_BASE_URL OPENAI_API_BASE API_BASE
+    elif [[ "${cloud_provider}" == "vllm" ]]; then
+        # Point OpenAI-compatible clients at the vLLM /v1 base. Do not append
+        # another /v1, and do not copy VLLM_API_KEY into OPENAI_API_KEY: the
+        # server key stays in its own variable. A placeholder is EMPTY, which
+        # a vLLM started without --api-key accepts. The user's ANTHROPIC_* is
+        # left alone; the scrub below still clears unrelated secrets on a
+        # non-local host.
+        unset OLLAMA_HOST OLLAMA_BASE_URL
+        export OPENAI_BASE_URL="${vllm_base}"
+        export OPENAI_API_BASE="${vllm_base}"
+        export API_BASE="${vllm_base}"
+        if [[ -z "${OPENAI_API_KEY:-}" || "${OPENAI_API_KEY}" == "ollama" ]]; then
+            export OPENAI_API_KEY="EMPTY"
+        fi
+        if [[ "${vllm_has_key}" == yes ]]; then
+            export VLLM_API_KEY="${vllm_key}"
+        fi
     else
         export OLLAMA_HOST="${active_host}"
         export OLLAMA_BASE_URL="${active_host}"
@@ -7355,9 +7900,10 @@ cmd_launch() {
 
     # Apply per-model tuned defaults baked in via 'tune' (raw resolved model).
     # The tuning registry is keyed by Ollama tag and its num_ctx/num_gpu/...
-    # options are daemon parameters, so it does not apply to a hosted API.
+    # options are daemon parameters, so it does not apply to a hosted API
+    # or to a vLLM server.
     local tp=""
-    if ! hosted_provider "${cloud_provider}"; then
+    if ! skips_ollama_daemon "${cloud_provider}"; then
         tp=$(tuned_params "${resolved_model}" || true)
         if [[ -n "${tp}" ]]; then
             local nctx
@@ -7534,7 +8080,7 @@ cmd_launch() {
                 kimi) dry_argv=(kimi -m "${resolved_model}") ;;
                 *) dry_argv=("${cli_cmd}" --model "${resolved_model}") ;;
             esac
-        elif [[ "${cloud_provider}" == "dashscope" ]]; then
+        elif [[ "${cloud_provider}" == "dashscope" || "${cloud_provider}" == "alibaba" ]]; then
             case "${cli_cmd}" in
                 kimi)
                     if [[ "${dashscope_surface}" == freetier ]]; then
@@ -7546,18 +8092,32 @@ cmd_launch() {
                 codex) dry_argv=("${codex_argv[@]}") ;;
                 *) dry_argv=("${cli_cmd}" --model "${resolved_model}") ;;
             esac
+        elif [[ "${cloud_provider}" == "vllm" ]]; then
+            # No alias until /v1/models has been read, and a dry run does not
+            # contact the server. A known id is still shown as provider/model.
+            if [[ -n "${vllm_wire}" ]]; then
+                dry_argv=(kimi -m "${vllm_pid}/${vllm_wire}")
+            else
+                dry_argv=(kimi)
+            fi
         elif [[ -n "${codex_mp_id}" ]]; then
             dry_argv=("${codex_argv[@]}")
         fi
-        [[ "${cli_available}" -eq 1 || -z "${cli_cmd}" ]] || dry_argv=(ollama run "${resolved_model}")
+        if [[ "${cloud_provider}" != "vllm" ]]; then
+            [[ "${cli_available}" -eq 1 || -z "${cli_cmd}" ]] || dry_argv=(ollama run "${resolved_model}")
+        fi
         [[ "${cli_cmd}" == codex && "${cli_available}" -eq 1 ]] || dry_argv+=("${cli_passthrough_args[@]}")
         _dry_secret() { # <var>: never print a credential
             if [[ -z "${!1+x}" ]]; then echo "<unset>"
             elif [[ "${!1}" == "ollama" ]]; then echo "ollama (placeholder)"
+            elif [[ "${cloud_provider}" == "vllm" && "$1" == "VLLM_API_KEY" ]]; then echo "<kept: real value, vLLM key>"
+            elif [[ "${cloud_provider}" == "vllm" && "$1" == "OPENAI_API_KEY" && "${!1}" == "EMPTY" ]]; then echo "EMPTY (vLLM placeholder, no API key)"
             elif [[ "${cloud_provider}" == "abliteration" ]]; then echo "<kept: real value, abliteration.ai provider>"
             elif [[ "${cloud_provider}" == "codex" ]]; then echo "<kept: real value, codex token/key>"
             elif [[ "${cloud_provider}" == "openai" ]]; then echo "<kept: real value, OpenAI platform key>"
-            elif [[ "${cloud_provider}" == "dashscope" ]]; then echo "<kept: real value, DashScope key>"
+            elif [[ "${cloud_provider}" == "dashscope" && "${cli_cmd}" == agy && ( "$1" == DASHSCOPE_API_KEY || "$1" == MODELSTUDIO_API_KEY ) ]]; then
+                echo "<kept: loopback shim only, not exported to agy>"
+            elif [[ "${cloud_provider}" == "dashscope" || "${cloud_provider}" == "alibaba" ]]; then echo "<kept: real value, DashScope key>"
             elif [[ "${cloud_provider}" == "qwencloud" ]]; then echo "<kept: real value, QwenCloud key>"
             elif [[ "${cloud_provider}" == "xai" ]]; then echo "<kept: real value, xAI key>"
             elif [[ "${cloud_provider}" == "anthropic" || "${cloud_provider}" == "claude" ]]; then echo "<kept: real value, Anthropic key>"
@@ -7567,11 +8127,12 @@ cmd_launch() {
         local -a env_names=(OLLAMA_HOST OPENAI_BASE_URL ANTHROPIC_BASE_URL OLLAMA_CONTEXT_LENGTH)
         local -a secret_names=(OPENAI_API_KEY ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN CURSOR_API_KEY CODEX_API_KEY CODEX_AUTH_TOKEN CODEX_ACCESS_TOKEN)
         [[ "${cloud_provider}" == "abliteration" ]] && secret_names+=(ABLITERATION_API_KEY)
-        [[ "${cloud_provider}" == "dashscope" ]] && secret_names+=(DASHSCOPE_API_KEY MODELSTUDIO_API_KEY)
+        [[ "${cloud_provider}" == "dashscope" || "${cloud_provider}" == "alibaba" ]] && secret_names+=(DASHSCOPE_API_KEY MODELSTUDIO_API_KEY)
         [[ "${cloud_provider}" == "qwencloud" ]] && secret_names+=(QWENCLOUD_API_KEY DASHSCOPE_API_KEY MODELSTUDIO_API_KEY)
         [[ "${cloud_provider}" == "xai" ]] && secret_names+=(XAI_API_KEY XAI_AUTH_TOKEN)
         [[ "${cloud_provider}" == "anthropic" || "${cloud_provider}" == "claude" ]] && secret_names+=(CLAUDE_CODE_OAUTH_TOKEN)
         [[ "${cloud_provider}" == "gemini" ]] && secret_names+=(GEMINI_AUTH_TOKEN GOOGLE_OAUTH_TOKEN GEMINI_API_KEY GOOGLE_API_KEY)
+        [[ "${cloud_provider}" == "vllm" ]] && secret_names+=(VLLM_API_KEY)
         if openai_backend "${cloud_provider}"; then
             env_names+=(CODEX_OSS_BASE_URL)
         fi
@@ -7607,24 +8168,39 @@ cmd_launch() {
                 echo "  evict  : n/a (hosted API, no VRAM to free)"
                 echo "  context: ${ablit_ctx} tokens"
                 echo "  caps   : ${ablit_caps}"
-            elif [[ "${cloud_provider}" == "dashscope" ]]; then
+            elif [[ "${cloud_provider}" == "dashscope" || "${cloud_provider}" == "alibaba" ]]; then
                 echo "  evict  : n/a (hosted API, no VRAM to free)"
                 if [[ "${provider}" == claude ]]; then
                     echo "  context: ${CLAUDE_CODE_MAX_CONTEXT_TOKENS:-${DASHSCOPE_CLAUDE_MAX_CONTEXT}} tokens"
+                elif [[ "${cloud_provider}" == "alibaba" || "${provider_selected}" == "alibaba" || "${resolved_model}" =~ deepseek ]]; then
+                    echo "  context: ${opt_launch_ctx:-${ALIBABA_DEFAULT_CTX}} tokens"
                 else
                     echo "  context: ${opt_launch_ctx:-${DASHSCOPE_DEFAULT_CTX}} tokens"
                 fi
                 [[ -z "${codex_mp_id}" ]] || echo "  wire   : responses (${codex_mp_base})"
+                if [[ "${cli_cmd}" == agy ]]; then
+                    echo "  wire   : gemini -> openai chat/completions (loopback shim)"
+                fi
             elif [[ -n "${codex_mp_id}" ]]; then
                 echo "  evict  : n/a (hosted API, no VRAM to free)"
                 echo "  context: ${opt_launch_ctx:-${codex_mp_ctx}} tokens"
                 echo "  wire   : responses (${codex_mp_base})"
+            elif [[ "${cloud_provider}" == "vllm" ]]; then
+                echo "  evict  : n/a (vLLM server, no VRAM to free)"
+                echo "  context: ${vllm_ctx} tokens"
+                echo "  wire   : openai ${vllm_base}"
             elif hosted_provider "${cloud_provider}"; then
                 echo "  evict  : n/a (hosted API, no VRAM to free)"
             else
                 echo "  evict  : ${opt_evict} (other loaded models are left alone in a dry run)"
             fi
-            [[ "${cli_available}" -eq 1 || -z "${cli_cmd}" ]] || echo "  note   : '${cli_cmd}' is not installed; kimo would fall back to 'ollama run'"
+            if [[ "${cli_available}" -ne 1 && -n "${cli_cmd}" ]]; then
+                if [[ "${cloud_provider}" == "vllm" ]]; then
+                    echo "  note   : '${cli_cmd}' is not installed; vLLM routing does not fall back to 'ollama run'"
+                else
+                    echo "  note   : '${cli_cmd}' is not installed; kimo would fall back to 'ollama run'"
+                fi
+            fi
             printf '  argv   :'
             printf ' %q' "${dry_argv[@]}"
             echo
@@ -7643,12 +8219,14 @@ cmd_launch() {
                 kimi|grok|agy|cyberstrike)
                     if [[ "${cloud_provider}" == "abliteration" ]]; then
                         echo "  ${C_DIM}(at launch kimi gets a named [providers.abliteration] + served-model aliases if the key validates, else the zero-footprint KIMI_MODEL_* env channel; this dry run writes no config)${C_RESET}"
-                    elif [[ "${cloud_provider}" == "dashscope" ]]; then
+                    elif [[ "${cloud_provider}" == "dashscope" || "${cloud_provider}" == "alibaba" ]]; then
                         if [[ "${dashscope_surface}" == freetier ]]; then
                             echo "  ${C_DIM}(kimi rides its freetier-managed [providers.alibaba]; no env key, no config write)${C_RESET}"
                         else
                             echo "  ${C_DIM}(kimi gets a zero-footprint KIMI_MODEL_* env provider; no config.toml is written)${C_RESET}"
                         fi
+                    elif [[ "${cloud_provider}" == "vllm" ]]; then
+                        echo "  ${C_DIM}(at launch kimi gets [providers.${vllm_pid}] plus served-model aliases when /v1/models answers; this dry run writes no config)${C_RESET}"
                     elif openai_backend "${cloud_provider}"; then
                         echo "  ${C_DIM}(Kimi's ${cloud_provider}/ aliases are synced at launch; this dry run writes no config)${C_RESET}"
                     else
@@ -7692,7 +8270,7 @@ cmd_launch() {
                     echo "${C_DIM}[*] claude on abliteration.ai: ${claude_model} (context ${ablit_ctx})${C_RESET}"
                     exec "${cli_cmd}" --model "${claude_model}" "${cli_passthrough_args[@]}"
                 fi
-                if [[ "${cloud_provider}" == "dashscope" ]]; then
+                if [[ "${cloud_provider}" == "dashscope" || "${cloud_provider}" == "alibaba" ]]; then
                     if [[ "${dashscope_surface}" == freetier ]]; then
                         echo "${C_RED}Error: the DashScope free-tier fallback rides kimi's config; claude has no such fallback. Export DASHSCOPE_API_KEY or MODELSTUDIO_API_KEY.${C_RESET}" >&2
                         return 1
@@ -7898,7 +8476,7 @@ cmd_launch() {
                     echo "${C_DIM}[*] kimi on abliteration.ai '${resolved_model}' via ${ablit_openai_url} (context ${ablit_ctx}, caps ${KIMI_MODEL_CAPABILITIES}, effort ${kimi_ablit_effort})${C_RESET}"
                     exec "${cli_cmd}" "${cli_passthrough_args[@]}"
                 fi
-                if [[ "${cloud_provider}" == "dashscope" && "${dashscope_surface}" == freetier ]]; then
+                if [[ ( "${cloud_provider}" == "dashscope" || "${cloud_provider}" == "alibaba" ) && "${dashscope_surface}" == freetier ]]; then
                     # kimi's own [providers.alibaba] holds the credential and
                     # the quota-verified model; kimo adds nothing but -m.
                     # Config-based launches make kimi validate every provider's
@@ -7908,11 +8486,22 @@ cmd_launch() {
                     _resolve_codex_auth || true
                     export KIMI_DISABLE_TELEMETRY="${KIMI_DISABLE_TELEMETRY:-1}"
                     export KIMI_CODE_NO_AUTO_UPDATE="${KIMI_CODE_NO_AUTO_UPDATE:-1}"
-                    echo "${C_DIM}[*] kimi on DashScope free tier: ${resolved_model} via kimi's [providers.alibaba] (no env key needed)${C_RESET}"
+                    local alibaba_target_ctx="${opt_launch_ctx:-${DASHSCOPE_DEFAULT_CTX}}"
+                    if [[ "${cloud_provider}" == "alibaba" || "${provider_selected}" == "alibaba" || "${resolved_model}" =~ deepseek ]]; then
+                        alibaba_target_ctx="${opt_launch_ctx:-${ALIBABA_DEFAULT_CTX}}"
+                    fi
+                    if [[ -n "${resolved_model}" && -f "${KIMI_CONFIG}" ]]; then
+                        _kimi_sync_model_context "${KIMI_CONFIG}" "${resolved_model}" "${alibaba_target_ctx}" || true
+                    fi
+                    unset KIMI_MODEL_NAME KIMI_MODEL_API_KEY KIMI_MODEL_PROVIDER_TYPE \
+                        KIMI_MODEL_BASE_URL KIMI_MODEL_CAPABILITIES \
+                        KIMI_MODEL_REASONING_KEY KIMI_MODEL_THINKING_EFFORT
+                    export KIMI_MODEL_MAX_CONTEXT_SIZE="${alibaba_target_ctx}"
+                    echo "${C_DIM}[*] kimi on DashScope free tier: ${resolved_model} via kimi's [providers.alibaba] (context ${alibaba_target_ctx}, no env key needed)${C_RESET}"
                     exec "${cli_cmd}" -m "${resolved_model}" "${cli_passthrough_args[@]}"
                 fi
-                if [[ "${cloud_provider}" == "dashscope" ]]; then
-                    # DashScope path: the KIMI_MODEL_* env channel only, exactly
+                if [[ "${cloud_provider}" == "dashscope" || "${cloud_provider}" == "alibaba" ]]; then
+                    # DashScope / Alibaba path: the KIMI_MODEL_* env channel only, exactly
                     # like abliteration - a config.toml alias would store a
                     # third-party API key in plaintext on disk, and kimi's own
                     # config is deliberately left alone. There is no /api/show
@@ -7927,7 +8516,11 @@ cmd_launch() {
                     export KIMI_MODEL_PROVIDER_TYPE="openai"
                     export KIMI_MODEL_BASE_URL="${active_host}"
                     export KIMI_MODEL_API_KEY="${dashscope_key}"
-                    export KIMI_MODEL_MAX_CONTEXT_SIZE="${opt_launch_ctx:-${DASHSCOPE_DEFAULT_CTX}}"
+                    local active_ctx="${opt_launch_ctx:-${DASHSCOPE_DEFAULT_CTX}}"
+                    if [[ "${cloud_provider}" == "alibaba" || "${provider_selected}" == "alibaba" || "${resolved_model}" =~ deepseek ]]; then
+                        active_ctx="${opt_launch_ctx:-${ALIBABA_DEFAULT_CTX}}"
+                    fi
+                    export KIMI_MODEL_MAX_CONTEXT_SIZE="${active_ctx}"
                     export KIMI_MODEL_CAPABILITIES="${KIMO_KIMI_CAPABILITIES:-thinking,tool_use}"
                     # DashScope returns its reasoning trace as
                     # 'reasoning_content' on /v1/chat/completions - the field
@@ -7935,6 +8528,58 @@ cmd_launch() {
                     export KIMI_MODEL_REASONING_KEY="${KIMO_KIMI_REASONING_KEY:-reasoning_content}"
                     export KIMI_MODEL_THINKING_EFFORT="${KIMO_KIMI_EFFORT:-${OM_KIMI_EFFORT:-high}}"
                     echo "${C_DIM}[*] kimi on DashScope '${resolved_model}' via ${active_host} (context ${KIMI_MODEL_MAX_CONTEXT_SIZE}, caps ${KIMI_MODEL_CAPABILITIES}, effort ${KIMI_MODEL_THINKING_EFFORT})${C_RESET}"
+                    exec "${cli_cmd}" "${cli_passthrough_args[@]}"
+                fi
+                if [[ "${cloud_provider}" == "vllm" ]]; then
+                    # vLLM has no server-side web search. -W still points the
+                    # session at the local WebBridge skill, same as Ollama.
+                    export KIMI_DISABLE_TELEMETRY="${KIMI_DISABLE_TELEMETRY:-1}"
+                    export KIMI_CODE_NO_AUTO_UPDATE="${KIMI_CODE_NO_AUTO_UPDATE:-1}"
+                    export KIMI_CODE_LLM_HEADERS_TIMEOUT_MS="${KIMI_CODE_LLM_HEADERS_TIMEOUT_MS:-600000}"
+                    local webbridge_skill="${HOME:-/root}/.agents/skills/custom-web/SKILL.md"
+                    if ${opt_launch_webbridge} && [[ -f "${webbridge_skill}" ]]; then
+                        echo "${C_DIM}[*] webbridge skill: ${webbridge_skill} (endpoint ${WEBBRIDGE_URL})${C_RESET}"
+                        echo "${C_DIM}    Agent: on WebSearch 403 → route to WebBridge (curl POST ${WEBBRIDGE_URL})${C_RESET}"
+                    elif ${opt_launch_webbridge}; then
+                        echo "${C_YELLOW}[!] webbridge skill not found at ${webbridge_skill} — agent will fall back to FetchURL only${C_RESET}"
+                    fi
+                    # Catalogue path: [providers.<pid>] plus one alias per served
+                    # model. A failed sync (no tomlkit, busy lock) falls through
+                    # to the env channel rather than launching with no model.
+                    if [[ -n "${vllm_models_json}" ]]; then
+                        local vllm_alias=""
+                        vllm_alias=$(vllm_sync_kimi "${vllm_pid}" "${vllm_base}" "${vllm_models_json}" "${vllm_wire}" \
+                            "${vllm_ctx}" "${vllm_caps}" "${vllm_efforts}" "${vllm_deff}" "${vllm_off}" "${vllm_rkey}" \
+                            "${vllm_has_key}") || vllm_alias=""
+                        if [[ -n "${vllm_alias}" ]]; then
+                            unset KIMI_MODEL_NAME KIMI_MODEL_API_KEY KIMI_MODEL_PROVIDER_TYPE \
+                                KIMI_MODEL_BASE_URL KIMI_MODEL_MAX_CONTEXT_SIZE KIMI_MODEL_CAPABILITIES \
+                                KIMI_MODEL_REASONING_KEY KIMI_MODEL_THINKING_EFFORT
+                            echo "${C_DIM}[*] kimi on vLLM '${vllm_wire}' via [providers.${vllm_pid}] (context ${vllm_ctx}, caps ${vllm_caps}${vllm_deff:+, effort ${vllm_deff}})${C_RESET}"
+                            exec "${cli_cmd}" -m "${vllm_alias}" "${cli_passthrough_args[@]}"
+                        fi
+                        echo "${C_YELLOW}[!] Warning: could not register vLLM models in kimi's config; falling back to the KIMI_MODEL_* env channel.${C_RESET}" >&2
+                    fi
+                    unset KIMI_MODEL_NAME KIMI_MODEL_API_KEY KIMI_MODEL_PROVIDER_TYPE \
+                        KIMI_MODEL_BASE_URL KIMI_MODEL_MAX_CONTEXT_SIZE KIMI_MODEL_CAPABILITIES \
+                        KIMI_MODEL_REASONING_KEY KIMI_MODEL_THINKING_EFFORT
+                    export KIMI_MODEL_NAME="${vllm_wire}"
+                    export KIMI_MODEL_PROVIDER_TYPE="openai"
+                    export KIMI_MODEL_BASE_URL="${vllm_base}"
+                    if [[ "${vllm_has_key}" == yes ]]; then
+                        export KIMI_MODEL_API_KEY="${vllm_key}"
+                    else
+                        export KIMI_MODEL_API_KEY="EMPTY"
+                    fi
+                    export KIMI_MODEL_MAX_CONTEXT_SIZE="${vllm_ctx}"
+                    export KIMI_MODEL_CAPABILITIES="${vllm_caps}"
+                    if [[ ",${vllm_caps}," == *",thinking,"* ]]; then
+                        export KIMI_MODEL_REASONING_KEY="${vllm_rkey}"
+                        export KIMI_MODEL_THINKING_EFFORT="${vllm_deff}"
+                    else
+                        unset KIMI_MODEL_REASONING_KEY KIMI_MODEL_THINKING_EFFORT
+                    fi
+                    echo "${C_DIM}[*] kimi on vLLM '${vllm_wire}' via ${vllm_base} (context ${vllm_ctx}, caps ${vllm_caps}${KIMI_MODEL_THINKING_EFFORT:+, thinking effort ${KIMI_MODEL_THINKING_EFFORT}})${C_RESET}"
                     exec "${cli_cmd}" "${cli_passthrough_args[@]}"
                 fi
                 # kimi (Kimi Code CLI). Two routing paths, tried in order:
@@ -8106,7 +8751,15 @@ cmd_launch() {
             agy)
                 # No exec here: the shim must be reaped and modelProvider
                 # removed from agy's settings once the session ends.
-                local shim rc=0
+                local shim rc=0 shim_kind="ollama" shim_token_var=""
+                # A hosted OpenAI-compatible surface has no /api/chat, so the
+                # shim translates to /chat/completions instead and carries the
+                # provider key upstream. DashScope is the only hosted provider
+                # wired for agy; every other cloud_provider is rejected above.
+                if [[ "${cloud_provider}" == "dashscope" || "${cloud_provider}" == "alibaba" ]]; then
+                    shim_kind="openai"
+                    shim_token_var="${dashscope_env:-}"
+                fi
                 if ! shim=$(find_gemini_shim); then
                     echo "${C_RED}Error: Gemini shim not found (looked in: ${GEMINI_SHIM_PATHS[*]}).${C_RESET}" >&2
                     echo "agy speaks only the Gemini wire format, so it cannot reach ${active_host} without it." >&2
@@ -8116,10 +8769,10 @@ cmd_launch() {
                     echo "${C_RED}Error: jq is required to patch ${AGY_SETTINGS}.${C_RESET}" >&2
                     exit 1
                 fi
-                if ! agy_start_shim "${shim}" "${active_host}" "${resolved_model}"; then
+                if ! agy_start_shim "${shim}" "${active_host}" "${resolved_model}" "${shim_kind}" "${shim_token_var}"; then
                     exit 1
                 fi
-                echo "${C_DIM}[*] Gemini shim on 127.0.0.1:${AGY_SHIM_PORT} -> ${active_host} (pid ${AGY_SHIM_PID})${C_RESET}"
+                echo "${C_DIM}[*] Gemini shim on 127.0.0.1:${AGY_SHIM_PORT} -> ${active_host} (${shim_kind} wire, pid ${AGY_SHIM_PID})${C_RESET}"
 
                 if ! agy_patch_settings "${resolved_model}"; then
                     echo "${C_RED}Error: could not register ${resolved_model} in ${AGY_SETTINGS}; agy would fall back to Google.${C_RESET}" >&2
@@ -8129,6 +8782,12 @@ cmd_launch() {
 
                 export GEMINI_API_KEY="${AGY_SHIM_KEY}"
                 export GOOGLE_GEMINI_BASE_URL="http://127.0.0.1:${AGY_SHIM_PORT}"
+                if [[ -n "${shim_token_var}" ]]; then
+                    # The running shim already holds the provider key; agy talks
+                    # to the shim with GEMINI_API_KEY and has no use for a
+                    # DashScope credential, so a Google client is not handed one.
+                    unset DASHSCOPE_API_KEY MODELSTUDIO_API_KEY
+                fi
                 echo "${C_DIM}[*] agy now runs on ${resolved_model} via the Gemini wire format.${C_RESET}"
 
                 "${cli_cmd}" --model "${resolved_model}" "${cli_passthrough_args[@]}" || rc=$?
@@ -8219,9 +8878,17 @@ cmd_launch() {
     elif [[ -n "${cli_cmd}" ]]; then
         echo "${C_YELLOW}[!] External CLI '${cli_cmd}' not found in PATH.${C_RESET}"
         echo "${C_DIM}    Tip: Install it with: ${0##*/} install ${provider}${C_RESET}"
+        if [[ "${cloud_provider}" == "vllm" ]]; then
+            echo "${C_RED}Error: vLLM routing does not fall back to 'ollama run'.${C_RESET}" >&2
+            return 1
+        fi
         echo "${C_CYAN}[*] Falling back to native 'ollama run ${resolved_model}'...${C_RESET}"
         exec ollama run "${resolved_model}" "${cli_passthrough_args[@]}"
     else
+        if [[ "${cloud_provider}" == "vllm" ]]; then
+            echo "${C_RED}Error: vLLM routing does not fall back to 'ollama run'. Install kimi with: ${0##*/} install kimi${C_RESET}" >&2
+            return 1
+        fi
         echo "${C_CYAN}[*] Executing provider '${provider}' via 'ollama run ${resolved_model}'...${C_RESET}"
         exec ollama run "${resolved_model}" "${cli_passthrough_args[@]}"
     fi
@@ -10484,7 +11151,7 @@ _kimo() {
                 return 0
             fi
             if [[ "${prev}" == "--provider" ]]; then
-                COMPREPLY=( $(compgen -W "ollama abliteration codex openai dashscope qwencloud xai anthropic claude gemini grok" -- "${cur}") )
+                COMPREPLY=( $(compgen -W "ollama abliteration codex openai dashscope alibaba qwencloud xai anthropic claude gemini vllm grok" -- "${cur}") )
                 return 0
             fi
             if [[ "${cur}" == -* ]]; then
@@ -10863,7 +11530,7 @@ _kimo() {
                     _arguments \
                         '(-m --model)'{-m,--model}'[Target model name]:model:_kimo_models' \
                         '(-c --ctx --context)'{-c,--ctx,--context}'[Override context window length]:tokens:' \
-                        '--provider[Inference backend]:backend:(ollama abliteration codex openai dashscope qwencloud xai anthropic claude gemini grok)' \
+                        '--provider[Inference backend]:backend:(ollama abliteration codex openai dashscope alibaba qwencloud xai anthropic claude gemini vllm grok)' \
                         '(-W --webbridge)'{-W,--webbridge}'[Inject WebBridge skill into session]' \
                         '(--evict --no-evict)'{--evict,--no-evict}'[Unload / keep other models on the host]' \
                         '--dry-run[Show routing plan, start nothing]' \
@@ -11420,7 +12087,7 @@ ${C_YELLOW}Options:${C_RESET}
   --sort name|expires|remaining    Selection order (default remaining)
   --limit N               Cap selection to N models
   --set-default first|none|ALIAS   Optionally rewrite default_model
-  --context-window N      max_context_size written per model (default 131072)
+  --context-window N      max_context_size written per model (default 500000)
   --max-output N          max_output_size written per model (default 32768)
   --base-url URL          DashScope compatible-mode base URL
   --api-key KEY           API key (else ~/.qwen/settings.json, DASHSCOPE_API_KEY, bl profile)
@@ -11457,7 +12124,7 @@ cmd_freetier() {
     KIMI_FT_VERIFY_TIMEOUT=30
     KIMI_FT_VERIFY_JOBS=6
     KIMI_FT_SET_DEFAULT=""
-    KIMI_FT_CONTEXT_WINDOW="${KIMO_KIMI_FT_CONTEXT:-131072}"
+    KIMI_FT_CONTEXT_WINDOW="${KIMO_KIMI_FT_CONTEXT:-500000}"
     KIMI_FT_MAX_OUTPUT="${KIMO_KIMI_FT_MAX_OUTPUT:-32768}"
     KIMI_FT_DRY_RUN=0
     KIMI_FT_LIST_ONLY=0
