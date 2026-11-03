@@ -762,6 +762,33 @@ class AdapterTests(unittest.TestCase):
         self.assertIn("a%20b", self.http_mock.call_args.args[0])
         self.assertNotIn("fixture-gemini", self.http_mock.call_args.args[0])
 
+    def test_gemini_oauth_token_from_file_falls_back_when_scope_insufficient(self):
+        self.file(".gemini/antigravity-cli/antigravity-oauth-token", {
+            "token": {"access_token": "ya29.fixture-token", "expiry": "2099-01-01T00:00:00Z"}
+        })
+        self.http_mock.side_effect = quota.QuotaError("auth_required", "insufficient scope", http_status=403)
+        data = self.dashboard.provider("gemini")
+        self.assertEqual(data["status"], "online")
+        self.assertTrue(data["key_present"])
+        self.assertGreaterEqual(len(data["models"]), 5)
+        self.assertEqual(self.http_mock.call_args.args[2]["Authorization"], "Bearer ya29.fixture-token")
+
+    def test_gemini_oauth_token_from_env_uses_bearer_header(self):
+        os.environ["GEMINI_AUTH_TOKEN"] = "ya29.env-bearer-token"
+        self.http_payload({
+            "models": [{"name": "models/gemini-2.5-flash", "inputTokenLimit": 1048576, "outputTokenLimit": 65536}]
+        })
+        data = self.dashboard.provider("gemini")
+        self.assertEqual(data["status"], "online")
+        self.assertEqual(len(data["models"]), 1)
+        self.assertEqual(self.http_mock.call_args.args[2]["Authorization"], "Bearer ya29.env-bearer-token")
+
+    def test_gemini_unconfigured_when_no_credentials(self):
+        data = self.dashboard.provider("gemini")
+        self.assertEqual(data["status"], "unconfigured")
+        self.assertFalse(data["key_present"])
+        self.http_mock.assert_not_called()
+
     def test_cumulative_timeout_stops_pagination(self):
         os.environ["KIMO_QUOTA_GEMINI_KEY"] = "fixture-gemini"
         self.args.timeout = .01
@@ -844,6 +871,16 @@ class AdapterTests(unittest.TestCase):
         data = self.dashboard.cli("opencode")
         self.assertEqual(data["windows"][0]["remaining"], 80)
         self.assertNotIn("fixture-opencode", json.dumps(data))
+
+    def test_opencode_console_provider_reports_console_without_requests(self):
+        directory = self.home / ".config/opencode"
+        directory.mkdir(parents=True)
+        for model in ('"model": "opencode/big-pickle"', '"theme": "dark"'):
+            (directory / "opencode.json").write_text("{" + model + "}")
+            data = self.dashboard.cli("opencode")
+            self.assertEqual((data["status"], data["source"]), ("unavailable", "OpenCode Console"))
+            self.assertIn("Console", data["message"])
+        self.http_mock.assert_not_called()
 
     def test_other_local_api_is_not_claimed_as_ollama(self):
         os.environ["OPENAI_BASE_URL"] = "http://127.0.0.1:4321/v1"

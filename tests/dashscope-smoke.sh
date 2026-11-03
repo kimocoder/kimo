@@ -14,6 +14,12 @@
 #   * unsupported CLIs are rejected and config/flag precedence holds
 #   * a remote Ollama host never sees the DashScope key
 #   * the hosted path never probes Ollama
+#   * agy rides the Gemini shim in OpenAI mode: a real translated turn reaches
+#     /chat/completions with the key as a bearer token, agy's own environment
+#     never sees that key, and its settings are restored afterwards
+#   * provider 'alibaba' routes to freetier-managed [providers.alibaba] with
+#     500,000 context by default and syncs config.toml max_context_size
+#
 #
 # Usage: tests/dashscope-smoke.sh
 
@@ -190,6 +196,140 @@ check_contains "fallback notes kimi's own provider" "freetier-managed [providers
 KIMI_CONFIG="${FT_CONFIG}" "${KIMO}" launch kimi --provider dashscope >/dev/null 2>&1
 check "fallback launches kimi with the alias" "alibaba/qwen3-coder-flash-2025-07-28" "$(flag_val "${CAPTURE}" -m)"
 check "fallback exports no KIMI_MODEL key" "<unset>" "$(env_val "${CAPTURE}" KIMI_MODEL_API_KEY)"
+
+echo "[*] [9] agy: Gemini wire onto the compatible-mode surface"
+# agy speaks only the Gemini protocol and Model Studio has no Gemini endpoint,
+# so kimo must spawn the shim in its OpenAI-compatible mode. A loopback
+# stand-in for the plan surface answers /chat/completions only for the right
+# bearer token, which is what proves the key reached the shim and not agy.
+harness_fake_ollama --openai-models qwen3.8-max --openai-bearer "${SP_KEY}" --openai-chat PONG
+PLAN_URL="${FAKE_OLLAMA_URL}" PLAN_LOG="${FAKE_OLLAMA_LOG}"
+harness_fake_ollama --openai-models qwen3-coder-plus --openai-bearer "${KEY}" --openai-chat PONG
+INTL_URL="${FAKE_OLLAMA_URL}" INTL_LOG="${FAKE_OLLAMA_LOG}"
+AGY_CAPTURE="${HARNESS_ROOT}/dashscope-agy.txt"
+export AGY_SMOKE_CAPTURE="${AGY_CAPTURE}"
+export AGY_SETTINGS="${HARNESS_ROOT}/agy-settings.json"
+export KIMO_AGY_CLAIM_DIR="${HARNESS_ROOT}/agy-claims"
+printf '{"model":"Old Model","trustedWorkspaces":["/x"]}' > "${AGY_SETTINGS}"
+
+cat > "${FAKE_BIN}/agy" <<'SH'
+#!/usr/bin/env bash
+out="${AGY_SMOKE_CAPTURE:?}"
+argv=("$@")
+model=""
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --model) model="${2:-}"; shift 2 ;;
+        *) shift ;;
+    esac
+done
+base="${GOOGLE_GEMINI_BASE_URL-}"
+answer=""
+if [[ -n "${base}" ]]; then
+    # A real Gemini-wire turn through the shim, the way agy itself would send it.
+    answer="$(curl -s -m 20 -X POST "${base}/v1beta/models/${model}:generateContent" \
+        -H 'Content-Type: application/json' -H "x-goog-api-key: ${GEMINI_API_KEY-}" \
+        -d '{"contents":[{"role":"user","parts":[{"text":"hi"}]}]}' 2>/dev/null || true)"
+fi
+{
+    printf 'ARGV\n'
+    printf '%s\n' "${argv[@]}"
+    printf 'ENV\n'
+    for key in GOOGLE_GEMINI_BASE_URL GEMINI_API_KEY DASHSCOPE_API_KEY MODELSTUDIO_API_KEY \
+        KIMO_SHIM_UPSTREAM_TOKEN OLLAMA_HOST OPENAI_BASE_URL OPENAI_API_KEY; do
+        printf '%s=%s\n' "${key}" "${!key-<unset>}"
+    done
+    printf 'ANSWER=%s\n' "${answer}"
+} > "${out}"
+exit 0
+SH
+chmod +x "${FAKE_BIN}/agy"
+
+KIMO_DASHSCOPE_PLAN_BASE_URL="${PLAN_URL}/plan" DASHSCOPE_API_KEY="${SP_KEY}" \
+    "${KIMO}" launch agy --provider dashscope >/dev/null 2>&1
+check "agy is launched with the DashScope default model" "qwen3.8-max" "$(flag_val "${AGY_CAPTURE}" --model)"
+check_match "agy points at a loopback shim" '^http://127\.0\.0\.1:[0-9]+$' "$(env_val "${AGY_CAPTURE}" GOOGLE_GEMINI_BASE_URL)"
+check_contains "the shim translated a real turn end to end" "PONG" "$(env_val "${AGY_CAPTURE}" ANSWER)"
+check_contains "the shim posted chat/completions on the plan surface" \
+    "POST /plan/compatible-mode/v1/chat/completions" "$(<"${PLAN_LOG}")"
+check "agy never receives DASHSCOPE_API_KEY" "<unset>" "$(env_val "${AGY_CAPTURE}" DASHSCOPE_API_KEY)"
+check "agy never receives MODELSTUDIO_API_KEY" "<unset>" "$(env_val "${AGY_CAPTURE}" MODELSTUDIO_API_KEY)"
+check "agy never receives the shim's upstream token" "<unset>" "$(env_val "${AGY_CAPTURE}" KIMO_SHIM_UPSTREAM_TOKEN)"
+check "no Ollama host is exported" "<unset>" "$(env_val "${AGY_CAPTURE}" OLLAMA_HOST)"
+want="$(printf '%s' '{"model":"Old Model","trustedWorkspaces":["/x"]}' | jq -cS .)"
+got="$(jq -cS . "${AGY_SETTINGS}" 2>/dev/null || true)"
+check "agy settings are restored after the session" "${want}" "${got}"
+
+# An explicit model and the intl surface both reach the same wire. Note the two
+# overrides differ in shape: KIMO_DASHSCOPE_PLAN_BASE_URL is an origin that kimo
+# appends /compatible-mode/v1 to, KIMO_DASHSCOPE_BASE_URL is the whole base.
+KIMO_DASHSCOPE_BASE_URL="${INTL_URL}/intl/compatible-mode/v1" MODELSTUDIO_API_KEY="${KEY}" \
+    "${KIMO}" launch agy --provider dashscope --model qwen3-coder-plus >/dev/null 2>&1
+check "an explicit model reaches agy" "qwen3-coder-plus" "$(flag_val "${AGY_CAPTURE}" --model)"
+check_contains "the intl key rides the intl surface" \
+    "POST /intl/compatible-mode/v1/chat/completions" "$(<"${INTL_LOG}")"
+check_contains "the translated turn still answers" "PONG" "$(env_val "${AGY_CAPTURE}" ANSWER)"
+
+# The shim is per-session: nothing is left listening once kimo exits.
+port="$(env_val "${AGY_CAPTURE}" GOOGLE_GEMINI_BASE_URL)"
+if curl -sf -m 2 "${port}/healthz" >/dev/null 2>&1; then
+    bad "shim still listening on ${port} after kimo exit"
+else
+    ok "shim stopped after kimo exit"
+fi
+rm -f "${FAKE_BIN}/agy"
+unset AGY_SMOKE_CAPTURE AGY_SETTINGS KIMO_AGY_CLAIM_DIR
+
+echo "[*] [10] Provider 'alibaba' explicit routing and 500,000 context"
+ALI_CONFIG="${HARNESS_ROOT}/ali/config.toml"
+mkdir -p "$(dirname "${ALI_CONFIG}")"
+cat > "${ALI_CONFIG}" <<'TOML'
+default_model = "alibaba/deepseek-v4.1-flash-1017"
+[providers.alibaba]
+type = "openai"
+base_url = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
+api_key = "sk-ws-fixture-stored-key"
+[models."alibaba/deepseek-v4.1-flash-1017"]
+provider = "alibaba"
+model = "deepseek-v4.1-flash-1017"
+max_context_size = 131072
+max_output_size = 32768
+[models."alibaba/qwen3-coder-flash-2025-07-28"]
+provider = "alibaba"
+model = "qwen3-coder-flash-2025-07-28"
+max_context_size = 131072
+max_output_size = 32768
+TOML
+
+dry_ali=$(KIMI_CONFIG="${ALI_CONFIG}" "${KIMO}" launch kimi --provider alibaba --dry-run)
+check_contains "provider reported as alibaba" "provider: alibaba" "${dry_ali}"
+check_contains "default model is deepseek" "model  : alibaba/deepseek-v4.1-flash-1017" "${dry_ali}"
+check_contains "default context is 500000 tokens" "context: 500000 tokens" "${dry_ali}"
+check_contains "argv launches kimi with deepseek alias" "argv   : kimi -m alibaba/deepseek-v4.1-flash-1017" "${dry_ali}"
+
+dry_ali_ctx=$(KIMI_CONFIG="${ALI_CONFIG}" "${KIMO}" launch kimi --provider alibaba --ctx 12345 --dry-run)
+check_contains "--ctx overrides alibaba context" "context: 12345 tokens" "${dry_ali_ctx}"
+
+dry_ali_model=$(KIMI_CONFIG="${ALI_CONFIG}" "${KIMO}" launch kimi --provider alibaba -m alibaba/qwen3-coder-flash-2025-07-28 --dry-run)
+check_contains "explicit model alias is preserved" "model  : alibaba/qwen3-coder-flash-2025-07-28" "${dry_ali_model}"
+check_contains "model alias keeps 500000 context default" "context: 500000 tokens" "${dry_ali_model}"
+
+dry_ali_bare=$(KIMI_CONFIG="${ALI_CONFIG}" "${KIMO}" launch kimi --provider alibaba -m deepseek-v4.1-flash-1017 --dry-run)
+check_contains "bare model name is auto-prefixed with alibaba/" "model  : alibaba/deepseek-v4.1-flash-1017" "${dry_ali_bare}"
+
+KIMI_CONFIG="${ALI_CONFIG}" "${KIMO}" launch kimi --provider alibaba >/dev/null 2>&1
+check "live alibaba launch launches kimi with deepseek alias" "alibaba/deepseek-v4.1-flash-1017" "$(flag_val "${CAPTURE}" -m)"
+check "live alibaba launch sets KIMI_MODEL_MAX_CONTEXT_SIZE" "500000" "$(env_val "${CAPTURE}" KIMI_MODEL_MAX_CONTEXT_SIZE)"
+check "live alibaba launch leaves KIMI_MODEL_NAME unset" "<unset>" "$(env_val "${CAPTURE}" KIMI_MODEL_NAME)"
+check "live alibaba launch leaves KIMI_MODEL_API_KEY unset" "<unset>" "$(env_val "${CAPTURE}" KIMI_MODEL_API_KEY)"
+got_ctx="$(python3 -c "import tomlkit; doc = tomlkit.parse(open('${ALI_CONFIG}').read()); print(doc.get('models', {}).get('alibaba/deepseek-v4.1-flash-1017', {}).get('max_context_size', ''))" 2>/dev/null || true)"
+check "live alibaba launch synced max_context_size in config.toml" "500000" "${got_ctx}"
+
+"${KIMO}" config set cloud_provider alibaba >/dev/null
+check "config accepts alibaba" "alibaba" "$("${KIMO}" config get cloud_provider)"
+dry_cfg=$(KIMI_CONFIG="${ALI_CONFIG}" "${KIMO}" launch kimi --dry-run)
+check_contains "configured backend alibaba is used" "provider: alibaba" "${dry_cfg}"
+"${KIMO}" config unset cloud_provider >/dev/null
 
 echo
 harness_summary "dashscope_smoke"

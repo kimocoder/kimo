@@ -7,3 +7,9 @@ __pycache__/
 *.tmp
 *.bak
 *.swp
+
+# Local agent and tool state: session exports, CLI device ids and per-user
+# permission lists. Personal, and can hold credentials; never commit.
+.qwen/
+.local/
+extract/

@@ -12,6 +12,14 @@ Blobs uploaded with POST /api/blobs/<digest> are digest-checked like the real
 server and stored under --blob-dir; /api/create registers the model in
 /api/tags, so a sync can be verified end to end.
 
+With --openai-models it also serves the OpenAI-compatible GET /v1/models that
+hosted providers (e.g. abliteration.ai) expose; --openai-bearer then requires a
+matching "Authorization: Bearer <token>" header and answers 401 without it, so
+credential-validation paths can be exercised on loopback. --openai-chat adds the
+matching POST .../chat/completions (SSE when the request asks to stream), which
+is what a Gemini-to-OpenAI translation is checked against. Both are matched on
+the path suffix, so a provider base such as /compatible-mode/v1 works.
+
 Started by harness_fake_ollama in tests/lib/harness.sh; the bound port is
 written to --port-file once the socket is listening.
 """
@@ -82,6 +90,19 @@ class Handler(BaseHTTPRequestHandler):
     def _json(self, status: int, payload: object) -> None:
         self._send(status, json.dumps(payload).encode(), "application/json")
 
+    def _path(self) -> str:
+        """The request path with any query string removed."""
+        return self.path.split("?", 1)[0]
+
+    def _openai_authorized(self) -> bool:
+        """Bearer check for the OpenAI-compatible endpoints; answers 401 itself."""
+        bearer = self.server.openai_bearer
+        if bearer and self.headers.get("Authorization") != f"Bearer {bearer}":
+            self._json(401, {"error": {"message": "invalid api key",
+                                       "type": "invalid_request_error"}})
+            return False
+        return True
+
     def _blob_path(self, digest: str) -> str | None:
         """Blob file for a well-formed sha256 digest; None for anything else."""
         if not re.fullmatch(r"sha256:[0-9a-f]{64}", digest):
@@ -119,6 +140,15 @@ class Handler(BaseHTTPRequestHandler):
             self._json(200, {"models": models})
         elif self.path == "/api/ps":
             self._json(200, {"models": [{"name": name, "model": name} for name in self.server.loaded]})
+        elif self._path().endswith("/v1/models"):
+            if not self.server.openai_models:
+                self._json(404, {"error": "not found"})
+                return
+            if not self._openai_authorized():
+                return
+            self._json(200, {"object": "list",
+                             "data": [{"id": name, "object": "model", "owned_by": "fixture"}
+                                      for name in self.server.openai_models]})
         else:
             self._json(404, {"error": "not found"})
 
@@ -190,8 +220,49 @@ class Handler(BaseHTTPRequestHandler):
             self._json(200, {"model": body.get("model", ""), "done": True, "response": ""})
         elif self.path in ("/api/copy", "/api/delete"):
             self._json(200, {})
+        elif self._path().endswith("/chat/completions"):
+            self._openai_chat(body)
         else:
             self._json(404, {"error": "not found"})
+
+    def _sse(self, payload: object) -> None:
+        self.wfile.write(b"data: " + json.dumps(payload).encode() + b"\n\n")
+        self.wfile.flush()
+
+    def _openai_chat(self, body: dict) -> None:
+        """The OpenAI-compatible chat endpoint hosted providers expose.
+
+        Streams SSE when the request asks to, the way Model Studio's
+        compatible-mode surface does, and echoes the requested model so a wire
+        translation can be followed end to end.
+        """
+        if self.server.openai_chat is None:
+            self._json(404, {"error": "not found"})
+            return
+        if not self._openai_authorized():
+            return
+        model = body.get("model", "")
+        text = self.server.openai_chat
+        usage = {"prompt_tokens": 11, "completion_tokens": 7, "total_tokens": 18}
+        if body.get("stream") is not True:
+            self._json(200, {"id": "chatcmpl-fixture", "object": "chat.completion", "model": model,
+                             "choices": [{"index": 0, "finish_reason": "stop",
+                                          "message": {"role": "assistant", "content": text}}],
+                             "usage": usage})
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.end_headers()
+        # Two deltas, so a relay that only handles a single chunk looks broken.
+        for piece in (text[:1], text[1:]):
+            if piece:
+                self._sse({"id": "chatcmpl-fixture", "object": "chat.completion.chunk",
+                           "model": model, "choices": [{"index": 0, "delta": {"content": piece}}]})
+        self._sse({"id": "chatcmpl-fixture", "object": "chat.completion.chunk", "model": model,
+                   "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}], "usage": usage})
+        self.wfile.write(b"data: [DONE]\n\n")
+        self.wfile.flush()
+        self.close_connection = True  # pylint: disable=attribute-defined-outside-init
 
     def _stream_generate(self, body: dict) -> None:
         """NDJSON like the real server: the first request for a model pays a
@@ -230,6 +301,15 @@ def main() -> None:
     parser.add_argument("--pull-events",
                         help="file of NDJSON events streamed by /api/pull (default: a success sequence)")
     parser.add_argument("--blob-dir", help="where uploaded blobs are kept (default: next to --log)")
+    parser.add_argument("--openai-models", default="",
+                        help="comma-separated ids served by the OpenAI-compatible /v1/models "
+                             "(empty: the endpoint 404s)")
+    parser.add_argument("--openai-bearer", default="",
+                        help="token /v1/models requires as 'Authorization: Bearer <token>' "
+                             "(empty: no auth check)")
+    parser.add_argument("--openai-chat", default=None,
+                        help="text the OpenAI-compatible .../chat/completions endpoint replies "
+                             "with (omitted: the endpoint 404s)")
     args = parser.parse_args()
 
     server = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
@@ -240,6 +320,9 @@ def main() -> None:
     server.created = {}
     server.warm = set()
     server.loaded = [name for name in args.loaded.split(",") if name]
+    server.openai_models = [name for name in args.openai_models.split(",") if name]
+    server.openai_bearer = args.openai_bearer
+    server.openai_chat = args.openai_chat
     server.blob_dir = args.blob_dir or args.log + ".blobs"
     os.makedirs(server.blob_dir, exist_ok=True)
     if args.pull_events:

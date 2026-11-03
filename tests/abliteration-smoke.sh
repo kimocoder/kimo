@@ -12,7 +12,11 @@
 #   * claude gets the [1m] context suffix, CLAUDE_CODE_MAX_CONTEXT_TOKENS and
 #     the ANTHROPIC_DEFAULT_*_MODEL tier overrides; x-api-key stays unset so
 #     exactly one credential rides the request
-#   * kimi gets the zero-footprint KIMI_MODEL_* env channel and NO config.toml
+#   * kimi: a validated key registers a named [providers.abliteration] (the key
+#     by env-var NAME only) plus an alias per served model, and launches on
+#     'abliteration/<id>'; when validation cannot complete (blocked network, no
+#     tomlkit) kimi falls back to the zero-footprint KIMI_MODEL_* env channel
+#     and NO config.toml is written; a rejected key (401/403) aborts the launch
 #   * per-model capabilities and efforts: only 'abliterated-model' takes images
 #     and it caps thinking effort at xhigh
 #   * no Ollama probing: nothing contacts /api/tags, /api/show or /api/ps
@@ -72,6 +76,7 @@ cat > "${FAKE_DIR}/kimi" <<'FAKE'
     printf 'KIMI_MODEL_CAPABILITIES=%s\n' "${KIMI_MODEL_CAPABILITIES-<unset>}"
     printf 'KIMI_MODEL_REASONING_KEY=%s\n' "${KIMI_MODEL_REASONING_KEY-<unset>}"
     printf 'KIMI_MODEL_THINKING_EFFORT=%s\n' "${KIMI_MODEL_THINKING_EFFORT-<unset>}"
+    printf 'ABLITERATION_API_KEY=%s\n' "${ABLITERATION_API_KEY-<unset>}"
     printf 'OPENAI_BASE_URL=%s\n' "${OPENAI_BASE_URL-<unset>}"
     printf 'OPENAI_API_KEY=%s\n' "${OPENAI_API_KEY-<unset>}"
     printf 'OLLAMA_HOST=%s\n' "${OLLAMA_HOST-<unset>}"
@@ -128,7 +133,7 @@ launch claude --provider abliteration --model base
 check "'base' resolves to abliterated-model" "abliterated-model" "$(flag_val "${CAPTURE}" --model)"
 check "256K window exported" "262144" "$(env_val "${CAPTURE}" CLAUDE_CODE_MAX_CONTEXT_TOKENS)"
 
-echo "[*] kimi: zero-footprint env channel"
+echo "[*] kimi: env-channel fallback when validation cannot complete"
 launch kimi --provider abliteration
 if [[ ! -f "${CAPTURE}" ]]; then
     bad "fake kimi was never exec'd (no capture); cannot assert"
@@ -192,14 +197,17 @@ check "dry-run --json names the provider" "abliteration" "$(jq -r '.provider' <<
 check_not_contains "dry-run --json never prints the key" "${KEY}" "${dry_json}"
 
 echo "[*] nothing probes an Ollama daemon or evicts a model"
-# The harness curl stub refuses every non-loopback URL and logs the attempt, so
-# an empty curl log means kimo contacted neither api.abliteration.ai nor a host.
+# The harness curl stub refuses every non-loopback URL and logs the attempt.
+# The one tolerated outbound call is the abliteration key validation against
+# ${API}/v1/models (blocked here, so the launch falls back to the env channel);
+# no Ollama endpoint may be contacted.
 launch kimi --provider abliteration
 blocked="$(harness_stub_calls curl)"
-if [[ -z "${blocked}" ]]; then
-    ok "launch made no outbound curl call (no /api/tags, /api/show or /api/ps)"
+unexpected="$(grep -v "^curl BLOCKED ${API}/v1/models\$" <<<"${blocked}" | grep -v '^$' || true)"
+if [[ -z "${unexpected}" ]]; then
+    ok "the only outbound curl is the ${API}/v1/models validation (no /api/tags, /api/show or /api/ps)"
 else
-    bad "unexpected outbound curl: ${blocked//$'\n'/; }"
+    bad "unexpected outbound curl: ${unexpected//$'\n'/; }"
 fi
 
 echo "[*] failure paths"
@@ -269,6 +277,62 @@ cfgout="$("${KIMO}" config set cloud_provider bogus 2>&1)" && rc=0 || rc=1
 check "config set rejects an unknown provider" "1" "${rc}"
 check_contains "the rejection names the valid values" "abliteration" "${cfgout}"
 check "the bogus value was not written" "" "$("${KIMO}" config get cloud_provider)"
+
+echo "[*] kimi: a validated key registers the named provider and the served catalogue"
+harness_fake_ollama --openai-models "abliterated-model,abliterated-model-large-v2,custom-served-model" \
+    --openai-bearer "${KEY}"
+export KIMO_ABLITERATION_BASE_URL="${FAKE_OLLAMA_URL}"
+CFG="${HOME}/.kimi-code/config.toml"
+rm -f "${CFG}"
+launch kimi --provider abliteration
+if [[ ! -f "${CAPTURE}" ]]; then
+    bad "fake kimi was never exec'd on the validated path; cannot assert"
+else
+    check "kimi launches on the named alias" "abliteration/abliterated-model-large-v2" "$(flag_val "${CAPTURE}" -m)"
+    check "the env channel is not used alongside the alias" "<unset>" "$(env_val "${CAPTURE}" KIMI_MODEL_NAME)"
+    check "KIMI_MODEL_API_KEY stays unset" "<unset>" "$(env_val "${CAPTURE}" KIMI_MODEL_API_KEY)"
+    check "ABLITERATION_API_KEY reaches kimi for the api_key_env reference" "${KEY}" "$(env_val "${CAPTURE}" ABLITERATION_API_KEY)"
+fi
+if [[ ! -f "${CFG}" ]]; then
+    bad "the validated launch did not write ${CFG}"
+else
+    cfgtext="$(cat "${CFG}")"
+    check_contains "the provider is registered under its real name" "[providers.abliteration]" "${cfgtext}"
+    check_contains "the provider points at the OpenAI surface" "base_url = \"${FAKE_OLLAMA_URL}/v1\"" "${cfgtext}"
+    check_contains "the credential is referenced by env-var name" 'api_key_env = "ABLITERATION_API_KEY"' "${cfgtext}"
+    check_not_contains "the real key never lands in the config" "${KEY}" "${cfgtext}"
+    check_contains "the launched model has an alias" '[models."abliteration/abliterated-model-large-v2"]' "${cfgtext}"
+    check_contains "every served model is registered" '[models."abliteration/custom-served-model"]' "${cfgtext}"
+    check_contains "the image-capable base model keeps image_in" "image_in" "${cfgtext}"
+    check_contains "default_model is pinned to the launched alias" 'default_model = "abliteration/abliterated-model-large-v2"' "${cfgtext}"
+fi
+check_contains "the fixture served the validation call" "GET /v1/models" "$(cat "${FAKE_OLLAMA_LOG}")"
+
+echo "[*] kimi: the ABLIT_KEY alias normalizes to ABLITERATION_API_KEY"
+rm -f "${CAPTURE}" "${CFG}"
+harness_reset_stub_log
+env -u ABLITERATION_API_KEY ABLIT_KEY="${KEY}" "${KIMO}" launch kimi --provider abliteration >/dev/null 2>&1 || true
+check "kimi still receives ABLITERATION_API_KEY" "${KEY}" "$(env_val "${CAPTURE}" ABLITERATION_API_KEY)"
+check_contains "the config still names ABLITERATION_API_KEY" 'api_key_env = "ABLITERATION_API_KEY"' "$(cat "${CFG}")"
+
+echo "[*] kimi: a rejected key aborts the launch"
+harness_fake_ollama --openai-models "abliterated-model-large-v2" --openai-bearer "ak_somebody-elses-key"
+export KIMO_ABLITERATION_BASE_URL="${FAKE_OLLAMA_URL}"
+rm -f "${CAPTURE}" "${CFG}"
+launch_out kimi --provider abliteration
+check "a 401 exits non-zero" "1" "${LAUNCH_RC}"
+check_contains "the rejection is reported" "rejected the API key" "${LAUNCH_OUT}"
+if [[ -f "${CAPTURE}" ]]; then
+    bad "a rejected key still exec'd kimi"
+else
+    ok "a rejected key never execs kimi"
+fi
+if [[ -e "${CFG}" ]]; then
+    bad "a rejected key wrote a config"
+else
+    ok "a rejected key writes no config"
+fi
+unset KIMO_ABLITERATION_BASE_URL
 
 echo
 harness_summary "abliteration smoke"

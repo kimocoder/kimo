@@ -25,6 +25,9 @@ CODEX_TOKEN_URL = "https://auth.openai.com/oauth/token"  # nosec B105 - an endpo
 # A token this close to expiry counts as expired: launching on it would 401
 # partway through a session, which is far harder to diagnose than refreshing.
 EXPIRY_SKEW_SECONDS = 60
+# config.toml.before-codex-* backups kept after a sync, like 'kimo freetier'.
+# Each holds the whole config, keys included, and a sync can run per launch.
+BACKUP_KEEP = 5
 
 # The two OpenAI backends kimo can route a CLI at. 'codex' is the ChatGPT plan
 # endpoint and takes an OAuth bearer token; 'openai' is the metered platform API
@@ -370,6 +373,30 @@ def register_model(models, item, pid, alias):
     model["capabilities"] = caps
 
 
+def prune_backups(config, keep_path):
+    """Delete all but the BACKUP_KEEP newest before-codex backups of config.
+
+    Only regular files are removed (never a symlink planted under the name),
+    and keep_path, the backup this sync just made, always survives.
+    """
+    backups = []
+    for path in config.parent.glob(config.name + ".before-codex-*"):
+        try:
+            info = path.lstat()
+        except OSError:
+            continue
+        if stat.S_ISREG(info.st_mode):
+            backups.append((info.st_mtime, str(path)))
+    backups.sort(reverse=True)
+    for _, path in backups[BACKUP_KEEP:]:
+        if path == str(keep_path):
+            continue
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+
 def sync(home, config, selected, as_json, which="codex"):
     import tomlkit
     # The caller holds KIMI_CONFIG_LOCK. Validate the whole document before
@@ -430,6 +457,8 @@ def sync(home, config, selected, as_json, which="codex"):
         finally:
             if os.path.exists(temp):
                 os.unlink(temp)
+        if backup:
+            prune_backups(config, backup)
     result = {"config_file": str(config), "changed": changed, "backup": backup, "provider": pid,
               "models": [k for k in models if k.startswith(prefix)], "default_model": doc.get("default_model")}
     if as_json:

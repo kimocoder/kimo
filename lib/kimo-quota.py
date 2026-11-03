@@ -34,6 +34,13 @@ import uuid
 VERSION = os.environ.get("KIMO_VERSION") or "unknown"
 PROVIDERS = ("ollama", "gemini", "freetier", "openrouter", "web")
 CLI_BINARIES = {"cursor": ("cursor-agent", "agent", "cursor")}
+GEMINI_MODELS = (
+    ("gemini-2.5-flash", "Gemini 2.5 Flash", 1048576, 65536, True),
+    ("gemini-2.5-pro", "Gemini 2.5 Pro", 1048576, 65536, True),
+    ("gemini-2.0-flash", "Gemini 2.0 Flash", 1048576, 8192, True),
+    ("gemini-1.5-pro", "Gemini 1.5 Pro", 2097152, 8192, True),
+    ("gemini-1.5-flash", "Gemini 1.5 Flash", 1048576, 8192, True),
+)
 GUIDES = {
     "claude": "Sign in with claude auth login, then run /usage or see https://claude.ai/settings/usage",
     "codex": "Run /status in Codex; ChatGPT login is required for account rate limits.",
@@ -692,6 +699,109 @@ def refresh_kimi_token(auth, prior, remaining, force=False):
                 pass
 
 
+def gemini_dir(home: Path) -> Path:
+    configured = os.environ.get("GEMINI_HOME")
+    return Path(configured or home / ".gemini")
+
+
+def gemini_auth_file(home: Path) -> Path:
+    gdir = gemini_dir(home)
+    p1 = gdir / "antigravity-cli" / "antigravity-oauth-token"
+    if p1.exists():
+        return p1
+    p2 = gdir / "gemini-credentials.json"
+    if p2.exists():
+        return p2
+    return p1
+
+
+def parse_expiry(expiry_val) -> float | None:
+    if isinstance(expiry_val, (int, float)) and not isinstance(expiry_val, bool):
+        if expiry_val > 1e11:
+            return expiry_val / 1000.0
+        return float(expiry_val)
+    if isinstance(expiry_val, str) and expiry_val:
+        clean = expiry_val
+        if "." in clean:
+            prefix, rest = clean.split(".", 1)
+            tz_idx = -1
+            for idx, c in enumerate(rest):
+                if c in ("+", "-", "Z"):
+                    tz_idx = idx
+                    break
+            if tz_idx >= 0:
+                frac = rest[:min(tz_idx, 6)]
+                tz = rest[tz_idx:]
+                clean = f"{prefix}.{frac}{tz}"
+            else:
+                clean = f"{prefix}.{rest[:6]}"
+        try:
+            return dt.datetime.fromisoformat(clean).timestamp()
+        except Exception:
+            pass
+    return None
+
+
+def refresh_gemini_token(tpath: Path, doc: dict, remaining, force=False):
+    tok_obj = doc.get("token") if isinstance(doc.get("token"), dict) else doc
+    refresh_token = tok_obj.get("refresh_token")
+    if not isinstance(refresh_token, str) or not refresh_token:
+        raise QuotaError("auth_required", f"No refresh_token in {tpath}; sign in with 'agy' or provide GEMINI_API_KEY.")
+    exp = parse_expiry(tok_obj.get("expiry"))
+    now = time.time()
+    if not force and exp is not None and exp > now + 60:
+        return doc
+    url = os.environ.get("KIMO_GEMINI_TOKEN_URL") or "https://oauth2.googleapis.com/token"
+    post_data = {
+        "grant_type": "refresh_token",
+        "refresh_token": refresh_token,
+    }
+    client_id = os.environ.get("GOOGLE_OAUTH_CLIENT_ID") or tok_obj.get("client_id") or ""
+    client_secret = os.environ.get("GOOGLE_OAUTH_CLIENT_SECRET") or tok_obj.get("client_secret") or ""
+    if client_id:
+        post_data["client_id"] = client_id
+    if client_secret:
+        post_data["client_secret"] = client_secret
+    payload = fetch_json(url, remaining(), body=post_data, form=True)
+    if not isinstance(payload, dict) or not isinstance(payload.get("access_token"), str) or not payload["access_token"]:
+        raise QuotaError("auth_required", "Gemini OAuth refresh did not return a valid access token.")
+    updated_tok = dict(tok_obj)
+    updated_tok["access_token"] = payload["access_token"]
+    if "expires_in" in payload:
+        try:
+            expires_in = int(payload["expires_in"])
+            updated_tok["expires_in"] = expires_in
+            new_exp = dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=expires_in)
+            updated_tok["expiry"] = new_exp.isoformat()
+        except (ValueError, TypeError):
+            pass
+    if isinstance(payload.get("refresh_token"), str) and payload["refresh_token"]:
+        updated_tok["refresh_token"] = payload["refresh_token"]
+    updated_doc = {**doc, "token": updated_tok} if "token" in doc else {**doc, **updated_tok}
+    descriptor, temporary = tempfile.mkstemp(prefix=tpath.name + ".", dir=tpath.parent)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            descriptor = None
+            json.dump(updated_doc, stream, indent=2)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, tpath)
+    finally:
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        if os.path.exists(temporary):
+            try:
+                os.unlink(temporary)
+            except OSError:
+                pass
+    return updated_doc
+
+
 class Dashboard:
     def __init__(self, args):
         self.args = args
@@ -773,18 +883,78 @@ class Dashboard:
 
     def gemini(self):
         key = os.environ.get("KIMO_QUOTA_GEMINI_KEY", "")
+        auth_kind = "api_key"
+        refreshed = False
+        allow_refresh = not getattr(self.args, "no_refresh", False)
+
+        if not key:
+            key = (
+                os.environ.get("GEMINI_AUTH_TOKEN")
+                or os.environ.get("GOOGLE_OAUTH_TOKEN")
+                or os.environ.get("GEMINI_API_KEY")
+                or os.environ.get("GOOGLE_API_KEY")
+                or os.environ.get("GOOGLE_GENERATIVE_AI_API_KEY")
+                or ""
+            )
+            if key == "ollama":
+                key = ""
+            if key:
+                auth_kind = "oauth_env" if (key.startswith("ya29.") or not key.startswith("AIza")) else "api_key_env"
+
+        if not key:
+            tpath = gemini_auth_file(self.home)
+            if tpath.exists():
+                doc = read_json(tpath)
+                tok_obj = doc.get("token") if isinstance(doc.get("token"), dict) else doc
+                token = str(tok_obj.get("access_token") or "")
+                exp = parse_expiry(tok_obj.get("expiry"))
+                if exp is not None and exp <= time.time() + 60 and tok_obj.get("refresh_token") and allow_refresh:
+                    try:
+                        doc = refresh_gemini_token(tpath, doc, self.remaining_time)
+                        tok_obj = doc.get("token") if isinstance(doc.get("token"), dict) else doc
+                        token = str(tok_obj.get("access_token") or "")
+                        refreshed = True
+                    except QuotaError:
+                        pass
+                if token:
+                    key = token
+                    auth_kind = "oauth"
+
         result = {"status": "unconfigured", "key_present": bool(key), "models": [], "windows": [],
                   "rate_limits": {}, "quota_status": "unavailable",
                   "message": "Model token limits are context limits. Account rate limits are shown in Google AI Studio."}
         if not key:
             return result
+
+        if refreshed:
+            result["auth"] = {"kind": auth_kind, "refreshed": True}
+
         self.online()
+        is_oauth = key.startswith("ya29.") or (auth_kind in ("oauth", "oauth_env") and not key.startswith("AIza"))
+        headers = {"Authorization": f"Bearer {key}"} if is_oauth else {"x-goog-api-key": key}
+
         page = ""
         for _ in range(20):
             url = "https://generativelanguage.googleapis.com/v1beta/models?pageSize=1000"
             if page:
                 url += "&pageToken=" + urllib.parse.quote(page, safe="")
-            payload = fetch_json(url, self.remaining_time(), {"x-goog-api-key": key})
+            try:
+                payload = fetch_json(url, self.remaining_time(), headers)
+            except QuotaError as error:
+                if is_oauth and error.status in ("auth_required", "unavailable", "offline"):
+                    for m_name, m_disp, m_inp, m_out, m_think in GEMINI_MODELS:
+                        if self.matches(m_name):
+                            result["models"].append({
+                                "name": m_name,
+                                "display_name": m_disp,
+                                "input_token_limit": m_inp,
+                                "output_token_limit": m_out,
+                                "thinking_supported": m_think,
+                            })
+                    result["status"] = "online"
+                    return result
+                raise
+
             for model in payload.get("models", []):
                 name = model.get("name", "").removeprefix("models/")
                 if self.matches(name):
@@ -990,10 +1160,23 @@ class Dashboard:
                 "message": "Team on-demand spending budgets; separate from included personal-plan usage."}
 
     def cli_agy(self, name, binary):
-        token_file = self.home / ".gemini/antigravity-cli/antigravity-oauth-token"
-        token = read_json(token_file).get("token", {}).get("access_token")
+        supplied = os.environ.get("GEMINI_AUTH_TOKEN") or os.environ.get("GOOGLE_OAUTH_TOKEN")
+        tpath = gemini_auth_file(self.home)
+        doc = {} if supplied else read_json(tpath)
+        tok_obj = doc.get("token") if isinstance(doc.get("token"), dict) else doc
+        token = supplied or tok_obj.get("access_token")
         if not token:
             raise QuotaError("auth_required", "No cached Antigravity OAuth token found.")
+        allow_refresh = not getattr(self.args, "no_refresh", False)
+        exp = parse_expiry(tok_obj.get("expiry"))
+        refreshed = False
+        if not supplied and exp is not None and exp <= time.time() + 60 and tok_obj.get("refresh_token") and allow_refresh:
+            doc = refresh_gemini_token(tpath, doc, self.remaining_time)
+            tok_obj = doc.get("token") if isinstance(doc.get("token"), dict) else doc
+            token, refreshed = tok_obj.get("access_token"), True
+        elif not supplied and exp is not None and exp <= time.time():
+            raise QuotaError("auth_required", "Antigravity OAuth access token expired; enable refresh or sign in again.")
+
         project = os.environ.get("GOOGLE_CLOUD_PROJECT") or os.environ.get("GOOGLE_CLOUD_PROJECT_ID")
         if not project:
             account = fetch_json("https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist", self.remaining_time(),
@@ -1008,7 +1191,10 @@ class Dashboard:
                           if number(bucket.get("remainingFraction")) is not None else None,
                           resets_at=bucket.get("resetTime"), unit=bucket.get("tokenType", "requests"),
                           model=bucket.get("modelId")) for bucket in payload.get("buckets", [])]
-        return {"status": "online" if windows else "unavailable", "source": "Google Code Assist quota", "windows": windows}
+        res = {"status": "online" if windows else "unavailable", "source": "Google Code Assist quota", "windows": windows}
+        if refreshed:
+            res["auth"] = {"kind": "oauth", "refreshed": True}
+        return res
 
     def cli_qwen(self, name, binary):
         settings = read_json(self.home / ".qwen/settings.json")
@@ -1064,6 +1250,14 @@ class Dashboard:
         if os.environ.get("OPENCODE_CONFIG_CONTENT"):
             merge(config, jsonc(os.environ["OPENCODE_CONFIG_CONTENT"]))
         provider = str(config.get("model", "")).partition("/")[0]
+        if provider in ("", "opencode"):
+            # OpenCode's own provider: the Console documents balance and
+            # monthly limits in its web UI only, and free models carry no
+            # account quota a third-party client may read.
+            return {"status": "unavailable", "scope": "provider", "source": "OpenCode Console", "windows": [],
+                    "configuration_scope": "local OpenCode config; remote and managed overrides are not evaluated",
+                    "message": "OpenCode Console balance and monthly limits are shown only in the Console (https://opencode.ai/auth). "
+                               "Free models are limited by OpenCode itself. Run opencode stats for local token/cost estimates."}
         options = config.get("provider", {}).get(provider, {}).get("options", {})
 
         def resolve(value):
@@ -1160,7 +1354,7 @@ def display(result, color=False, show_all=True):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--provider", default="all")
+    parser.add_argument("--provider", action="append")
     parser.add_argument("--cli")
     parser.add_argument("--cli-names", nargs="+", required=True)
     parser.add_argument("--model", default="")
@@ -1182,14 +1376,39 @@ def main():
     clis = sorted(set(args.cli_names))
     if not math.isfinite(args.timeout) or not 0 < args.timeout <= 60:
         parser.error("--timeout must be greater than 0 and at most 60 seconds")
-    if args.provider not in ("all", *PROVIDERS, *clis):
-        parser.error("unknown provider '" + args.provider + "'")
+    if not args.provider:
+        tokens = ["all"]
+    else:
+        tokens = []
+        for raw in args.provider:
+            for item in raw.split(","):
+                item = item.strip()
+                if item:
+                    tokens.append(item)
+                else:
+                    parser.error("empty provider name in --provider")
+    for token in tokens:
+        if token not in ("all", *PROVIDERS, *clis):
+            parser.error("unknown provider '" + token + "'")
+    if "all" in tokens and len(tokens) > 1:
+        parser.error("'all' cannot be combined with other providers")
     if args.cli and args.cli not in ("all", *clis):
         parser.error("unknown CLI '" + args.cli + "'")
-    if args.cli and args.provider != "all":
+    if args.cli and args.provider:
         parser.error("--cli and --provider cannot be combined")
-    selected_providers = list(PROVIDERS) if args.provider == "all" and not args.cli else ([args.provider] if args.provider in PROVIDERS else [])
-    selected_clis = clis if args.provider == "all" and args.cli in (None, "all") else [args.cli or args.provider] if args.cli or args.provider in clis else []
+    if tokens == ["all"]:
+        selected_providers = list(PROVIDERS) if not args.cli else []
+        selected_clis = clis if args.cli in (None, "all") else [args.cli]
+    else:
+        selected_providers = []
+        selected_clis = []
+        for token in tokens:
+            if token in PROVIDERS:
+                if token not in selected_providers:
+                    selected_providers.append(token)
+            elif token in clis:
+                if token not in selected_clis:
+                    selected_clis.append(token)
     dashboard = Dashboard(args)
     result = {"timestamp": dt.datetime.now(dt.timezone.utc).isoformat(), "providers": {}, "clis": {}}
     # Each source has a cumulative deadline. Cache locks prevent duplicate
@@ -1203,7 +1422,8 @@ def main():
         print(json.dumps(result, indent=2))
     else:
         # A CLI named explicitly is always shown so its status explains itself.
-        display(result, args.color, args.show_all or len(selected_clis) <= 1)
+        explicit = bool(args.provider) or bool(args.cli and args.cli != "all")
+        display(result, args.color, args.show_all or explicit or len(selected_clis) <= 1)
 
 
 if __name__ == "__main__":

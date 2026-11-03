@@ -4,18 +4,17 @@ set -euo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/lib/harness.sh"
 
 # ---------- gh_guard_test.sh ----------
-# Tests that both `kimo launch gh` and `kimo run gh` reject the command
-# with the proper "management-only" error message.
+# Tests that `kimo run gh` rejects 'gh' as a model name and points at
+# `kimo launch gh` (GitHub Copilot CLI), which is the supported route.
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 KIMO="${ROOT_DIR}/kimo"
 
-for verb in launch run; do
-    echo "Testing 'kimo ${verb} gh' ..."
-    rc=0
-    output=$("${KIMO}" "${verb}" gh 2>&1) || rc=$?
-    check_contains "kimo ${verb} gh shows management-only error" "GitHub CLI is management-only" "${output}"
-    check "kimo ${verb} gh exits 1" "1" "${rc}"
-done
+echo "Testing 'kimo run gh' ..."
+rc=0
+output=$("${KIMO}" run gh 2>&1) || rc=$?
+check_contains "kimo run gh says gh is not a model" "'gh' is the GitHub CLI, not a model" "${output}"
+check_contains "kimo run gh points at launch gh" "launch gh" "${output}"
+check "kimo run gh exits 1" "1" "${rc}"
 
 harness_summary "gh_guard_test.sh"

@@ -50,6 +50,7 @@ out="${KIMI_SMOKE_OUT:?KIMI_SMOKE_OUT unset}"
     printf 'KIMI_CODE_HOME=%s\n' "${KIMI_CODE_HOME-<unset>}"
     printf 'KIMI_DISABLE_TELEMETRY=%s\n' "${KIMI_DISABLE_TELEMETRY-<unset>}"
     printf 'KIMI_CODE_NO_AUTO_UPDATE=%s\n' "${KIMI_CODE_NO_AUTO_UPDATE-<unset>}"
+    printf 'KIMI_CODE_LLM_HEADERS_TIMEOUT_MS=%s\n' "${KIMI_CODE_LLM_HEADERS_TIMEOUT_MS-<unset>}"
     printf 'KIMI_MODEL_NAME=%s\n' "${KIMI_MODEL_NAME-<unset>}"
     printf 'KIMI_MODEL_PROVIDER_TYPE=%s\n' "${KIMI_MODEL_PROVIDER_TYPE-<unset>}"
     printf 'KIMI_MODEL_BASE_URL=%s\n' "${KIMI_MODEL_BASE_URL-<unset>}"
@@ -86,6 +87,7 @@ else
     check "KIMI_CODE_HOME set and non-empty" "yes" "$([[ -n "$(env_val "${CAPTURE}" KIMI_CODE_HOME)" ]] && echo yes || echo no)"
     check "KIMI_DISABLE_TELEMETRY exported (1)" "1" "$(env_val "${CAPTURE}" KIMI_DISABLE_TELEMETRY)"
     check "KIMI_CODE_NO_AUTO_UPDATE exported (1)" "1" "$(env_val "${CAPTURE}" KIMI_CODE_NO_AUTO_UPDATE)"
+    check "KIMI_CODE_LLM_HEADERS_TIMEOUT_MS exported (600000)" "600000" "$(env_val "${CAPTURE}" KIMI_CODE_LLM_HEADERS_TIMEOUT_MS)"
 fi
 
 echo "[*] mocked: config-alias path writes default_model + registers alias"
@@ -103,6 +105,40 @@ if has_flag "${CAPTURE}" -m; then
     else
         bad "alias form unexpected: ${mval}"
     fi
+fi
+
+echo "[*] mocked: --host passthrough for kimi web/rc subcommands"
+dry=$("${KIMO}" launch kimi web --host 192.168.1.111 --port 1337 --dry-run)
+check_contains "dry run includes --host 192.168.1.111 in argv" "web --host 192.168.1.111 --port 1337" "${dry}"
+
+rm -f "${CAPTURE}"
+"${KIMO}" --host "${UPSTREAM}" launch kimi web --host 192.168.1.111 --port 1337 >/dev/null 2>&1 || true
+if [[ -f "${CAPTURE}" ]]; then
+    check "kimi received --host flag" "192.168.1.111" "$(flag_val "${CAPTURE}" --host)"
+    check "kimi received --port flag" "1337" "$(flag_val "${CAPTURE}" --port)"
+else
+    bad "fake kimi was not exec'd for web --host"
+fi
+
+rm -f "${CAPTURE}"
+"${KIMO}" --host "${UPSTREAM}" launch kimi web --host --port 1337 >/dev/null 2>&1 || true
+if [[ -f "${CAPTURE}" ]]; then
+    if has_flag "${CAPTURE}" --host; then
+        ok "kimi received bare --host flag"
+    else
+        bad "kimi did not receive bare --host flag"
+    fi
+    check "kimi received --port flag with bare --host" "1337" "$(flag_val "${CAPTURE}" --port)"
+else
+    bad "fake kimi was not exec'd for bare --host"
+fi
+
+rm -f "${CAPTURE}"
+"${KIMO}" --host "${UPSTREAM}" launch kimi web --host=192.168.1.111 --port 1337 >/dev/null 2>&1 || true
+if [[ -f "${CAPTURE}" ]]; then
+    check_contains "kimi received --host=value flag" "--host=192.168.1.111" "$(<"${CAPTURE}")"
+else
+    bad "fake kimi was not exec'd for --host=value"
 fi
 
 echo

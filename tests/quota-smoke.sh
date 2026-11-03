@@ -69,13 +69,21 @@ with tempfile.TemporaryDirectory(prefix='kimo-quota-smoke-') as temp:
     check(set(data['clis']) == {'claude'} and data['clis']['claude']['status'] == 'offline', '--no-refresh works for Claude selection')
     data = dashboard('quota', '--provider', 'ollama')
     check(set(data['providers']) == {'ollama'} and not data['clis'], 'provider filter preserved')
+    for name in ('codex', 'qwen', 'grok', 'agy', 'opencode'):
+        data = dashboard('quota', '--provider', name)
+        check(set(data['clis']) == {name} and not data['providers'], '--provider account: ' + name)
+    data = dashboard('quota', '--provider', 'codex,grok,ollama')
+    check(set(data['clis']) == {'codex', 'grok'} and set(data['providers']) == {'ollama'}, 'comma-separated --provider list')
+    data = dashboard('quota', '--provider', 'qwen', '--provider=agy', '--provider', 'qwen')
+    check(set(data['clis']) == {'qwen', 'agy'} and not data['providers'], 'repeated --provider, duplicates dropped')
     data = dashboard('--remote', 'quota')
     check(set(data['clis']) == names, '--remote --offline remains offline')
     data = dashboard('--host', 'http://127.0.0.1:12345', 'quota', '--model', 'pro')
     check(set(data['clis']) == names, '--host and model filtering')
     for options in (('--provider', 'invalid'), ('--cli', 'invalid'), ('--timeout', '0'),
                     ('--timeout', 'nan'), ('--timeout', '61'), ('--cli',), ('--unknown',),
-                    ('--provider', 'ollama', '--cli', 'codex')):
+                    ('--provider', 'ollama', '--cli', 'codex'), ('--provider', 'codex,invalid'),
+                    ('--provider', 'all,codex')):
         result = run('quota', '--offline', *options)
         check(result.returncode != 0 and 'Traceback' not in result.stderr, 'invalid arguments rejected: ' + ' '.join(options))
     result = run('quota', '--offline')

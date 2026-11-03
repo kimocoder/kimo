@@ -27,8 +27,10 @@
   - **Google Antigravity CLI** (`agy`)
   - **Cyberstrike AI Pentesting CLI** (`cyberstrike`)
   - **Hermes / OpenClaw**
-- **Hosted Cloud Provider**: `launch --provider abliteration` routes `claude` and `kimi` at the [abliteration.ai](https://docs.abliteration.ai) Anthropic-/OpenAI-compatible API instead of a self-hosted Ollama daemon — no host probing, no model eviction, and the API key stays in the environment only.
-- **DashScope (Alibaba Model Studio)**: `launch --provider dashscope` routes `kimi` and `claude` at Model Studio — the key's class picks the surface (`sk-ws-`/`sk-` → pay-as-you-go intl, `sk-sp-` → token-plan); kimi rides a zero-footprint env channel, claude the Anthropic-compatible `/apps/anthropic` endpoint, and with no env key kimi falls back to the freetier-managed `alibaba/` aliases.
+- **Hosted Cloud Provider**: `launch --provider abliteration` routes `claude` and `kimi` at the [abliteration.ai](https://docs.abliteration.ai) Anthropic-/OpenAI-compatible API instead of a self-hosted Ollama daemon — no host probing, no model eviction, and the API key stays in the environment only. For `kimi`, a validated key registers a named `[providers.abliteration]` (credential by env-var reference) plus every model the API serves.
+- **DashScope (Alibaba Model Studio)**: `launch --provider dashscope` routes `kimi`, `claude`, `codex` and `agy` at Model Studio — the key's class picks the surface (`sk-ws-`/`sk-` → pay-as-you-go intl, `sk-sp-` → token-plan); kimi rides a zero-footprint env channel, claude the Anthropic-compatible `/apps/anthropic` endpoint, codex the Responses wire, and agy the loopback Gemini shim in its OpenAI-compatible mode (Model Studio exposes no Gemini endpoint). With no env key kimi falls back to the freetier-managed `alibaba/` aliases.
+- **Alibaba Free Tier**: `launch --provider alibaba` explicitly targets the freetier-managed `[providers.alibaba]` configuration in Kimi Code CLI with a default context size of 500,000 tokens (preventing continuous context auto-compaction loops with DeepSeek models).
+- **vLLM (self-hosted OpenAI server)**: `launch --provider vllm` routes `kimi` at a local or remote vLLM server (default `http://127.0.0.1:8000/v1`). It is not an Ollama daemon: no `/api/tags`, no VRAM eviction, no tune registry. A reachable `GET /v1/models` registers `[providers.vllm]` (or `vllm-<host>`) and one alias per served model. `VLLM_API_KEY` is stored by env-var name only; with no key the placeholder is `EMPTY`. Unrelated credentials are still scrubbed when the server is not on this machine.
 
 ---
 
@@ -69,7 +71,7 @@ make check
 | `make test-gh` | Headless smoke test of GitHub CLI (`gh`) integration contracts and update safety |
 | `make test-qwen` | Headless smoke test of the `qwen` launch branch: asserts the argv/env kimo passes (api-key scrubbing, `QWEN_CODE_API_TIMEOUT_MS`). Add `LIVE=1` for an opt-in live `-p` turn against a reachable Ollama host (`KIMO_SMOKE_HOST`/`KIMO_SMOKE_MODEL` override) |
 | `make test-claude` | Headless smoke test of the `claude` launch branch: asserts the env kimo passes (api-key scrubbing, `CLAUDE_CODE_*` defaults incl. unknown-model window enforcement and telemetry/MCP flags with user overrides honoured, `--ctx` → `OLLAMA_CONTEXT_LENGTH`, `API_TIMEOUT_MS` passthrough). Add `LIVE=1` for an opt-in live `-p` turn |
-| `make test-agy` | Headless smoke test of the `agy` launch branch: asserts shim liveness/reaping, settings patch + restore, and that `GEMINI_API_KEY` is never scrubbed (it only reaches the loopback shim, whose upstream requests carry no auth). Add `LIVE=1` for an opt-in live `-p` turn |
+| `make test-agy` | Headless smoke test of the `agy` launch branch: asserts shim liveness/reaping, settings patch + restore, and that `GEMINI_API_KEY` is never scrubbed (it is the shim's own session key, not a provider credential, and only reaches the loopback shim). Add `LIVE=1` for an opt-in live `-p` turn |
 | `make test-opencode` | Headless smoke test of the `opencode` launch branch: asserts the argv/env kimo passes (host env, `OPENAI_API_KEY`/`ANTHROPIC_API_KEY` scrub for non-local hosts). opencode routes via its own provider config and reads no base-url env, so the scrub is defence-in-depth. Add `LIVE=1` for an opt-in live `run` turn against an isolated `HOME` with a throwaway provider (`KIMO_SMOKE_HOST`/`KIMO_SMOKE_MODEL` override) |
 | `make test-codex` | Headless smoke test of the `codex` launch branch: asserts the argv/env kimo passes (`--oss`, `--local-provider ollama`, `CODEX_OSS_BASE_URL` host routing, `OPENAI_API_KEY` default). Add `LIVE=1` for an opt-in live `exec` turn against a reachable Ollama host (`KIMO_SMOKE_HOST`/`KIMO_SMOKE_MODEL` override) |
 | `make test-codex-auth` | Isolated Codex native command forwarding, cloud/Ollama precedence, credentials, and Kimi model sync with backups |
@@ -77,8 +79,9 @@ make check
 | `make test-grok` | Headless smoke test of the `grok` launch branch: asserts the argv/env kimo passes (`--model`, `GROK_MODELS_BASE_URL` host routing, forced `XAI_API_KEY` scrub for all hosts, exit-code propagation) and the `--ctx` config.toml `context_window` patch/revert lifecycle. Add `LIVE=1` for an opt-in live `-p` turn against a reachable Ollama host (`KIMO_SMOKE_HOST`/`KIMO_SMOKE_MODEL` override) |
 | `make test-thinking-tools` | Checks the thinking/tools capability handling: `_kimi_model_spec` unit checks (capability mapping `thinking`/`tools`/`vision` → `thinking`/`tool_use`/`image_in`, probe-failure fallback to `tool_use`, override precedence, ctx precedence flag > runtime > architecture) plus launch-branch integration (kimi env channel exports thinking vars only for thinking models, scrubs stale inherited effort on non-thinking models, honours `KIMO_KIMI_EFFORT`/`KIMO_KIMI_REASONING_KEY`/`KIMO_KIMI_CAPABILITIES`) |
 | `make test-gemini` | Headless smoke test of `kimo gemini` model sync into Kimi Code: asserts `/v1beta/models` parsing, non-chat filtering, `--stable-only`/`--all` flags, token limits mapping, thinking capability, valid TOML generation, idempotency, and backup creation |
-| `make test-abliteration` | Headless smoke test of the abliteration.ai cloud provider (`launch --provider abliteration`): base-URL routing for both API surfaces, the forwarded key never reaching argv or console, Claude's `[1m]` context suffix and tier overrides, kimi's zero-footprint env channel, per-model capabilities/effort ceilings, provider precedence (flag > env > config), and the absence of any Ollama probing |
-| `make test-dashscope` | Headless smoke test of the DashScope cloud provider (`launch --provider dashscope`): intl compatible-mode routing, default/explicit/`--ctx` model selection, `DASHSCOPE_API_KEY` with `MODELSTUDIO_API_KEY` fallback, placeholder and missing-key rejection, kimi's zero-footprint `KIMI_MODEL_*` env channel (wire type, base URL, context, reasoning key), provider precedence, remote-host key scrubbing, and the absence of any Ollama probing |
+| `make test-abliteration` | Headless smoke test of the abliteration.ai cloud provider (`launch --provider abliteration`): base-URL routing for both API surfaces, the forwarded key never reaching argv, console or config, Claude's `[1m]` context suffix and tier overrides, kimi's validated `[providers.abliteration]` config path (served-catalogue registration, `api_key_env` reference, `ABLIT_KEY` normalization, 401 abort) and its zero-footprint env-channel fallback, per-model capabilities/effort ceilings, provider precedence (flag > env > config), and the absence of any Ollama probing |
+| `make test-dashscope` | Headless smoke test of the DashScope cloud provider (`launch --provider dashscope`): intl compatible-mode routing, default/explicit/`--ctx` model selection, `DASHSCOPE_API_KEY` with `MODELSTUDIO_API_KEY` fallback, placeholder and missing-key rejection, kimi's zero-footprint `KIMI_MODEL_*` env channel (wire type, base URL, context, reasoning key), provider precedence, remote-host key scrubbing, the absence of any Ollama probing, and agy's Gemini→OpenAI shim turn (a real translated request reaches `/chat/completions` with the key as a bearer token, while agy's own environment never sees that key) |
+| `make test-vllm` | Headless smoke test of `launch kimi --provider vllm`: base-URL normalization, catalogue registration from `/v1/models`, `EMPTY` vs `VLLM_API_KEY` by name, context capping, thinking-id detection, env-channel fallback, remote credential scrubbing, and no Ollama probe or `ollama run` fallback |
 | `make test-quota` | Headless smoke test of unified quota & usage dashboard (`kimo quota`) |
 | `make test-tunnel` | Headless smoke test of remote Ollama SSH tunnel management (`kimo tunnel`) |
 | `make test-config-validate` | Headless smoke test of persistent configuration validation (`kimo config validate`) |
@@ -91,7 +94,7 @@ make check
 | `make test-launch-contract` | Launch contract for every CLI: credential scrub for non-local hosts, child-flag passthrough and `--`, opt-in `--evict` |
 | `make test-sync` | Blob-level `sync` between two fake daemons (upload, create, weight verification, `--force`), plus the digest-verified registry fallback |
 | `make test-model-commands` | Core model commands against fake local and remote daemons: `search` honors `--local`/`--remote` and reports VRAM residency per host; `stream` runs the shipped helper with kimo's remote resolution; `bench` TTFT includes cold loads, `--runs`/`--warmup` |
-| `make test-shim` | Gemini shim contract: `model:tag` paths, JSON-array/SSE streaming, mid-stream errors, tools, images, `countTokens`, request validation |
+| `make test-shim` | Gemini shim contract against both upstream wires (Ollama `/api/chat` and OpenAI-compatible `/chat/completions`): `model:tag` paths, JSON-array/SSE streaming, mid-stream errors, tools, images, `countTokens`, request validation, and on the OpenAI side the top-level sampling controls, `response_format`, `enable_thinking`, reassembly of fragmented tool calls, `reasoning_content` → thought parts and bearer credential forwarding |
 | `make test-install-packages` | Installers request only official npm/PyPI packages and never fall back to look-alike names |
 | `make clean` | Removes temporary and backup files (`*~`, `*.tmp`, `*.bak`) |
 | `make help` | Displays list of available make targets and options |
@@ -149,9 +152,11 @@ kimo [options] <command> [arguments...]
 | `update [cli\|all]`  | Check for updates for all installed CLIs, or apply updates | `kimo update` |
 | `completion [sh]`    | Generate shell tab-completion script for Bash or Zsh | `kimo completion bash` |
 | `freetier [opts]`    | Sync Kimi config with Model Studio free-tier quotas (`bl usage free`) | `kimo freetier --verify-prune` |
-| `gemini [opts]`      | Register Gemini API models (with exact token limits) into Kimi Code | `kimo gemini --verify-prune` |
+| `gemini [opts]`      | Register Gemini API models into Kimi Code, inspect OAuth token & accounts | `kimo gemini --token` |
+| `claude [opts\|cmd]` | Inspect Claude OAuth token, sync models into Kimi, or forward Claude CLI | `kimo claude --token` |
 | `codex [opts\|command]` | Inspect Codex authentication, sync models into Kimi, or forward native Codex commands | `kimo codex login --device-auth` |
 | `quota [cli] [opts]` | Check provider usage and every supported CLI account | `kimo quota codex --json` |
+| `kimi provider [cmd]` | List, disable/enable, or sync Kimi Code's LLM providers and model aliases | `kimo kimi provider sync --prune` |
 
 ---
 
@@ -170,6 +175,8 @@ kimo quotas kimi --no-refresh       # Use cached credentials without OAuth refre
 kimo quota claude --json            # Structured account windows and reset times
 kimo quota claude --no-refresh      # Read Claude usage without rotating OAuth credentials
 kimo quota --provider openrouter    # Existing provider filter
+kimo quota --provider codex,grok,agy  # Account adapters work as providers; comma-separate or repeat
+kimo quota --provider qwen --provider opencode
 kimo quota --offline --json         # Installation checks without network or CLI execution
 kimo quota --timeout 10             # Timeout budget per source (default 5s, maximum 60s)
 kimo --host localhost:11434 quota --provider ollama
@@ -184,11 +191,13 @@ kimo --host localhost:11434 quota --provider ollama
 | `agy` | Google Code Assist per-model quota buckets | Cached Antigravity OAuth token; discovers the existing quota project or uses `GOOGLE_CLOUD_PROJECT` / `GOOGLE_CLOUD_PROJECT_ID`. These are Code Assist buckets, not a complete Antigravity subscription budget. |
 | `cursor` | Team on-demand spend against enforced spending limits | Optional `CURSOR_ADMIN_API_KEY`; personal-plan usage remains in the dashboard. [Admin API](https://cursor.com/docs/account/teams/admin-api) |
 | `qwen` | Bailian free-tier balances or configured OpenRouter budget | Qwen settings or provider environment; Bailian requires `bl` console login. Qwen OAuth daily remaining quota has no supported headless readout. |
-| `opencode` | Selected provider's OpenRouter budget or configured Ollama status | Reads local JSON/JSONC config and environment references; remote organization and managed overrides are not evaluated. |
+| `opencode` | Selected provider's OpenRouter budget or configured Ollama status; OpenCode's own provider points at the Console | Reads local JSON/JSONC config and environment references; remote organization and managed overrides are not evaluated. OpenCode Console balance and monthly limits have no API, so `opencode/*` models report `unavailable` with Console guidance. |
 | `hermes` | Configured OpenRouter budget, Ollama status, or local session usage | Provider environment / `.hermes/.env`; optionally set `HERMES_USAGE_FILE` to an existing `--usage-file` report. Local estimates are labelled separately. |
 | `grok` | Native subscription credits, billing period, on-demand cap/spend, prepaid balance, plan, and billing history | Existing `grok login`; probes `_x.ai/billing` via `grok agent stdio`. Uses the native client's authentication/refresh. Older clients without billing support can fall back to a configured OpenRouter/Ollama backend. [Official billing protocol](https://github.com/xai-org/grok-build/blob/main/crates/codegen/xai-grok-shell/src/extensions/billing.rs) |
 | `cyberstrike` | Configured OpenRouter budget or Ollama status | Provider environment; otherwise guidance for checking the configured provider. |
 | `gh` | Native GitHub API rate-limit resources | Existing `gh` authentication; these limits do not represent Copilot premium requests. |
+
+`--provider` accepts the service providers above and any CLI account name (`codex`, `qwen`, `grok`, `agy`, `opencode`, ...); `all` cannot be mixed with other names. Account results stay under `clis` in JSON.
 
 Every CLI remains visible even when it is missing, offline, unauthenticated, or cannot expose quota. Unsupported account checks return `unavailable` with instructions, rather than an invented balance. Ollama is marked `not_metered`; Gemini model token limits are labelled as context limits, with account quota unavailable. `--model` filters model-specific data while retaining account-wide windows.
 
@@ -348,6 +357,10 @@ kimo launch codex --provider ollama --model my-model --ctx 32768 -- exec "Explai
 kimo --remote launch codex --provider ollama --model my-model
 kimo launch codex --provider codex -c 'model_reasoning_effort="high"'
 kimo launch codex --provider codex --dry-run
+kimo launch codex --provider dashscope              # Responses wire, default qwen3.8-max
+kimo launch codex --provider qwencloud --model qwen3-coder-plus
+kimo launch codex --provider xai                    # alias: --provider grok
+kimo launch codex --provider anthropic --dry-run
 ```
 
 Ollama remains the default backend. OpenAI has two backends, and their credentials are not interchangeable:
@@ -375,32 +388,79 @@ Sync reads the visible models, context sizes, input capabilities, and reasoning 
 
 A ChatGPT access token expires after a few hours, so kimo renews it from `auth.json`'s `refresh_token` (the same call the Codex CLI makes) whenever `launch --provider codex`, `kimo codex --token` or `--export` needs a working credential. The renewed token is written back atomically at mode `0600` and is never printed or passed in argv; no plaintext backup of a credential file is left behind. Set `KIMO_CODEX_NO_REFRESH=1` to stay offline (`KIMO_CODEX_TOKEN_URL` / `KIMO_CODEX_REFRESH_TIMEOUT` override the endpoint and its timeout). `kimo codex` reports the refresh token and last renewal; `kimo codex --json` exposes `refreshable` and `last_refresh`. OpenAI Platform API keys cannot authenticate the ChatGPT endpoint — use `--provider openai` for those.
 
-## Google Gemini API Model Sync (`gemini`)
+## Claude Code Authentication & Model Sync (`claude`)
 
-`kimo gemini` registers Google Gemini API models directly into Kimi Code (`~/.kimi-code/config.toml`). It queries the `/v1beta/models` endpoint (paginated) for every model visible to your API key, maps each model's genuine architectural token limits (`inputTokenLimit` &rarr; `max_context_size`, `outputTokenLimit` &rarr; `max_output_size`), detects thinking capability, and populates a managed `[providers.gemini]` block with native `google-genai` provider protocol and `[models."gemini/<id>"]` aliases.
-
-Non-chat models (media generation, TTS, live audio streams, embeddings, and autonomous agents) are automatically filtered out unless `--all` is passed. Like other `kimo` config mutations, edits are surgical, validated against `kimi doctor`, and preceded by timestamped backups (`config.toml.before-gemini-*`).
+`kimo claude` inspects Claude Code OAuth authentication (`~/.claude/.credentials.json`), manages tokens, and syncs Claude models into Kimi Code's configuration (`[providers.anthropic]`):
 
 ```bash
-# Preview models that would be added (writes nothing)
-kimo gemini --dry-run
-
-# Probe candidate models with a 1-token prompt, prune any failing models, and write config
-kimo gemini --verify --verify-prune
-
-# Register only stable release models (drop preview / experimental tags)
-kimo gemini --stable-only
-
-# Reference GEMINI_API_KEY environment variable instead of hardcoding key into config.toml
-kimo gemini --api-key-env GEMINI_API_KEY
-
-# Set Gemini 2.5 Flash as the default model in Kimi Code
-kimo gemini --set-default gemini/gemini-2.5-flash
-
-# Launch Kimi Code CLI directly with a registered Gemini model
-kimi -m gemini/gemini-2.5-flash
-kimi -m gemini/gemini-2.5-pro
+kimo claude                              # Inspect Claude OAuth session, expiration and plan
+kimo claude --token                      # Print active Claude Code OAuth token
+kimo claude --export                     # Output export statements for CLAUDE_CODE_OAUTH_TOKEN / ANTHROPIC_AUTH_TOKEN
+kimo claude --json                       # Structured JSON output
+kimo claude --sync                       # Sync Claude models (claude-opus-5-5, etc.) into Kimi config
+kimo claude --set-default                # Sync and set claude-opus-5-5 as default model in Kimi
+kimo claude auth login                   # Native command forwarding directly to Claude CLI
 ```
+
+## Google Gemini API Model Sync & Token Management (`gemini`)
+
+`kimo gemini` inspects Google / Gemini CLI authentication (`~/.gemini/antigravity-cli/antigravity-oauth-token`), provides token export and automatic refresh, and registers Google Gemini API models directly into Kimi Code (`~/.kimi-code/config.toml`):
+
+```bash
+# Token & Authentication inspection
+kimo gemini                              # Inspect Gemini account, OAuth expiration & credentials
+kimo gemini --token                      # Output active OAuth bearer token or API key
+kimo gemini --export                     # Output eval-able shell export statement
+kimo gemini --json                       # Structured JSON authentication and model status
+
+# Model synchronization
+kimo gemini --verify --verify-prune      # Probe candidate models, prune failing, write config
+kimo gemini --stable-only                # Register stable models only
+kimo gemini --set-default gemini/gemini-2.5-flash
+```
+
+---
+
+## Kimi Code Provider Management (`kimi provider`)
+
+`kimo kimi provider` manages the `[providers.*]` blocks and `[models."<provider>/*"]` aliases in Kimi Code's `~/.kimi-code/config.toml` (`$KIMI_CONFIG` overrides the path). Every change is written atomically while holding kimo's Kimi config lock.
+
+```bash
+# Every provider, its type, alias count and whether it is enabled (* = default model's provider)
+kimo kimi provider list
+
+# Hide a provider from Kimi's /model picker without losing anything, then bring it back
+kimo kimi provider disable groq
+kimo kimi provider enable groq
+
+# Check every provider's key against its /models endpoint and add the models it serves
+kimo kimi provider sync
+kimo kimi provider sync groq
+
+# Preview, then remove aliases for models a provider no longer serves
+kimo kimi provider sync --prune --dry-run
+kimo kimi provider sync --prune
+
+# Add OpenCode Zen (paid models) with your own key
+OPENCODE_API_KEY=... kimo kimi provider sync opencode
+```
+
+**disable / enable.** Disable moves the provider block and every alias that belongs to it (by its `provider` field or a `<name>/` prefix) into `[disabled_providers]` and `[disabled_models]`. Kimi never reads those tables, but keeps them when it rewrites the file. If `default_model` pointed at the provider, it is cleared and remembered in `[disabled_defaults]`; enable puts the aliases back and restores that default, unless another default was chosen in the meantime. Running `enable` on an already enabled provider also recovers aliases an older kimo left hidden.
+
+**sync.** For each provider kimo resolves the key (`api_key_env` or `api_key`), asks the provider's own `base_url` for its model list, and adds or refreshes `[models."<provider>/<model>"]` with display names and context/output limits. Keys only ever go to that `base_url`, in a header (`Authorization`, `x-api-key` or `x-goog-api-key`), and redirects are never followed. Provider types: `openai`, `anthropic` (`base_url` used as given, `/v1` added when missing), `google-genai`, and `openai_responses` (models from Codex's `models_cache.json`); Kimi-managed OAuth providers are skipped. Embedding, speech, image and moderation models are left out unless `--include-nonchat`.
+
+| Option | Effect |
+|---|---|
+| `--all` | Sync every provider (the default when no name is given) |
+| `--prune` | Remove aliases for models the provider no longer serves (never the current `default_model`) |
+| `--dry-run` | Report what would change without writing |
+| `--include-nonchat` | Keep embedding, speech, image and moderation models |
+| `--timeout <s>` / `--jobs <n>` | Per-provider HTTP timeout (default 8) and parallel checks (default 4) |
+| `--json` | Machine-readable results |
+
+Statuses `ok`, `empty`, `skipped`, `no-credential`, `no-models-endpoint` and `no-cache` are informational. The command exits 1 only when a provider is actually broken: `bad-key`, `rate-limited`, `redirected`, `unreachable`, `http-error`, `parse-error` or `no-base-url`.
+
+**OpenCode Zen.** `sync opencode` adds `[providers.opencode]` (`https://opencode.ai/inference/openai/v1`, key read from `$OPENCODE_API_KEY` and never written to the config; create one at https://opencode.ai/auth) once the key checks out. Only paid chat-completions models are aliased: free-tier models answer only the OpenCode client (kimi gets HTTP 403), and models on the `/responses` or `/messages` wire formats are skipped. Free and paid are told apart with models.dev pricing, from OpenCode's cache (`~/.cache/opencode/models.json`) or from https://models.dev when that cache is missing, has no Zen section, or lacks a model Zen serves. kimo warns when no price list is available, and names models it had to add without pricing.
 
 ---
 
@@ -697,6 +757,7 @@ kimo --remote launch qwen --model kalidroid-27b:latest
 
 # Launch Google Antigravity CLI via automatic Gemini-to-Ollama wire shim
 kimo launch agy --model kalidroid-27b:latest
+kimo launch agy --provider dashscope            # same shim, OpenAI-compatible upstream
 
 # Launch Cyberstrike AI pentesting agent routed to Ollama models
 kimo launch cyberstrike --model kalidroid-27b:latest
@@ -720,7 +781,7 @@ Other models already loaded on the target host are **not** unloaded unless you a
 
 ### Cloud Provider: DashScope (Alibaba Model Studio)
 
-`--provider dashscope` routes a launch at Alibaba Model Studio. The credential's class picks the surface: `sk-ws-`/`sk-` keys go to the pay-as-you-go international endpoint (`https://dashscope-intl.aliyuncs.com/compatible-mode/v1`), `sk-sp-` token-plan keys to the subscription endpoint (`https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1`) — each class 401s on the other's surface. It is wired for **`kimi`** and **`claude`**; every other CLI stays on Ollama routing and errors out if you ask it to use the provider.
+`--provider dashscope` routes a launch at Alibaba Model Studio. The credential's class picks the surface: `sk-ws-`/`sk-` keys go to the pay-as-you-go international endpoint (`https://dashscope-intl.aliyuncs.com/compatible-mode/v1`), `sk-sp-` token-plan keys to the subscription endpoint (`https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1`) — each class 401s on the other's surface. It is wired for **`kimi`**, **`claude`**, **`codex`**, and **`agy`**; every other CLI stays on Ollama routing and errors out if you ask it to use the provider.
 
 ```bash
 export DASHSCOPE_API_KEY="sk-..."        # MODELSTUDIO_API_KEY is accepted too
@@ -728,14 +789,29 @@ export DASHSCOPE_API_KEY="sk-..."        # MODELSTUDIO_API_KEY is accepted too
 kimo launch kimi --provider dashscope                       # default: qwen3.8-max
 kimo launch kimi --provider dashscope --model qwen3-coder-plus
 kimo launch claude --provider dashscope                     # Anthropic wire, tier-mapped
+kimo launch agy --provider dashscope                        # Gemini wire via the shim
 kimo launch kimi --provider dashscope --ctx 131072 --dry-run
 
 kimo config set cloud_provider dashscope                    # make it the default backend
 ```
 
-kimi rides its zero-footprint `KIMI_MODEL_*` env channel (wire type `openai`, reasoning key `reasoning_content`, context 1,000,000 unless `--ctx` or `KIMO_DASHSCOPE_CTX` says otherwise), so nothing is written to kimi's config and the key never reaches argv or disk. claude rides each surface's Anthropic-compatible `/apps/anthropic` endpoint with the bearer in `ANTHROPIC_AUTH_TOKEN` and a tier mapping that keeps its internal requests on Model Studio models (`haiku`→`qwen3.6-flash`, `sonnet`→`qwen3.8-flash`, `opus`→`qwen3.8-max`, subagents `auto`, context 983,616; all overridable via `KIMO_DASHSCOPE_CLAUDE_*`). Without `-m`, kimi defaults to `qwen3.8-max` and claude to `auto`.
+kimi rides its zero-footprint `KIMI_MODEL_*` env channel (wire type `openai`, reasoning key `reasoning_content`, context 1,000,000 unless `--ctx` or `KIMO_DASHSCOPE_CTX` says otherwise), so nothing is written to kimi's config and the key never reaches argv or disk. claude rides each surface's Anthropic-compatible `/apps/anthropic` endpoint with the bearer in `ANTHROPIC_AUTH_TOKEN` and a tier mapping that keeps its internal requests on Model Studio models (`haiku`→`qwen3.6-flash`, `sonnet`→`qwen3.8-flash`, `opus`→`qwen3.8-max`, subagents `auto`, context 983,616; all overridable via `KIMO_DASHSCOPE_CLAUDE_*`). Without `-m`, kimi defaults to `qwen3.8-max` and claude to `auto`. **codex** rides the same compatible-mode origin on the Responses wire (`POST {base}/responses`). kimo passes it as `-c model_providers.dashscope` overlays (`env_key` names `DASHSCOPE_API_KEY` or `MODELSTUDIO_API_KEY`, `requires_openai_auth=false`) and does not modify `config.toml`. **agy** speaks only the Gemini wire and Model Studio exposes no Gemini endpoint, so kimo spawns its loopback Gemini shim in OpenAI-compatible mode (`--upstream-kind openai`): the shim serves `v1beta/models/{model}:generateContent|streamGenerateContent` and posts `{base}/chat/completions` upstream, translating text, images, tool calls, `reasoning_content` and token usage in both directions. The DashScope key is passed to the shim by environment and unset before agy starts, so a Google client is never handed an Alibaba credential; agy authenticates to the shim with its own per-session `GEMINI_API_KEY`. The default model is `qwen3.8-max`.
+
+### Codex Responses providers (`qwencloud`, `xai`, `anthropic`)
+
+`kimo launch codex --provider` can also target three more Responses endpoints. Codex CLI 0.164 accepts only `wire_api = "responses"` (it rejects `chat`). These providers are **codex-only**. The key stays in the environment; `--dry-run` masks it; nothing is written to `~/.codex/config.toml` or placed in argv. `--oss` is not set, and a ChatGPT login is not required. Codex's multi-agent tools, and the TUI's `codex_worktrees` MCP server, are sent as `{"type":"namespace"}`. These endpoints reject that variant with HTTP 422. Codex 0.164 also sends `external_web_access` on `web_search`, which xAI rejects with HTTP 400 (`Argument not supported: external_web_access`) before the model runs. The launch disables multi-agent and, through a localhost proxy, flattens remaining namespace tools and drops `external_web_access`, `indexed_web_access`, and `search_context_size`. Cached web search (`external_web_access: false`) is omitted, because these endpoints have no cached-only search. Live and indexed search stay, with `filters`, `user_location`, and `search_content_types` kept. The key still goes only to the upstream.
+
+| Provider | Default endpoint | Credential | Default model | Context |
+| --- | --- | --- | --- | --- |
+| `qwencloud` | `https://ap-southeast-1.maas.qwencloudapi.com/compatible-mode/v1` | `QWENCLOUD_API_KEY`, else `DASHSCOPE_API_KEY`, else `MODELSTUDIO_API_KEY` | `qwen3.8-max` | 1,000,000 |
+| `xai` (`grok`) | `https://api.x.ai/v1` | `XAI_API_KEY` | `grok-4.7` | 500,000 |
+| `anthropic` | `https://api.anthropic.com/v1` | `ANTHROPIC_API_KEY`, else `ANTHROPIC_AUTH_TOKEN` | `claude-opus-5-5` | 1,000,000 |
+
+An `sk-sp-` key selects QwenCloud's token-plan host (`https://token-plan.maas.qwencloudapi.com/compatible-mode/v1`) unless `KIMO_QWENCLOUD_BASE_URL` is set. `KIMO_QWENCLOUD_REGION` changes the pay-as-you-go region (default `ap-southeast-1`). `KIMO_XAI_BASE_URL` and `KIMO_ANTHROPIC_BASE_URL` override those origins. `KIMO_ANTHROPIC_BASE_URL` is the Responses base Codex posts to; it is separate from Claude Code's `ANTHROPIC_BASE_URL`. A `qwencloud/`, `xai/`, `grok/`, or `anthropic/` prefix on `--model` is stripped. `--ctx` overrides the context window Codex is told about (`model_context_window`).
 
 With no usable key in the environment at all, `launch kimi --provider dashscope` falls back to the freetier-managed `[providers.alibaba]` block (`kimo freetier`, quota data from `bl usage free`): kimi launches with `-m alibaba/<model>` against its own stored credential, so the free-tier surface works with no secret from kimo. `bl auth login --console --console-site international` refreshes the quota data when it expires. Like every hosted backend it skips host probing, Ollama tag resolution, eviction and tune settings.
+
+`launch kimi --provider alibaba` explicitly targets this `[providers.alibaba]` block even when environment keys (such as `DASHSCOPE_API_KEY`) are present. It defaults the context window to `500,000` tokens (`KIMO_ALIBABA_CTX`, overridable with `--ctx`), syncing `max_context_size` in `~/.kimi-code/config.toml` and exporting `KIMI_MODEL_MAX_CONTEXT_SIZE` so DeepSeek does not hit premature context auto-compaction loops.
 
 ### Cloud Provider: abliteration.ai
 
@@ -766,7 +842,7 @@ What changes versus Ollama routing:
 - **No daemon interaction.** There is no host probing, no `/api/tags` resolution, no `/api/show` capability detection, no VRAM eviction and no `tune` registry — the model table above supplies the context window and capabilities instead.
 - **The credential rule is inverted, deliberately.** `api.abliteration.ai` is the provider you selected, so the real key is forwarded rather than scrubbed. The scrub still applies to every Ollama host. The key is read from the environment only (`ABLITERATION_API_KEY`, or `ABLIT_KEY` as abliteration.ai's own opencode docs spell it): kimo never writes it to a config file and never passes it in argv, and `--dry-run` masks it.
 - **`claude`** gets `ANTHROPIC_BASE_URL` plus bearer auth via `ANTHROPIC_AUTH_TOKEN`, with `ANTHROPIC_API_KEY` left unset so exactly one credential rides the request and Claude Code does not prompt about a "custom API key". The model id carries the `[1m]` suffix where the window is 1M — Claude Code assumes 200K for an unrecognized third-party id otherwise, and strips the suffix before the request. `CLAUDE_CODE_MAX_CONTEXT_TOKENS` and the `ANTHROPIC_DEFAULT_{OPUS,SONNET,HAIKU}_MODEL` tiers all point at the same model, so background and summarization calls cannot fall back to real Anthropic ids this key cannot serve.
-- **`kimi`** uses the zero-footprint `KIMI_MODEL_*` env channel rather than the config-alias path used for Ollama, because an alias would have to store a third-party API key in plaintext in `~/.kimi-code/config.toml`. Nothing is written to kimi's config. Capabilities come from the model table (`image_in` only for `base`), the reasoning key is `reasoning_content` (the field abliteration.ai returns on `/v1/chat/completions`), and a thinking effort above the model's ceiling is capped with a warning.
+- **`kimi`** first validates the key against the API's `GET /v1/models`. When validation passes, kimo registers a named `[providers.abliteration]` in `~/.kimi-code/config.toml` — storing only the *name* of the key's env var (`api_key_env = "ABLITERATION_API_KEY"`, never the key itself) — plus one `abliteration/<id>` alias for every model the API serves, and launches on `-m abliteration/<model>`. kimi's provider picker then shows **abliteration** with its live catalogue instead of the synthesized `__kimi_env__`, and the config alias unlocks the graded `/effort` picker. A rejected key (401/403) aborts the launch with an actionable error. If validation cannot complete (offline, upstream error, missing `tomlkit`), kimi falls back to the zero-footprint `KIMI_MODEL_*` env channel — which kimi displays as `__kimi_env__` — and nothing is written to its config. Capabilities come from the model table for known ids (`image_in` only for `base`; remote-only models default to `tool_use,thinking`), the reasoning key is `reasoning_content` (the field abliteration.ai returns on `/v1/chat/completions`), and a thinking effort above the model's ceiling is capped with a warning.
 
 `--ctx` still works and is capped at the selected model's window. `--dry-run` reports the provider, the resolved window and capabilities alongside the usual argv and masked env.
 

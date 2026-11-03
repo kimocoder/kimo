@@ -2,22 +2,28 @@
 # Headless smoke tests for kimo's GitHub CLI ('gh') integration.
 #
 # Asserts the contract for 'gh' in kimo across launch, install, update, doctor, and completions:
-#   * Launch rejection contract: 'kimo launch gh' rejects execution because gh is a
-#     management-only CLI rather than an LLM model runner.
+#   * Launch contract: 'kimo launch gh' execs 'gh copilot -- <args>' with GitHub
+#     Copilot CLI's BYOK env pointed at <host>/v1 (COPILOT_PROVIDER_BASE_URL,
+#     COPILOT_MODEL, COPILOT_PROVIDER_TYPE=openai), --ctx as
+#     COPILOT_PROVIDER_MAX_PROMPT_TOKENS, COPILOT_OFFLINE defaulting to true,
+#     provider keys scrubbed for non-local hosts, --dry-run, and hosted
+#     --provider rejection. 'kimo run gh' still rejects gh as a model name.
 #   * Install status contract:
 #       - 'kimo install gh' reports existing binary when already installed.
-#       - 'kimo install --force gh' refuses to replace/shadow an external system binary without --allow-system-path.
+#       - 'kimo install --force gh' refuses to replace/shadow an external system binary.
+#       - 'kimo update gh' and 'kimo update all' update an owned standalone gh in place.
 #   * Update flag contract:
 #       - rejects combining --check and --apply
 #       - restricts --allow-system-path strictly to named 'update gh' (not batch 'update all')
 #       - validates update --help documentation and eligible check behavior
 #   * Inventory & Doctor contract:
-#       - 'kimo install list' includes 'gh' row marked with 'n/a' default model
+#       - 'kimo install list' includes 'gh' row with its default launch model
 #       - 'kimo doctor' detects 'gh' and formats its version and binary location
-#   * Shell completion contract: bash & zsh completions expose 'gh' across install and update.
+#   * Shell completion contract: bash & zsh completions expose 'gh' across launch, install and update.
 #
 # Optional live layer (--live): if a real 'gh' binary is installed on the host, runs
-# a real version verification check.
+# a real version verification check, plus a 'gh copilot' turn against a
+# reachable Ollama host when the Copilot CLI is available.
 #
 # Usage: tests/gh-smoke.sh [--live]
 
@@ -34,14 +40,85 @@ TMPDIR_GH="$(mktemp -d)"
 
 echo "=== Kimo GitHub CLI ('gh') Smoke Tests ==="
 
-# 1. Launch rejection contract
-echo "[1] Launch rejection contract (gh is management-only)"
-LAUNCH_OUT="$("${KIMO}" launch gh --model kalidroid-27b:latest 2>&1 || true)"
-LAUNCH_RC=0
-"${KIMO}" launch gh --model kalidroid-27b:latest >/dev/null 2>&1 || LAUNCH_RC=$?
+# 1. Launch contract: 'launch gh' runs GitHub Copilot CLI in BYOK mode
+echo "[1] Launch contract (gh copilot routed to Ollama)"
+LAUNCH_BIN="${TMPDIR_GH}/launch_bin"
+LAUNCH_HOME="${TMPDIR_GH}/launch_home"
+mkdir -p "${LAUNCH_BIN}" "${LAUNCH_HOME}"
+CAPTURE="${TMPDIR_GH}/launch_call.txt"
+export GH_SMOKE_OUT="${CAPTURE}"
+cat > "${LAUNCH_BIN}/gh" <<'FAKE'
+#!/usr/bin/env bash
+out="${GH_SMOKE_OUT:?GH_SMOKE_OUT unset}"
+{
+    printf 'ARGV\n'
+    printf '%s\n' "$@"
+    printf 'ENV\n'
+    for v in COPILOT_PROVIDER_BASE_URL COPILOT_PROVIDER_TYPE COPILOT_MODEL \
+        COPILOT_PROVIDER_MAX_PROMPT_TOKENS COPILOT_OFFLINE COPILOT_PROVIDER_WIRE_MODEL \
+        COPILOT_PROVIDER_API_KEY COPILOT_PROVIDER_BEARER_TOKEN; do
+        printf '%s=%s\n' "${v}" "${!v-<unset>}"
+    done
+} > "${out}"
+exit 0
+FAKE
+chmod +x "${LAUNCH_BIN}/gh"
 
-check "launch gh exits with status 1" "1" "${LAUNCH_RC}"
-check_contains "launch gh error message" "Error: GitHub CLI is management-only; run gh directly, not through Ollama launch." "${LAUNCH_OUT}"
+# Unassigned port 9 so no real Ollama is contacted or unloaded. PATH puts the
+# fake first; /usr/local/bin stays last because kimo prepends it only when
+# absent, and a real gh there must not shadow the fake.
+LOCAL_HOST="http://127.0.0.1:9"
+REMOTE_HOST="http://192.168.1.131:9"
+run_launch() { # [env assignments...] -- <kimo args...>
+    local -a envs=()
+    while [[ $# -gt 0 && "$1" != -- ]]; do envs+=("$1"); shift; done
+    shift
+    rm -f "${CAPTURE}"
+    env HOME="${LAUNCH_HOME}" PATH="${LAUNCH_BIN}:/usr/bin:/bin:/usr/local/bin" "${envs[@]}" \
+        "${KIMO}" "$@" >/dev/null 2>&1 || true
+}
+argv_lines() { sed -n '/^ARGV$/,/^ENV$/p' "${CAPTURE}" | sed '1d;$d' | paste -sd' ' -; }
+
+run_launch -- --host "${LOCAL_HOST}" launch gh --model kalidroid-27b:latest -p "hi there" --allow-tool 'shell(git)'
+if [[ ! -f "${CAPTURE}" ]]; then
+    bad "fake gh was never exec'd (no capture); cannot assert"
+else
+    check "argv is 'copilot --' plus passthrough" "copilot -- -p hi there --allow-tool shell(git)" "$(argv_lines)"
+    check "COPILOT_PROVIDER_BASE_URL is host/v1" "${LOCAL_HOST}/v1" "$(env_val "${CAPTURE}" COPILOT_PROVIDER_BASE_URL)"
+    check "COPILOT_PROVIDER_TYPE is openai" "openai" "$(env_val "${CAPTURE}" COPILOT_PROVIDER_TYPE)"
+    check "COPILOT_MODEL is resolved model" "kalidroid-27b:latest" "$(env_val "${CAPTURE}" COPILOT_MODEL)"
+    check "COPILOT_OFFLINE defaults to true" "true" "$(env_val "${CAPTURE}" COPILOT_OFFLINE)"
+    check "no prompt cap without --ctx" "<unset>" "$(env_val "${CAPTURE}" COPILOT_PROVIDER_MAX_PROMPT_TOKENS)"
+fi
+
+run_launch COPILOT_OFFLINE=false COPILOT_PROVIDER_WIRE_MODEL=stale -- --host "${LOCAL_HOST}" launch gh --model kalidroid-27b:latest --ctx 65536
+check "--ctx becomes COPILOT_PROVIDER_MAX_PROMPT_TOKENS" "65536" "$(env_val "${CAPTURE}" COPILOT_PROVIDER_MAX_PROMPT_TOKENS)"
+check "user COPILOT_OFFLINE is honoured" "false" "$(env_val "${CAPTURE}" COPILOT_OFFLINE)"
+check "stale COPILOT_PROVIDER_WIRE_MODEL is dropped" "<unset>" "$(env_val "${CAPTURE}" COPILOT_PROVIDER_WIRE_MODEL)"
+check "no args still separates gh flags with --" "copilot --" "$(argv_lines)"
+
+run_launch COPILOT_PROVIDER_API_KEY=sk-local COPILOT_PROVIDER_BEARER_TOKEN=bt-local -- --host "${LOCAL_HOST}" launch gh --model kalidroid-27b:latest
+check "provider key kept for plain local host" "sk-local" "$(env_val "${CAPTURE}" COPILOT_PROVIDER_API_KEY)"
+check "bearer token kept for plain local host" "bt-local" "$(env_val "${CAPTURE}" COPILOT_PROVIDER_BEARER_TOKEN)"
+
+run_launch OLLAMA_REMOTE_URL="${REMOTE_HOST}" COPILOT_PROVIDER_API_KEY=sk-secret COPILOT_PROVIDER_BEARER_TOKEN=bt-secret -- --remote launch gh --model kalidroid-27b:latest
+check "COPILOT_PROVIDER_BASE_URL follows remote host" "${REMOTE_HOST}/v1" "$(env_val "${CAPTURE}" COPILOT_PROVIDER_BASE_URL)"
+check "provider key scrubbed for remote host" "<unset>" "$(env_val "${CAPTURE}" COPILOT_PROVIDER_API_KEY)"
+check "bearer token scrubbed for remote host" "<unset>" "$(env_val "${CAPTURE}" COPILOT_PROVIDER_BEARER_TOKEN)"
+
+rm -f "${CAPTURE}"
+DRY_OUT="$(env HOME="${LAUNCH_HOME}" PATH="${LAUNCH_BIN}:/usr/bin:/bin:/usr/local/bin" COPILOT_PROVIDER_API_KEY=sk-secret \
+    "${KIMO}" --host "${LOCAL_HOST}" launch gh --model kalidroid-27b:latest --dry-run -- -p hi 2>&1 || true)"
+check_contains "dry-run shows gh copilot argv" "argv   : gh copilot -- -p hi" "${DRY_OUT}"
+check_contains "dry-run shows COPILOT_PROVIDER_BASE_URL" "COPILOT_PROVIDER_BASE_URL=${LOCAL_HOST}/v1" "${DRY_OUT}"
+check_contains "dry-run masks provider key" "COPILOT_PROVIDER_API_KEY <kept: real value, plain local host>" "${DRY_OUT}"
+check_not_contains "dry-run never prints the key" "sk-secret" "${DRY_OUT}"
+[[ ! -f "${CAPTURE}" ]] && ok "dry-run does not exec gh" || bad "dry-run exec'd gh"
+
+HOSTED_RC=0
+HOSTED_OUT="$(ABLITERATION_API_KEY=ak_test "${KIMO}" launch gh --provider abliteration 2>&1)" || HOSTED_RC=$?
+check "launch gh --provider abliteration exits 1" "1" "${HOSTED_RC}"
+check_contains "hosted provider names gh as unsupported" "'gh' has no abliteration launch branch" "${HOSTED_OUT}"
 
 # 2. Update flag contract
 echo "[2] Update flag validation and error guards"
@@ -58,6 +135,78 @@ UPDATE_CHECK_APPLY_RC=0
 
 check "update gh --check --apply exits with status 1" "1" "${UPDATE_CHECK_APPLY_RC}"
 check_contains "cannot combine --check and --apply" "Error: --check and --apply cannot be combined." "${UPDATE_CHECK_APPLY_OUT}"
+
+# Named 'update gh' is the opt-in for a standalone gh outside ~/.local/bin: it
+# must get past the shadowing guard to the download (fake curl fails it there)
+# and leave the existing binary untouched.
+STANDALONE_DIR="${TMPDIR_GH}/standalone_bin"
+STANDALONE_HOME="${TMPDIR_GH}/standalone_home"
+mkdir -p "${STANDALONE_DIR}" "${STANDALONE_HOME}"
+printf '#!/usr/bin/env bash\necho "gh version 2.99.0 (2026-01-01)"\n' > "${STANDALONE_DIR}/gh"
+cat > "${STANDALONE_DIR}/curl" <<'FAKE'
+#!/usr/bin/env bash
+[[ " $* " == *" https://api.github.com/repos/cli/cli/releases/latest "* ]] || exit 22
+echo '{"tag_name":"v2.100.0"}'
+FAKE
+chmod +x "${STANDALONE_DIR}/gh" "${STANDALONE_DIR}/curl"
+STANDALONE_SUM="$(sha256sum "${STANDALONE_DIR}/gh")"
+STANDALONE_RC=0
+STANDALONE_OUT="$(HOME="${STANDALONE_HOME}" PATH="${STANDALONE_DIR}:/usr/bin:/bin" "${KIMO}" update gh 2>&1)" || STANDALONE_RC=$?
+check_not_contains "named update gh does not refuse a standalone gh" "refusing to replace or shadow" "${STANDALONE_OUT}"
+check_contains "named update gh reaches the release download" "Error: GitHub CLI download failed." "${STANDALONE_OUT}"
+check "named update gh exits 1 when the download fails" "1" "${STANDALONE_RC}"
+check "failed update leaves the standalone gh untouched" "${STANDALONE_SUM}" "$(sha256sum "${STANDALONE_DIR}/gh")"
+
+# Successful in-place update from a fake release: the new binary is installed,
+# and the backup and staging dir are removed once the new version verifies.
+if [[ "$(uname -s)" == Linux ]]; then
+    case "$(uname -m)" in
+        x86_64|amd64) GH_ARCH=amd64 ;; aarch64|arm64) GH_ARCH=arm64 ;;
+        i386|i686) GH_ARCH=386 ;; *) GH_ARCH=armv6 ;;
+    esac
+    RELEASE_DIR="${TMPDIR_GH}/release"
+    UPGRADE_DIR="${TMPDIR_GH}/upgrade_bin"
+    GH_ASSET="gh_2.100.0_linux_${GH_ARCH}.tar.gz"
+    mkdir -p "${RELEASE_DIR}/gh_2.100.0_linux_${GH_ARCH}/bin" "${UPGRADE_DIR}"
+    printf '#!/usr/bin/env bash\necho "gh version 2.100.0 (2026-02-01)"\n' > "${RELEASE_DIR}/gh_2.100.0_linux_${GH_ARCH}/bin/gh"
+    chmod +x "${RELEASE_DIR}/gh_2.100.0_linux_${GH_ARCH}/bin/gh"
+    tar -czf "${RELEASE_DIR}/${GH_ASSET}" -C "${RELEASE_DIR}" "gh_2.100.0_linux_${GH_ARCH}"
+    (cd "${RELEASE_DIR}" && sha256sum "${GH_ASSET}" > checksums)
+    cp "${STANDALONE_DIR}/gh" "${UPGRADE_DIR}/gh"
+    cat > "${UPGRADE_DIR}/curl" <<'FAKE'
+#!/usr/bin/env bash
+url="" out=""
+while [[ $# -gt 0 ]]; do
+    case "$1" in -o) out="$2"; shift ;; https://*) url="$1" ;; esac
+    shift
+done
+case "${url}" in
+    https://api.github.com/repos/cli/cli/releases/latest) echo '{"tag_name":"v2.100.0"}' ;;
+    */gh_2.100.0_checksums.txt) cp "${GH_FAKE_RELEASE}/checksums" "${out}" ;;
+    */gh_2.100.0_linux_*.tar.gz) cp "${GH_FAKE_RELEASE}/${url##*/}" "${out}" ;;
+    *) exit 22 ;;
+esac
+FAKE
+    chmod +x "${UPGRADE_DIR}/curl"
+    UPGRADE_RC=0
+    UPGRADE_OUT="$(HOME="${STANDALONE_HOME}" PATH="${UPGRADE_DIR}:/usr/bin:/bin" GH_FAKE_RELEASE="${RELEASE_DIR}" \
+        "${KIMO}" update gh 2>&1)" || UPGRADE_RC=$?
+    check "named update gh succeeds from a valid release" "0" "${UPGRADE_RC}"
+    check_contains "update reports the installed version" "Installed GitHub CLI 2.100.0 at ${UPGRADE_DIR}/gh." "${UPGRADE_OUT}"
+    check "standalone gh now runs the new release" "gh version 2.100.0 (2026-02-01)" "$("${UPGRADE_DIR}/gh" --version)"
+    check "verified update leaves no backup or staging dir" "" "$(find "${UPGRADE_DIR}" -name '.gh-*')"
+
+    # 'update all' updates the standalone gh too. KIMO_ENFORCE_PATH=0 keeps
+    # /usr/local/bin and ~/ tool dirs off PATH, and the fake curl/npm fail every
+    # other lookup, so no real CLI on the host is ever updated.
+    cp "${STANDALONE_DIR}/gh" "${UPGRADE_DIR}/gh"
+    printf '#!/usr/bin/env bash\nexit 1\n' > "${UPGRADE_DIR}/npm"
+    chmod +x "${UPGRADE_DIR}/npm"
+    BATCH_OUT="$(HOME="${STANDALONE_HOME}" PATH="${UPGRADE_DIR}:/usr/bin:/bin" GH_FAKE_RELEASE="${RELEASE_DIR}" \
+        KIMO_ENFORCE_PATH=0 "${KIMO}" update all 2>&1 || true)"
+    check_contains "update all updates a standalone gh" "Installed GitHub CLI 2.100.0 at ${UPGRADE_DIR}/gh." "${BATCH_OUT}"
+    check "update all leaves the new gh release in place" "gh version 2.100.0 (2026-02-01)" "$("${UPGRADE_DIR}/gh" --version)"
+fi
 
 UPDATE_HELP="$("${KIMO}" update --help)"
 check_contains "update help documents --allow-system-path" "--allow-system-path" "${UPDATE_HELP}"
@@ -99,7 +248,7 @@ check_contains "refusing to replace or shadow message" "Error: refusing to repla
 echo "[4] Inventory table and Doctor diagnostics"
 INSTALL_LIST="$("${KIMO}" install list)"
 check_match "install list contains gh entry" "gh[[:space:]]+(● INSTALLED|○ MISSING)" "${INSTALL_LIST}"
-check_match "install list marks gh default model as n/a" "gh[[:space:]]+.*n/a" "${INSTALL_LIST}"
+check_match "install list shows gh default launch model" "gh[[:space:]]+.*kalidroid-27b:latest" "${INSTALL_LIST}"
 
 DOCTOR_OUT="$("${KIMO}" doctor)"
 check_match "doctor includes gh in External LLM CLI Hub Inventory" "\[(✓|·)\] gh[[:space:]]+:" "${DOCTOR_OUT}"
@@ -107,14 +256,16 @@ check_match "doctor includes gh in External LLM CLI Hub Inventory" "\[(✓|·)\]
 # 5. Shell completions
 echo "[5] Shell completions (bash & zsh)"
 BASH_COMP="$("${KIMO}" completion bash)"
-check_contains "bash completion allows gh in install target" 'gh all list' "${BASH_COMP}"
-check_contains "bash completion allows gh in update target" 'gh all' "${BASH_COMP}"
+check_match "bash completion lists gh among supported CLIs" 'supported_clis="[^"]* gh"' "${BASH_COMP}"
+check_contains "bash completion offers supported CLIs for install" '${supported_clis} all list' "${BASH_COMP}"
+check_contains "bash completion offers supported CLIs for update" '${supported_clis} all"' "${BASH_COMP}"
 check_contains "bash completion includes --allow-system-path" '--allow-system-path' "${BASH_COMP}"
 
 ZSH_COMP="$("${KIMO}" completion zsh)"
 check_contains "zsh completion includes gh in install args" 'gh all list' "${ZSH_COMP}"
 check_contains "zsh completion includes gh in update args" 'gh all' "${ZSH_COMP}"
 check_contains "zsh completion includes --allow-system-path" '--allow-system-path' "${ZSH_COMP}"
+check_contains "zsh completion includes gh in launch args" "openclaw hermes gh)' \\" "${ZSH_COMP}"
 
 echo
 echo "mocked smoke: ${pass} passed, ${fail} failed"
