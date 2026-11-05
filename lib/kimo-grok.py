@@ -3,11 +3,14 @@
 
 import base64
 import datetime
+import fcntl
+import hashlib
 import json
 import math
 import os
 from pathlib import Path
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.parse
@@ -15,6 +18,9 @@ import urllib.request
 
 EXPIRY_SKEW_SECONDS = 60
 BACKUP_KEEP = 5
+# Public OIDC token endpoint discovered from https://auth.x.ai/.well-known/openid-configuration.
+# A grok-login session refreshes here with the refresh_token stored in auth.json.
+GROK_TOKEN_URL = "https://auth.x.ai/oauth2/token"  # nosec B105 - an endpoint, not a secret
 
 GROK_MODELS = [
     ("grok-4.7", "Grok 4.7", 500000, 65536, True),
@@ -97,45 +103,207 @@ def token_expiry(expiry_val_or_token) -> float | None:
     return None
 
 
+def session_fresh(token: str) -> bool | None:
+    """True when a JWT is still usable, False when it is expired, None otherwise.
+
+    A token with no exp claim is treated as usable. cli-chat-proxy rejects an
+    expired one with 401 reason=no auth context even when X-XAI-Token-Auth is set.
+    """
+    if not token.startswith("eyJ"):
+        return None
+    exp = token_expiry(token)
+    if exp is None:
+        return True
+    return exp > time.time() + EXPIRY_SKEW_SECONDS
+
+
 def token_state(home: Path) -> None:
-    """Print '<state> <source> <refreshable>'."""
+    """Print '<state> <source> <refreshable>'.
+
+    An expired JWT exported in the environment must not hide a still-valid
+    session in auth.json. That stale bearer is what cli-chat-proxy reports as
+    auth_kind=bearer, x_xai_token_auth=xai-grok-cli, reason=no auth context.
+    """
     _doc, entry = auth_credentials(home)
-    refresh_token = entry.get("refresh_token")
-    refreshable = "yes" if refresh_token else "no"
-
-    env_token = os.environ.get("XAI_AUTH_TOKEN") or ""
+    refreshable = "yes" if entry.get("refresh_token") else "no"
+    env_auth = os.environ.get("XAI_AUTH_TOKEN") or ""
     env_key = os.environ.get("XAI_API_KEY") or ""
+    if env_key == "ollama":
+        env_key = ""
     file_token = str(entry.get("key") or "")
+    if not file_token.startswith("eyJ"):
+        file_token = ""
 
-    if env_token:
-        exp = token_expiry(entry.get("expires_at") or file_token) if file_token == env_token else token_expiry(env_token)
-        if exp is None or exp > time.time() + EXPIRY_SKEW_SECONDS:
+    for token in (env_auth, env_key):
+        if session_fresh(token) is True:
             print(f"valid env {refreshable}")
             return
+    # A real xai- key is a different credential from the grok-login session.
+    if env_key and not env_key.startswith("eyJ"):
+        print(f"apikey env {refreshable}")
+        return
+    if session_fresh(file_token) is True:
+        print(f"valid file {refreshable}")
+        return
+    if session_fresh(env_auth) is False or session_fresh(env_key) is False:
         print(f"expired env {refreshable}")
         return
-
-    if env_key:
-        if env_key.startswith("eyJ"):
-            exp = token_expiry(env_key)
-            if exp is None or exp > time.time() + EXPIRY_SKEW_SECONDS:
-                print(f"valid env {refreshable}")
-                return
-            print(f"expired env {refreshable}")
-            return
-        elif env_key != "ollama":
-            print(f"apikey env {refreshable}")
-            return
-
     if file_token:
-        exp = token_expiry(entry.get("expires_at") or file_token)
-        if exp is None or exp > time.time() + EXPIRY_SKEW_SECONDS:
-            print(f"valid file {refreshable}")
-            return
         print(f"expired file {refreshable}")
         return
-
     print(f"missing none {refreshable}")
+
+
+def _active_entry(doc: dict) -> tuple[str, dict]:
+    for key, value in doc.items():
+        if isinstance(value, dict) and "key" in value:
+            return key, value
+    return "", {}
+
+
+def oidc_client_id(entry_key: str, entry: dict, token: str) -> str:
+    client = entry.get("oidc_client_id")
+    if isinstance(client, str) and client:
+        return client
+    if "::" in entry_key:
+        tail = entry_key.split("::", 1)[1]
+        if tail:
+            return tail
+    audience = claims(token).get("aud")
+    if isinstance(audience, str) and audience:
+        return audience
+    if isinstance(audience, list) and audience and isinstance(audience[0], str):
+        return audience[0]
+    return ""
+
+
+def write_auth(home: Path, doc: dict) -> None:
+    """Atomically replace auth.json, owner-only.
+
+    No backup: the document holds a live refresh token. Unknown keys are kept
+    because the parsed document is updated, not rebuilt.
+    """
+    path = auth_file(home)
+    if path.is_symlink():
+        raise ValueError(f"Refusing to replace a symlinked {path}.")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp = tempfile.mkstemp(prefix=path.name + ".", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            json.dump(doc, stream, indent=2)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.chmod(temp, 0o600)
+        os.replace(temp, path)
+    finally:
+        if os.path.exists(temp):
+            os.unlink(temp)
+
+
+def _token_url_allowed(url: str) -> bool:
+    parts = urllib.parse.urlsplit(url)
+    if parts.scheme == "https":
+        return True
+    return parts.scheme == "http" and parts.hostname in ("127.0.0.1", "::1", "localhost")
+
+
+def refresh(home: Path) -> None:
+    """Renew the grok-login access token from auth.json's refresh_token.
+
+    Refresh tokens rotate. Renewals are serialized so two launches do not
+    present the same grant.
+    """
+    gdir = grok_dir(home)
+    gdir.mkdir(parents=True, exist_ok=True)
+    timeout = float(os.environ.get("KIMO_GROK_REFRESH_TIMEOUT") or 30)
+    runtime = os.environ.get("KIMO_RUNTIME_DIR") or ""
+    key = hashlib.sha256(str(gdir.resolve()).encode()).hexdigest()[:16]
+    lock_path = (Path(runtime) if os.path.isdir(runtime) else gdir) / f".grok-auth-{key}.lock"
+    fd = os.open(lock_path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, "r+") as lock:
+        deadline = time.monotonic() + timeout + 5
+        while True:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() > deadline:
+                    raise ValueError("Another kimo process is renewing the xAI Grok token; retry.") from None
+                time.sleep(0.1)
+        _doc, entry = auth_credentials(home)
+        current = str(entry.get("key") or "")
+        if session_fresh(current) is True:
+            print(f"  [✓] The xAI Grok token in {auth_file(home)} was already renewed.", file=sys.stderr)
+            return
+        _refresh_locked(home, timeout)
+
+
+def _refresh_locked(home: Path, timeout: float) -> None:
+    doc = read_json(auth_file(home))
+    entry_key, entry = _active_entry(doc)
+    if not entry_key:
+        raise ValueError(f"No session in {auth_file(home)}; sign in with 'grok login'.")
+    refresh_token = entry.get("refresh_token")
+    if not isinstance(refresh_token, str) or not refresh_token:
+        raise ValueError(f"No refresh_token in {auth_file(home)}; sign in again with 'grok login'.")
+    current = str(entry.get("key") or "")
+    client = oidc_client_id(entry_key, entry, current)
+    if not client:
+        raise ValueError(f"No OIDC client id in {auth_file(home)}; sign in again with 'grok login'.")
+    url = os.environ.get("KIMO_GROK_TOKEN_URL") or GROK_TOKEN_URL
+    if not _token_url_allowed(url):
+        raise ValueError(f"Refusing to send the refresh token to {url!r}: use an https:// URL.")
+    body = urllib.parse.urlencode({
+        "grant_type": "refresh_token",
+        "refresh_token": refresh_token,
+        "client_id": client,
+    }).encode("utf-8")
+    request = urllib.request.Request(
+        url, data=body, method="POST",
+        headers={"Content-Type": "application/x-www-form-urlencoded", "Accept": "application/json"})
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:  # nosec B310 - scheme checked above
+            payload = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as error:
+        try:
+            error.read()
+        except OSError:
+            pass
+        # The response body is not surfaced: it can echo the grant it rejected.
+        raise ValueError(
+            f"xAI OIDC refresh was refused (HTTP {error.code}). Sign in again with 'grok login'.") from None
+    except (urllib.error.URLError, TimeoutError, OSError, ValueError) as error:
+        raise ValueError(f"xAI OIDC refresh failed: {error}") from None
+    if not isinstance(payload, dict):
+        raise ValueError("xAI OIDC refresh returned a malformed response.")
+    access = payload.get("access_token")
+    if not isinstance(access, str) or not access:
+        raise ValueError("xAI OIDC refresh returned no access_token.")
+    entry["key"] = access
+    rotated = payload.get("refresh_token")
+    if isinstance(rotated, str) and rotated:
+        entry["refresh_token"] = rotated
+    exp = token_expiry(access)
+    if exp is None:
+        expires_in = payload.get("expires_in")
+        if isinstance(expires_in, (int, float)) and not isinstance(expires_in, bool) and math.isfinite(expires_in):
+            exp = time.time() + float(expires_in)
+    if exp is not None:
+        try:
+            entry["expires_at"] = datetime.datetime.fromtimestamp(
+                exp, datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        except (ValueError, OverflowError, OSError):
+            pass
+    doc[entry_key] = entry
+    write_auth(home, doc)
+    until = ""
+    if exp is not None:
+        try:
+            until = f" (expires {datetime.datetime.fromtimestamp(exp, datetime.timezone.utc).isoformat(timespec='seconds')})"
+        except (ValueError, OverflowError, OSError):
+            until = ""
+    print(f"  [✓] Refreshed the xAI Grok token in {auth_file(home)}{until}", file=sys.stderr)
 
 
 def read_config(path: Path):
@@ -249,14 +417,23 @@ def status(home: Path, config: Path, as_json: bool) -> None:
 
 
 def get_working_token(home: Path) -> str:
+    """Prefer a still-valid session over an expired JWT left in the environment."""
     _doc, entry = auth_credentials(home)
     file_token = str(entry.get("key") or "")
-    return (
-        os.environ.get("XAI_AUTH_TOKEN")
-        or (file_token if file_token.startswith("eyJ") else "")
-        or os.environ.get("XAI_API_KEY", "")
-        or file_token
-    )
+    if not file_token.startswith("eyJ"):
+        file_token = ""
+    env_auth = os.environ.get("XAI_AUTH_TOKEN") or ""
+    env_key = os.environ.get("XAI_API_KEY") or ""
+    if env_key == "ollama":
+        env_key = ""
+    for token in (env_auth, env_key):
+        if session_fresh(token) is True:
+            return token
+    if env_key and not env_key.startswith("eyJ"):
+        return env_key
+    if session_fresh(file_token) is True:
+        return file_token
+    return env_auth or file_token or env_key
 
 
 def fetch_live_models(token: str, timeout: float = 6) -> list[tuple[str, str, int, int, bool]]:
@@ -369,6 +546,8 @@ def main():
         status(home, config, as_json)
     elif action == "token-state":
         token_state(home)
+    elif action == "refresh":
+        refresh(home)
     elif action == "token":
         tok = get_working_token(home)
         if not tok or tok == "ollama":

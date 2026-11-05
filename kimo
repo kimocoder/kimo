@@ -350,8 +350,15 @@ ABLITERATION_CLIS="claude kimi"
 # backend answers a platform key with 401 "API keys are not supported".
 CODEX_BACKEND_URL="${KIMO_CODEX_BACKEND_URL:-https://chatgpt.com/backend-api/codex}"
 OPENAI_BACKEND_URL="${KIMO_OPENAI_BACKEND_URL:-https://api.openai.com}"
+# Context window Claude Code is told about when --ctx is omitted. The Codex
+# catalog window is not on the Anthropic wire. --ctx, KIMO_OPENAI_CTX and
+# KIMO_CODEX_CTX override these.
+OPENAI_CLAUDE_CTX="${KIMO_OPENAI_CTX:-272000}"
+CODEX_CLAUDE_CTX="${KIMO_CODEX_CTX:-272000}"
 # CLIs whose launch branch knows how to reach either OpenAI backend.
-OPENAI_CLIS="codex kimi"
+# claude speaks Anthropic /v1/messages, so it rides the localhost messages
+# proxy (Responses upstream) instead of Codex's native -c overlays.
+OPENAI_CLIS="codex kimi claude"
 
 # Alibaba Model Studio's international OpenAI-compatible surface, selected
 # with 'launch --provider dashscope' and billed pay-as-you-go. The credential
@@ -424,7 +431,8 @@ GEMINI_CODEX_CTX="${KIMO_GEMINI_CTX:-1000000}"
 VLLM_BASE_URL_DEFAULT="http://127.0.0.1:8000/v1"
 VLLM_DEFAULT_CTX="${KIMO_VLLM_CTX:-32768}"
 # CLIs whose launch branch knows how to reach a vLLM server.
-VLLM_CLIS="kimi"
+# claude rides the localhost messages proxy on the server's chat wire.
+VLLM_CLIS="kimi claude"
 
 # True when <url> can be embedded in a Codex -c TOML string: https, no query,
 # no spaces, no quotes.
@@ -511,6 +519,52 @@ _kimo_responses_proxy_start() {
     [[ -n "${provider}" ]] && proxy_cmd+=(--provider "${provider}")
     [[ -n "${model}" ]] && proxy_cmd+=(--model "${model}")
     "${proxy_cmd[@]}" >/dev/null 2>&1 &
+    waited=0
+    while (( waited < 50 )); do
+        if [[ -s "${port_file}" ]]; then
+            port=$(tr -cd '0-9' <"${port_file}")
+            rm -f "${port_file}"
+            if [[ -n "${port}" ]]; then
+                printf '%s\n' "${port}"
+                return 0
+            fi
+            return 1
+        fi
+        sleep 0.1
+        waited=$((waited + 1))
+    done
+    rm -f "${port_file}"
+    return 1
+}
+
+# Start the Anthropic Messages proxy and print its port. Claude Code posts
+# {base}/v1/messages; the proxy translates that into Chat Completions or the
+# Responses API at <upstream>. The upstream credential stays in <env-key>.
+# Claude is given a per-launch client token instead, so a random local
+# process cannot spend the upstream key. The proxy exits when this process's
+# pid disappears, which remains true after exec replaces the shell with Claude.
+_kimo_anthropic_proxy_start() {
+    local upstream="$1" wire="$2" env_key="$3" client_token="$4" provider="${5:-}"
+    local helper port_file port waited
+    if [[ "${wire}" != chat && "${wire}" != responses ]]; then
+        echo "${C_RED}Error: internal: claude proxy wire must be chat or responses.${C_RESET}" >&2
+        return 1
+    fi
+    if ! helper=$(_find_lib_helper kimo-anthropic-proxy.py "${KIMO_ANTHROPIC_PROXY:-}"); then
+        echo "${C_RED}Error: kimo-anthropic-proxy.py was not found next to kimo.${C_RESET}" >&2
+        return 1
+    fi
+    port_file=$(mktemp "${TMPDIR:-/tmp}/kimo-anthropic-port.XXXXXX")
+    local -a proxy_cmd=(
+        python3 "${helper}"
+        --upstream "${upstream}"
+        --wire "${wire}"
+        --port-file "${port_file}"
+        --exit-with-pid "$$"
+        --provider "${provider}"
+    )
+    [[ -n "${env_key}" ]] && proxy_cmd+=(--env-key "${env_key}")
+    KIMO_ANTHROPIC_PROXY_CLIENT="${client_token}" "${proxy_cmd[@]}" >/dev/null 2>&1 &
     waited=0
     while (( waited < 50 )); do
         if [[ -s "${port_file}" ]]; then
@@ -1386,6 +1440,70 @@ abliteration_claude_model() {
     fi
 }
 
+# Claude Code assumes a 200K window for an id it does not recognize. A trailing
+# [1m] is stripped before the request, so the upstream still sees the bare id.
+# Windows under 1M rely on CLAUDE_CODE_MAX_CONTEXT_TOKENS instead.
+claude_window_model() {
+    local id="$1" ctx="$2"
+    if [[ "${id}" == *'['*']' ]]; then
+        printf '%s\n' "${id}"
+        return 0
+    fi
+    if [[ "${ctx}" =~ ^[0-9]+$ ]] && (( ctx >= 1000000 )); then
+        printf '%s[1m]\n' "${id}"
+        return 0
+    fi
+    printf '%s\n' "${id}"
+}
+
+# Model id Claude should send for an OpenAI catalog backend. An explicit
+# --model is stripped of the codex/ and openai/ alias prefixes. Otherwise the
+# first listed catalog model is used; an Ollama preset is not a wire id.
+# Prints the bare slug. Args: <codex|openai> <true|false explicit> <want> <preset>
+_claude_take_catalog_model() {
+    local backend="$1" explicit="$2" want="$3" preset="$4" slug=""
+    if [[ "${explicit}" == true && -n "${want}" && "${want}" != claude \
+        && "${want}" != openai && "${want}" != codex && "${want}" != "${preset}" ]]; then
+        slug="${want}"
+    elif ! slug=$(_codex_helper default-model "${backend}" 2>/dev/null); then
+        echo "${C_RED}Error: '--provider ${backend}' needs a model for claude, and no Codex catalog is cached.${C_RESET}" >&2
+        echo "${C_DIM}    Pass --model <id>, or start Codex once so ${CODEX_HOME}/models_cache.json exists.${C_RESET}" >&2
+        return 1
+    fi
+    slug=$(_codex_wire_model "${slug}")
+    if [[ -z "${slug}" ]]; then
+        echo "${C_RED}Error: '--provider ${backend}' resolved an empty model id.${C_RESET}" >&2
+        return 1
+    fi
+    printf '%s\n' "${slug}"
+}
+
+# Record how this launch points Claude Code at a hosted provider.
+# wire: native (Anthropic Messages, no proxy), chat, or responses.
+# The assignments are read back in cmd_launch; dynamic scope sees that local.
+_claude_use() {
+    local ctx="$4"
+    case "$1" in
+        native|chat|responses) ;;
+        *)
+            echo "${C_RED}Error: internal: unknown claude wire '$1'.${C_RESET}" >&2
+            return 1
+            ;;
+    esac
+    if [[ -z "$2" ]]; then
+        echo "${C_RED}Error: internal: claude upstream is empty.${C_RESET}" >&2
+        return 1
+    fi
+    if [[ ! "${ctx}" =~ ^[1-9][0-9]*$ ]]; then
+        echo "${C_RED}Error: context window must be a positive integer (got '${ctx}').${C_RESET}" >&2
+        return 1
+    fi
+    claude_wire="$1"
+    claude_up_base="${2%/}"
+    claude_key_var="$3"
+    claude_ctx="${ctx}"
+}
+
 # kimi's capability vocabulary (thinking/tool_use/image_in). All abliteration
 # models stream, call tools and think; only the base model takes images - the
 # two large models answer an image request with a 400.
@@ -1658,6 +1776,66 @@ vllm_fetch_models() {
     fi
     cat "${tmp}"
     rm -f "${tmp}"
+}
+
+# True when no base was chosen explicitly, so the default server may be found
+# on one of the fallback ports. An env URL or a global --host pins the base.
+vllm_base_is_auto() {
+    if [[ -n "${KIMO_VLLM_BASE_URL:-}" || -n "${VLLM_BASE_URL:-}" ]]; then
+        return 1
+    fi
+    if [[ "${OPT_HOST_FROM_CLI:-false}" == true && -n "${OPT_HOST_RAW:-}" ]]; then
+        return 1
+    fi
+    return 0
+}
+
+# /v1 bases probed, in order, when the default does not answer. 18000 is the
+# usual local end of an `ssh -L 18000:127.0.0.1:8000` forward to a GPU box, so
+# a tunneled vLLM is found without exporting a URL. KIMO_VLLM_BASE_URLS
+# (comma or whitespace separated) replaces the built-in list.
+vllm_candidate_bases() {
+    local raw="${KIMO_VLLM_BASE_URLS:-}" item
+    local -a items=()
+    if [[ -z "${raw}" ]]; then
+        items=("${VLLM_BASE_URL_DEFAULT}" "http://127.0.0.1:18000/v1")
+    else
+        read -r -a items <<<"${raw//,/ }"
+    fi
+    (( ${#items[@]} )) || return 0
+    for item in "${items[@]}"; do
+        vllm_normalize_base "${item}" 2>/dev/null || continue
+    done
+}
+
+# Print the first candidate whose /v1/models answers. The default base is
+# skipped: it already failed, and trying it twice only doubles the timeout.
+vllm_discover_base() {
+    local current="$1" key="${2:-}" candidate
+    while IFS= read -r candidate; do
+        [[ -n "${candidate}" && "${candidate}" != "${current}" ]] || continue
+        if vllm_fetch_models "${candidate}" "${key}" >/dev/null 2>&1; then
+            printf '%s\n' "${candidate}"
+            return 0
+        fi
+    done < <(vllm_candidate_bases)
+    return 1
+}
+
+# Comma-joined ids a server published, for the launch message.
+vllm_model_list() {
+    printf '%s' "$1" | jq -r \
+        '[.data[]?.id | select(type == "string" and length > 0)] | join(", ")' 2>/dev/null
+}
+
+# The model to launch when --model was omitted. vLLM also publishes embedding
+# and reranker models on /v1/models, which cannot answer a chat request, so
+# those are skipped while a chat id remains; otherwise the first id wins.
+vllm_pick_model() {
+    printf '%s' "$1" | jq -r '
+        [.data[]?.id | select(type == "string" and test("^[A-Za-z0-9._:/-]+$"))] as $ids
+        | ($ids | map(select((ascii_downcase | test("embed|rerank")) | not))) as $chat
+        | first($chat[]) // first($ids[]) // empty' 2>/dev/null
 }
 
 # Pick the context window for one launch.
@@ -6410,15 +6588,46 @@ _grok_show_status() {
     _grok_helper status "${options[@]}"
 }
 
+# A grok-login access token lives for a few hours. cli-chat-proxy rejects an
+# expired one with 401 reason=no auth context even when X-XAI-Token-Auth is
+# set, and a stale XAI_API_KEY or XAI_AUTH_TOKEN in the shell hides the live
+# session in ~/.grok/auth.json. Renew from the stored refresh_token, then
+# export that session. An xai- API key is left alone.
+#
+# KIMO_GROK_NO_REFRESH=1 keeps kimo offline; the launch then needs an already
+# valid token in the environment or in auth.json.
 _ensure_grok_token() {
-    local state source refreshable
+    local state source refreshable refresh_attempted=false
     _resolve_grok_auth
     read -r state source refreshable < <(_grok_helper token-state 2>/dev/null) || return 1
+    if [[ "${state}" != valid && "${state}" != apikey && "${refreshable}" == yes && "${KIMO_GROK_NO_REFRESH:-0}" != 1 ]]; then
+        refresh_attempted=true
+        echo "${C_DIM}[*] xAI Grok token is ${state}; renewing it from auth.json...${C_RESET}" >&2
+        _grok_helper refresh || true
+        state="expired"
+        source="file"
+    fi
+    # token-state names one credential. Drop expired session JWTs so they
+    # cannot shadow the token just read (or renewed) from auth.json.
+    if [[ "${state}" != valid && "${state}" != apikey || "${source}" == file ]]; then
+        [[ "${XAI_AUTH_TOKEN:-}" == eyJ* ]] && unset XAI_AUTH_TOKEN
+        [[ "${XAI_API_KEY:-}" == eyJ* ]] && unset XAI_API_KEY
+        _resolve_grok_auth
+        read -r state source refreshable < <(_grok_helper token-state 2>/dev/null) || return 1
+    fi
     if [[ "${state}" == valid || "${state}" == apikey ]]; then
         return 0
     fi
     echo "${C_RED}Error: no usable xAI Grok token or API key (${state}).${C_RESET}" >&2
-    echo "${C_DIM}    Sign in with 'grok login', or export XAI_AUTH_TOKEN (or XAI_API_KEY).${C_RESET}" >&2
+    if [[ "${state}" == expired ]]; then
+        if ${refresh_attempted}; then
+            echo "${C_DIM}    The cached token has expired and the renewal above failed. Sign in again with 'grok login'.${C_RESET}" >&2
+        else
+            echo "${C_DIM}    The cached token has expired and auth.json holds no refresh_token. Sign in again with 'grok login'.${C_RESET}" >&2
+        fi
+    else
+        echo "${C_DIM}    Sign in with 'grok login', or export XAI_AUTH_TOKEN (or XAI_API_KEY).${C_RESET}" >&2
+    fi
     return 1
 }
 
@@ -6840,6 +7049,10 @@ ${C_YELLOW}Cloud Provider: OpenAI (--provider codex | --provider openai):${C_RES
   than storing it - no secret is ever written to disk, and --dry-run masks them.
   The model catalog comes from ${CODEX_HOME}/models_cache.json (populated the
   first time the Codex CLI runs); an explicit --model needs no catalog.
+  claude does not speak the Responses API. A live launch starts a localhost
+  /v1/messages proxy that posts {base}/responses upstream. Claude receives a
+  per-launch token for that proxy; the real key stays in OPENAI_API_KEY or
+  CODEX_AUTH_TOKEN. Without --model, claude uses the first catalog slug.
 
   Neither backend probes hosts, resolves Ollama tags, evicts models or applies
   tune settings - there is no VRAM to manage. Set \$KIMO_CODEX_NO_REFRESH=1 to
@@ -6880,6 +7093,12 @@ ${C_YELLOW}Self-hosted: vLLM (--provider vllm):${C_RESET}
   and /v1 is added when the URL does not already end in it. A default_host
   from the config file is an Ollama address and is not used here.
 
+  Without a configured base the default is probed first, then
+  http://127.0.0.1:18000/v1 (the usual local end of an ssh -L forward), then
+  any \$KIMO_VLLM_BASE_URLS list. Without --model, the served catalogue is
+  listed and the first chat model is launched (embedding/reranker ids are
+  skipped); claude and kimi both use it.
+
   What changes versus Ollama routing: no host probing, no /api/tags, no
   /api/show, no VRAM eviction and no tune registry. kimi is registered with
   a [providers.vllm] block (vllm-<host> when the base is not the default)
@@ -6901,10 +7120,12 @@ ${C_YELLOW}Self-hosted: vLLM (--provider vllm):${C_RESET}
 
   A remote vLLM host still has every unrelated credential scrubbed. Only
   \$VLLM_API_KEY is forwarded, because that key belongs to this server.
+  claude reaches the same /v1 base through the localhost Messages proxy
+  (Chat Completions upstream). Pass --model when the server cannot be listed.
 
-${C_YELLOW}Codex Responses providers (--provider qwencloud | xai | anthropic):${C_RESET}
-  ${C_BOLD}codex${C_RESET} only. Each one is a Responses endpoint (Codex posts {base}/responses
-  and rejects wire_api=chat). kimo passes the provider as -c overlays and names
+${C_YELLOW}Codex Responses providers (--provider qwencloud | xai | anthropic | gemini):${C_RESET}
+  ${C_BOLD}codex${C_RESET} and ${C_BOLD}claude${C_RESET}. For codex, each one is a Responses endpoint (Codex posts
+  {base}/responses and rejects wire_api=chat). kimo passes the provider as -c overlays and names
   the credential's environment variable (env_key). The key is never written to
   config.toml and never placed in argv; --dry-run masks it. requires_openai_auth
   is false, so a ChatGPT login is not required and is not billed. --oss is not
@@ -6912,8 +7133,20 @@ ${C_YELLOW}Codex Responses providers (--provider qwencloud | xai | anthropic):${
   flattens any remaining type "namespace" tools (the TUI's codex_worktrees
   MCP server is one). These Responses endpoints reject that variant with
   HTTP 422.
-  A dashscope/, qwencloud/, xai/, grok/ or anthropic/ model prefix is
+  A dashscope/, qwencloud/, xai/, grok/, anthropic/ or gemini/ model prefix is
   stripped before it is sent.
+  claude speaks /v1/messages, so the same credentials launch Claude Code through
+  a localhost proxy. An xai- key uses Responses at api.x.ai. A grok-login
+  token uses Chat Completions at cli-chat-proxy.grok.com, with
+  X-XAI-Token-Auth: xai-grok-cli. qwencloud and gemini are
+  translated to Chat Completions, which is the wire Gemini's OpenAI surface
+  actually serves (Codex still refuses that official host without
+  \$KIMO_GEMINI_BASE_URL). '--provider anthropic' (alias claude) launches
+  Claude Code on api.anthropic.com itself; \$KIMO_ANTHROPIC_BASE_URL remains
+  the Codex Responses origin and is not applied to Claude Code. Tier requests
+  (haiku, sonnet, opus, subagents) stay on the launched model. A window of
+  1,000,000 tokens is passed as a [1m] suffix, which Claude strips before the
+  upstream request.
 
   ${C_CYAN}qwencloud${C_RESET}  ${QWENCLOUD_BACKEND_URL}
           Pay-as-you-go QwenCloud. \$QWENCLOUD_API_KEY, else \$DASHSCOPE_API_KEY,
@@ -6957,12 +7190,22 @@ ${C_YELLOW}CLI Integration Mechanics:${C_RESET}
                 model's num_ctx (the window the runner actually allocates). Ollama
                 does not set an output token cap. A Kimi window above num_ctx fills
                 the runner and comes back as finish_reason=length, which Kimi reports
-                as "Model hit max_tokens" before any tool call. Thinking models declare
+                as "Model hit max_tokens" before any tool call. With --provider
+                codex/openai the window comes from the Codex catalog instead:
+                max_context_window (the ceiling Codex allows for a
+                model_context_window override), else context_window. An explicit
+                --ctx overrides it, clamped to that ceiling; the Ollama-oriented
+                KIMO_KIMI_CONTEXT/kimi_context setting is not applied to a hosted
+                window. Thinking models declare
                 support_efforts low..max so the in-session /effort picker works (mapped via reasoning_key).
   ${C_BOLD}claude${C_RESET}       Directs Claude Code to the target host via ANTHROPIC_BASE_URL. A real
                 ANTHROPIC_API_KEY/AUTH_TOKEN is forwarded only to a plain local daemon;
                 remote/LAN/tunnel hosts get a placeholder ('ollama') so the secret never
                 leaves this box. API_TIMEOUT_MS is left untouched (claude defaults to 600000 ms).
+                Hosted providers that are not already Anthropic-compatible (openai, codex,
+                xai, qwencloud, gemini, vllm) go through a localhost /v1/messages proxy.
+                '--provider anthropic' uses Anthropic's own API. DashScope and abliteration
+                keep their Anthropic-compatible bases and do not use the proxy.
   ${C_BOLD}codex${C_RESET}        Ollama uses --oss --local-provider ollama. Hosted Responses providers
                 (dashscope, qwencloud, xai, anthropic) are -c model_providers overlays
                 with wire_api=responses; ChatGPT and the platform API stay native.
@@ -7002,6 +7245,7 @@ ${C_YELLOW}Environment Overrides:${C_RESET}
   VLLM_API_KEY              Optional bearer token when the vLLM server was started with --api-key.
                             Stored in kimi's config as the variable name only, never the value.
   KIMO_VLLM_CTX             Context window used when vLLM does not report max_model_len (default 32768)
+  KIMO_VLLM_BASE_URLS       Fallback /v1 bases probed when no base is configured (default: :8000 then the :18000 tunnel)
   KIMO_VLLM_MODEL           Served model id to launch when --model is omitted and the server lists several
   KIMO_ABLITERATION_BASE_URL  Override the API origin (default: https://api.abliteration.ai)
   KIMO_CODEX_BACKEND_URL    Override the ChatGPT Codex endpoint (default: https://chatgpt.com/backend-api/codex)
@@ -7281,6 +7525,11 @@ cmd_launch() {
     # Set when Codex should use a custom Responses model_provider. Empty for
     # Ollama and for the native ChatGPT / platform backends.
     local codex_mp_id="" codex_mp_name="" codex_mp_base="" codex_mp_env="" codex_mp_ctx=""
+    # Set when Claude Code should talk to a hosted provider. native is
+    # Anthropic's own Messages API. chat and responses go through the localhost
+    # proxy. Empty for Ollama, abliteration and DashScope (those have their own
+    # Anthropic-compatible bases).
+    local claude_wire="" claude_up_base="" claude_key_var="" claude_ctx=""
 
     if openai_backend "${cloud_provider}"; then
         if [[ " ${OPENAI_CLIS} " != *" ${provider} "* ]]; then
@@ -7316,6 +7565,10 @@ cmd_launch() {
             export OPENAI_API_KEY="${openai_key}"
             if [[ "${provider}" == kimi ]]; then
                 resolved_model=$(_codex_kimi_model openai "${target_model}" "${opt_model_explicit}") || return 1
+            elif [[ "${provider}" == claude ]]; then
+                resolved_model=$(_claude_take_catalog_model openai "${opt_model_explicit}" "${target_model}" "${DEFAULT_MODELS[claude]:-}") || return 1
+                _claude_use responses "${active_host%/}/v1" OPENAI_API_KEY \
+                    "${opt_launch_ctx:-${OPENAI_CLAUDE_CTX}}" || return 1
             else
                 _codex_warn_chatgpt_login
                 if ! ${opt_model_explicit} && [[ "${target_model}" != openai/* ]]; then
@@ -7335,6 +7588,10 @@ cmd_launch() {
             _ensure_codex_token || return 1
             if [[ "${provider}" == kimi ]]; then
                 resolved_model=$(_codex_kimi_model codex "${target_model}" "${opt_model_explicit}") || return 1
+            elif [[ "${provider}" == claude ]]; then
+                resolved_model=$(_claude_take_catalog_model codex "${opt_model_explicit}" "${target_model}" "${DEFAULT_MODELS[claude]:-}") || return 1
+                _claude_use responses "${active_host%/}" CODEX_AUTH_TOKEN \
+                    "${opt_launch_ctx:-${CODEX_CLAUDE_CTX}}" || return 1
             else
                 if ! ${opt_model_explicit} && [[ "${target_model}" != codex/* ]]; then
                     # Let Codex resolve its own model/profile and stored login.
@@ -7457,8 +7714,8 @@ cmd_launch() {
             return 1
         fi
     elif [[ "${cloud_provider}" == "qwencloud" || "${cloud_provider}" == "xai" || "${cloud_provider}" == "anthropic" || "${cloud_provider}" == "gemini" ]]; then
-        if [[ "${provider}" != "codex" ]]; then
-            echo "${C_RED}Error: '--provider ${cloud_provider}' supports codex; '${provider}' has no ${cloud_provider} launch branch yet.${C_RESET}" >&2
+        if [[ "${provider}" != "codex" && "${provider}" != "claude" ]]; then
+            echo "${C_RED}Error: '--provider ${cloud_provider}' supports codex claude; '${provider}' has no ${cloud_provider} launch branch yet.${C_RESET}" >&2
             echo "${C_DIM}    Those CLIs are wired for a self-hosted Ollama host. Drop --provider to route '${provider}' to Ollama.${C_RESET}" >&2
             return 1
         fi
@@ -7498,17 +7755,19 @@ cmd_launch() {
                 provider_ctx="${XAI_DEFAULT_CTX}"
                 provider_hint="Export XAI_API_KEY=xai-..., XAI_AUTH_TOKEN, or sign in with 'grok login'. '--provider grok' selects this same backend."
                 provider_base="${XAI_BACKEND_URL}"
-                if [[ -n "${XAI_API_KEY:-}" ]]; then
+                # A stale eyJ in the shell is the 401 cli-chat-proxy reports as
+                # reason=no auth context. Prefer the live auth.json session.
+                _ensure_grok_token || return 1
+                if [[ -n "${XAI_API_KEY:-}" && "${XAI_API_KEY}" == xai-* ]]; then
                     key_var="XAI_API_KEY"
                 elif [[ -n "${XAI_AUTH_TOKEN:-}" ]]; then
                     key_var="XAI_AUTH_TOKEN"
+                elif [[ -n "${XAI_API_KEY:-}" && "${XAI_API_KEY}" != ollama ]]; then
+                    key_var="XAI_API_KEY"
                 else
-                    _resolve_grok_auth
-                    if ! key_var=$(_hosted_key_var XAI_AUTH_TOKEN XAI_API_KEY); then
-                        echo "${C_RED}Error: '--provider xai' needs an xAI API key, and none was found.${C_RESET}" >&2
-                        echo "${C_DIM}    ${provider_hint}${C_RESET}" >&2
-                        return 1
-                    fi
+                    echo "${C_RED}Error: '--provider xai' needs an xAI API key, and none was found.${C_RESET}" >&2
+                    echo "${C_DIM}    ${provider_hint}${C_RESET}" >&2
+                    return 1
                 fi
                 local xai_val="${!key_var}"
                 if [[ "${xai_val}" == sk-sp-* ]]; then
@@ -7557,7 +7816,7 @@ cmd_launch() {
                     echo "${C_DIM}    ${provider_hint}${C_RESET}" >&2
                     return 1
                 fi
-                if [[ "${provider_base}" == "https://api.anthropic.com/v1" && -z "${KIMO_ANTHROPIC_BASE_URL:-}" && "${opt_dry_run}" != true ]]; then
+                if [[ "${provider}" == codex && "${provider_base}" == "https://api.anthropic.com/v1" && -z "${KIMO_ANTHROPIC_BASE_URL:-}" && "${opt_dry_run}" != true ]]; then
                     echo "${C_RED}Error: Anthropic's official API (api.anthropic.com) does not support the OpenAI Responses API required by Codex.${C_RESET}" >&2
                     echo "${C_DIM}    To use Claude with Codex, set \$KIMO_ANTHROPIC_BASE_URL to an OpenAI Responses-compatible gateway.${C_RESET}" >&2
                     echo "${C_DIM}    Or use native Claude Code: '${0##*/} launch claude' (or '${0##*/} launch kimi').${C_RESET}" >&2
@@ -7600,7 +7859,7 @@ cmd_launch() {
                     echo "${C_DIM}    ${provider_hint}${C_RESET}" >&2
                     return 1
                 fi
-                if [[ "${provider_base}" == "https://generativelanguage.googleapis.com/v1beta/openai" && -z "${KIMO_GEMINI_BASE_URL:-}" && "${opt_dry_run}" != true ]]; then
+                if [[ "${provider}" == codex && "${provider_base}" == "https://generativelanguage.googleapis.com/v1beta/openai" && -z "${KIMO_GEMINI_BASE_URL:-}" && "${opt_dry_run}" != true ]]; then
                     echo "${C_RED}Error: Google's official Gemini API (generativelanguage.googleapis.com) does not support the OpenAI Responses API required by Codex.${C_RESET}" >&2
                     echo "${C_DIM}    To use Gemini with Codex, set \$KIMO_GEMINI_BASE_URL to an OpenAI Responses-compatible gateway.${C_RESET}" >&2
                     echo "${C_DIM}    Or use native Google Antigravity: '${0##*/} launch agy' (or '${0##*/} launch kimi').${C_RESET}" >&2
@@ -7618,7 +7877,7 @@ cmd_launch() {
             return 1
         fi
         active_host="${provider_base}"
-        if ! ${opt_model_explicit} || [[ -z "${target_model}" || "${target_model}" == codex ]]; then
+        if ! ${opt_model_explicit} || [[ -z "${target_model}" || "${target_model}" == codex || "${target_model}" == claude ]]; then
             resolved_model="${provider_model}"
         else
             resolved_model="${target_model}"
@@ -7629,11 +7888,39 @@ cmd_launch() {
                 gemini) resolved_model="${resolved_model#gemini/}" ;;
             esac
         fi
-        codex_mp_id="${cloud_provider}"
-        codex_mp_name="${provider_name}"
-        codex_mp_base="${provider_base}"
-        codex_mp_env="${key_var}"
-        codex_mp_ctx="${provider_ctx}"
+        if [[ "${provider}" == claude ]]; then
+            # Codex posts {base}/responses. Claude Code posts {base}/v1/messages.
+            # An xai- key stays on api.x.ai Responses. A grok-login JWT stays on
+            # the CLI chat proxy's Chat Completions wire. QwenCloud and Gemini's
+            # OpenAI surface are Chat Completions too. Official Anthropic is native:
+            # KIMO_ANTHROPIC_BASE_URL stays the Codex Responses origin and is
+            # not applied to Claude Code.
+            if [[ "${cloud_provider}" == anthropic ]]; then
+                active_host="https://api.anthropic.com"
+                _claude_use native "${active_host}" "${key_var}" \
+                    "${opt_launch_ctx:-${provider_ctx}}" || return 1
+            elif [[ "${cloud_provider}" == xai ]]; then
+                # api.x.ai speaks Responses. A grok-login JWT is sent to
+                # cli-chat-proxy.grok.com, which only accepts Chat Completions
+                # plus X-XAI-Token-Auth (the proxy adds that header).
+                if [[ "${provider_base}" == *"://cli-chat-proxy.grok.com"* ]]; then
+                    _claude_use chat "${provider_base}" "${key_var}" \
+                        "${opt_launch_ctx:-${provider_ctx}}" || return 1
+                else
+                    _claude_use responses "${provider_base}" "${key_var}" \
+                        "${opt_launch_ctx:-${provider_ctx}}" || return 1
+                fi
+            else
+                _claude_use chat "${provider_base}" "${key_var}" \
+                    "${opt_launch_ctx:-${provider_ctx}}" || return 1
+            fi
+        else
+            codex_mp_id="${cloud_provider}"
+            codex_mp_name="${provider_name}"
+            codex_mp_base="${provider_base}"
+            codex_mp_env="${key_var}"
+            codex_mp_ctx="${provider_ctx}"
+        fi
     elif [[ "${cloud_provider}" == "abliteration" ]]; then
         if ! abliteration_cli_supported "${provider}"; then
             echo "${C_RED}Error: '--provider abliteration' supports ${ABLITERATION_CLIS}; '${provider}' has no abliteration launch branch yet.${C_RESET}" >&2
@@ -7716,6 +8003,20 @@ cmd_launch() {
         if ! ${opt_dry_run}; then
             vllm_fetch_rc=0
             vllm_models_json=$(vllm_fetch_models "${vllm_base}" "${vllm_key}") || vllm_fetch_rc=$?
+            # A bare 'launch --provider vllm' with no configured base may be
+            # talking to an ssh -L forward (or a second local server). Probe
+            # the fallback ports only when the base was not pinned explicitly.
+            if ((vllm_fetch_rc == 1)) && vllm_base_is_auto; then
+                local vllm_found=""
+                vllm_found=$(vllm_discover_base "${vllm_base}" "${vllm_key}") || vllm_found=""
+                if [[ -n "${vllm_found}" ]]; then
+                    vllm_base="${vllm_found}"
+                    vllm_pid=$(vllm_provider_id "${vllm_base}")
+                    echo "${C_DIM}[*] found a vLLM server at ${vllm_base}${C_RESET}" >&2
+                    vllm_fetch_rc=0
+                    vllm_models_json=$(vllm_fetch_models "${vllm_base}" "${vllm_key}") || vllm_fetch_rc=$?
+                fi
+            fi
             if ((vllm_fetch_rc == 2)); then
                 echo "${C_RED}Error: the vLLM server rejected the API key (HTTP 401/403 on ${vllm_base}/models).${C_RESET}" >&2
                 echo "${C_DIM}    Export VLLM_API_KEY to match the server's --api-key, or start vLLM without --api-key.${C_RESET}" >&2
@@ -7723,8 +8024,11 @@ cmd_launch() {
             fi
             if ((vllm_fetch_rc == 0)); then
                 if [[ -z "${vllm_wire}" ]]; then
-                    vllm_wire=$(printf '%s' "${vllm_models_json}" | jq -r \
-                        'first(.data[]?.id | select(type == "string" and test("^[A-Za-z0-9._:/-]+$"))) // empty') || vllm_wire=""
+                    local vllm_served=""
+                    vllm_served=$(vllm_model_list "${vllm_models_json}")
+                    [[ -n "${vllm_served}" ]] && echo "${C_DIM}[*] vLLM models at ${vllm_base}: ${vllm_served}${C_RESET}" >&2
+                    vllm_wire=$(vllm_pick_model "${vllm_models_json}") || vllm_wire=""
+                    [[ -n "${vllm_wire}" ]] && echo "${C_DIM}[*] using vLLM model: ${vllm_wire}${C_RESET}" >&2
                 fi
                 if [[ -z "${vllm_wire}" ]]; then
                     echo "${C_RED}Error: ${vllm_base}/models returned no usable model id.${C_RESET}" >&2
@@ -7741,8 +8045,12 @@ cmd_launch() {
             else
                 vllm_models_json=""
                 if [[ -z "${vllm_wire}" ]]; then
-                    echo "${C_RED}Error: cannot reach a vLLM server at ${vllm_base}, and no model id was given.${C_RESET}" >&2
-                    echo "${C_DIM}    Start one with 'vllm serve <model> --host 127.0.0.1 --port 8000', set KIMO_VLLM_BASE_URL, or pass --model <served-id>.${C_RESET}" >&2
+                    local vllm_tried="${vllm_base}"
+                    if vllm_base_is_auto; then
+                        vllm_tried=$(vllm_candidate_bases | paste -sd ',' - | sed 's/,/, /g')
+                    fi
+                    echo "${C_RED}Error: no reachable vLLM server (tried: ${vllm_tried}), and no model id was given.${C_RESET}" >&2
+                    echo "${C_DIM}    Start one with 'vllm serve <model> --host 127.0.0.1 --port 8000', set KIMO_VLLM_BASE_URL (or KIMO_VLLM_BASE_URLS), or pass --model <served-id>.${C_RESET}" >&2
                     return 1
                 fi
                 echo "${C_YELLOW}[!] Warning: could not read ${vllm_base}/models; falling back to kimi's KIMI_MODEL_* env channel (shows as __kimi_env__).${C_RESET}" >&2
@@ -7776,6 +8084,11 @@ cmd_launch() {
             resolved_model="<first model vLLM is serving>"
         fi
         active_host="${vllm_base}"
+        if [[ "${provider}" == claude ]]; then
+            local vllm_key_var=""
+            [[ "${vllm_has_key}" == yes ]] && vllm_key_var="VLLM_API_KEY"
+            _claude_use chat "${vllm_base}" "${vllm_key_var}" "${vllm_ctx}" || return 1
+        fi
     elif [[ -n "${TARGET_HOST}" ]]; then
         active_host="${TARGET_HOST}"
         local res
@@ -7894,6 +8207,15 @@ cmd_launch() {
         unset ANTHROPIC_AUTH_TOKEN CURSOR_API_KEY
         unset CODEX_API_KEY CODEX_AUTH_TOKEN CODEX_ACCESS_TOKEN DASHSCOPE_API_KEY MODELSTUDIO_API_KEY QWENCLOUD_API_KEY XAI_API_KEY
         unset COPILOT_PROVIDER_API_KEY COPILOT_PROVIDER_BEARER_TOKEN
+    fi
+    # A hosted claude launch must not inherit an Ollama ANTHROPIC_BASE_URL.
+    # The proxy token is minted at exec time. Native Anthropic keeps the real
+    # key and drops only a stale base URL.
+    if [[ -n "${claude_wire}" ]]; then
+        unset ANTHROPIC_BASE_URL ANTHROPIC_API_BASE
+        if [[ "${claude_wire}" != native ]]; then
+            unset ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN
+        fi
     fi
 
     local cli_cmd="${EXTERNAL_CLI_MAP[$provider]:-}"
@@ -8103,7 +8425,10 @@ cmd_launch() {
         elif [[ -n "${codex_mp_id}" ]]; then
             dry_argv=("${codex_argv[@]}")
         fi
-        if [[ "${cloud_provider}" != "vllm" ]]; then
+        if [[ -n "${claude_wire}" ]]; then
+            dry_argv=(claude --model "$(claude_window_model "${resolved_model}" "${claude_ctx}")")
+        fi
+        if [[ "${cloud_provider}" != "vllm" && -z "${claude_wire}" ]]; then
             [[ "${cli_available}" -eq 1 || -z "${cli_cmd}" ]] || dry_argv=(ollama run "${resolved_model}")
         fi
         [[ "${cli_cmd}" == codex && "${cli_available}" -eq 1 ]] || dry_argv+=("${cli_passthrough_args[@]}")
@@ -8185,6 +8510,14 @@ cmd_launch() {
                 echo "  evict  : n/a (hosted API, no VRAM to free)"
                 echo "  context: ${opt_launch_ctx:-${codex_mp_ctx}} tokens"
                 echo "  wire   : responses (${codex_mp_base})"
+            elif [[ -n "${claude_wire}" ]]; then
+                echo "  evict  : n/a (hosted API, no VRAM to free)"
+                echo "  context: ${claude_ctx} tokens"
+                if [[ "${claude_wire}" == native ]]; then
+                    echo "  wire   : anthropic native (${claude_up_base})"
+                else
+                    echo "  wire   : anthropic -> ${claude_wire} (${claude_up_base})"
+                fi
             elif [[ "${cloud_provider}" == "vllm" ]]; then
                 echo "  evict  : n/a (vLLM server, no VRAM to free)"
                 echo "  context: ${vllm_ctx} tokens"
@@ -8195,7 +8528,9 @@ cmd_launch() {
                 echo "  evict  : ${opt_evict} (other loaded models are left alone in a dry run)"
             fi
             if [[ "${cli_available}" -ne 1 && -n "${cli_cmd}" ]]; then
-                if [[ "${cloud_provider}" == "vllm" ]]; then
+                if [[ -n "${claude_wire}" ]]; then
+                    echo "  note   : '${cli_cmd}' is not installed; this provider does not fall back to 'ollama run'"
+                elif [[ "${cloud_provider}" == "vllm" ]]; then
                     echo "  note   : '${cli_cmd}' is not installed; vLLM routing does not fall back to 'ollama run'"
                 else
                     echo "  note   : '${cli_cmd}' is not installed; kimo would fall back to 'ollama run'"
@@ -8214,6 +8549,13 @@ cmd_launch() {
                 codex)
                     if [[ -n "${codex_mp_id}" ]]; then
                         echo "  ${C_DIM}(Codex gets model_providers.${codex_mp_id} via -c; config.toml is not modified and the key stays in ${codex_mp_env}. A live launch flattens namespace tools on localhost.)${C_RESET}"
+                    fi
+                    ;;
+                claude)
+                    if [[ "${claude_wire}" == native ]]; then
+                        echo "  ${C_DIM}(Claude Code uses Anthropic's Messages API directly. \$KIMO_ANTHROPIC_BASE_URL is only the Codex Responses origin.)${C_RESET}"
+                    elif [[ -n "${claude_wire}" ]]; then
+                        echo "  ${C_DIM}(Claude Code speaks /v1/messages. A live launch points it at a localhost proxy; the upstream key stays in ${claude_key_var:-the provider env}. A [1m] suffix is stripped before the upstream request.)${C_RESET}"
                     fi
                     ;;
                 kimi|grok|agy|cyberstrike)
@@ -8249,6 +8591,38 @@ cmd_launch() {
                 # secret. Ollama ignores the value. No timeout override is needed
                 # here: claude's request timeout already defaults to 600000 ms
                 # (API_TIMEOUT_MS), so it does not hit qwen's old 45s wall.
+                if [[ -n "${claude_wire}" ]]; then
+                    local claude_shown=""
+                    claude_shown=$(claude_window_model "${resolved_model}" "${claude_ctx}")
+                    export CLAUDE_CODE_MAX_CONTEXT_TOKENS="${CLAUDE_CODE_MAX_CONTEXT_TOKENS:-${claude_ctx}}"
+                    if [[ "${claude_wire}" == native ]]; then
+                        unset ANTHROPIC_BASE_URL ANTHROPIC_API_BASE
+                        export ANTHROPIC_MODEL="${claude_shown}"
+                        echo "${C_DIM}[*] claude on Anthropic: ${claude_shown} (context ${claude_ctx})${C_RESET}"
+                        exec "${cli_cmd}" --model "${claude_shown}" "${cli_passthrough_args[@]}"
+                    fi
+                    local claude_token="" claude_port=""
+                    claude_token=$(python3 -c 'import secrets; print(secrets.token_hex(16))')
+                    if ! claude_port=$(_kimo_anthropic_proxy_start "${claude_up_base}" "${claude_wire}" "${claude_key_var}" "${claude_token}" "${cloud_provider}"); then
+                        echo "${C_RED}Error: could not start the local Anthropic messages proxy for ${cloud_provider}.${C_RESET}" >&2
+                        return 1
+                    fi
+                    unset ANTHROPIC_API_KEY
+                    export ANTHROPIC_BASE_URL="http://127.0.0.1:${claude_port}"
+                    export ANTHROPIC_API_BASE="http://127.0.0.1:${claude_port}/v1"
+                    export ANTHROPIC_AUTH_TOKEN="${claude_token}"
+                    export ANTHROPIC_MODEL="${claude_shown}"
+                    export ANTHROPIC_DEFAULT_OPUS_MODEL="${ANTHROPIC_DEFAULT_OPUS_MODEL:-${claude_shown}}"
+                    export ANTHROPIC_DEFAULT_SONNET_MODEL="${ANTHROPIC_DEFAULT_SONNET_MODEL:-${claude_shown}}"
+                    export ANTHROPIC_DEFAULT_HAIKU_MODEL="${ANTHROPIC_DEFAULT_HAIKU_MODEL:-${claude_shown}}"
+                    export CLAUDE_CODE_SUBAGENT_MODEL="${CLAUDE_CODE_SUBAGENT_MODEL:-${claude_shown}}"
+                    export CLAUDE_CODE_EFFORT_LEVEL="${CLAUDE_CODE_EFFORT_LEVEL:-high}"
+                    if [[ "${claude_ctx}" =~ ^[0-9]+$ ]] && (( claude_ctx >= 2 )); then
+                        export CLAUDE_CODE_AUTO_COMPACT_WINDOW="${CLAUDE_CODE_AUTO_COMPACT_WINDOW:-$((claude_ctx / 2))}"
+                    fi
+                    echo "${C_DIM}[*] claude on ${cloud_provider}: ${claude_shown} via ${ANTHROPIC_BASE_URL} -> ${claude_wire} ${claude_up_base} (context ${claude_ctx})${C_RESET}"
+                    exec "${cli_cmd}" --model "${claude_shown}" "${cli_passthrough_args[@]}"
+                fi
                 if [[ "${cloud_provider}" == "abliteration" ]]; then
                     # The key is already in ANTHROPIC_AUTH_TOKEN (bearer) from the
                     # provider block above, with ANTHROPIC_API_KEY unset; nothing
@@ -8375,13 +8749,23 @@ cmd_launch() {
                     # env var holding the credential) and an alias for the
                     # launched model. The credential itself stays in the
                     # environment, so nothing secret is written to disk.
-                    local sync_result="" synced_model=""
+                    local sync_result="" synced_model="" synced_ctx=""
+                    # Hosted OpenAI backends take their compaction window from
+                    # the Codex catalog (max_context_window, else context_window).
+                    # Only an explicit --ctx overrides it; the Ollama-oriented
+                    # KIMO_KIMI_CONTEXT/kimi_context setting must not shrink a
+                    # hosted window. The sync helper clamps to the catalog ceiling.
+                    local kimi_api_ctx="${opt_launch_ctx}"
+                    local -a kimi_sync_ctx=()
+                    if [[ -n "${kimi_api_ctx}" ]]; then
+                        kimi_sync_ctx=(--ctx "${kimi_api_ctx}")
+                    fi
                     if [[ "${cloud_provider}" == codex ]]; then
                         _resolve_codex_auth
-                        sync_result=$(_codex_sync_kimi --json "${resolved_model}" 2>&1) || return 1
+                        sync_result=$(_codex_sync_kimi --json "${resolved_model}" "${kimi_sync_ctx[@]}" 2>&1) || return 1
                         echo "${C_DIM}[*] kimi on codex provider: ${resolved_model} (ChatGPT OAuth, renewed as needed)${C_RESET}" >&2
                     else
-                        sync_result=$(_openai_sync_kimi --json "${resolved_model}" 2>&1) || return 1
+                        sync_result=$(_openai_sync_kimi --json "${resolved_model}" "${kimi_sync_ctx[@]}" 2>&1) || return 1
                         echo "${C_DIM}[*] kimi on openai provider: ${resolved_model} (platform API key)${C_RESET}" >&2
                     fi
                     # Extract the registered model alias from the sync result to avoid
@@ -8390,6 +8774,10 @@ cmd_launch() {
                     synced_model=$(echo "${sync_result}" | jq -r '.default_model // empty' 2>/dev/null)
                     if [[ -n "${synced_model}" ]]; then
                         resolved_model="${synced_model}"
+                    fi
+                    synced_ctx=$(echo "${sync_result}" | jq -r '.max_context_size // empty' 2>/dev/null)
+                    if [[ -n "${synced_ctx}" ]]; then
+                        echo "${C_DIM}[*] kimi context window: ${synced_ctx} tokens${C_RESET}" >&2
                     fi
                     unset KIMI_MODEL_NAME KIMI_MODEL_API_KEY KIMI_MODEL_PROVIDER_TYPE \
                         KIMI_MODEL_BASE_URL KIMI_MODEL_MAX_CONTEXT_SIZE KIMI_MODEL_CAPABILITIES \
@@ -8878,6 +9266,10 @@ cmd_launch() {
     elif [[ -n "${cli_cmd}" ]]; then
         echo "${C_YELLOW}[!] External CLI '${cli_cmd}' not found in PATH.${C_RESET}"
         echo "${C_DIM}    Tip: Install it with: ${0##*/} install ${provider}${C_RESET}"
+        if [[ -n "${claude_wire}" ]]; then
+            echo "${C_RED}Error: claude routing does not fall back to 'ollama run'.${C_RESET}" >&2
+            return 1
+        fi
         if [[ "${cloud_provider}" == "vllm" ]]; then
             echo "${C_RED}Error: vLLM routing does not fall back to 'ollama run'.${C_RESET}" >&2
             return 1
@@ -14531,6 +14923,7 @@ cmd_grok() {
             _grok_show_status "${opt_json}"
             ;;
         token)
+            _ensure_grok_token || return 1
             local tok="${XAI_AUTH_TOKEN:-${XAI_API_KEY:-}}"
             if [[ -z "${tok}" || "${tok}" == "ollama" ]]; then
                 echo "${C_RED}Error: No xAI Grok token or API key found. Set XAI_API_KEY or sign in with 'grok login'.${C_RESET}" >&2
@@ -14543,6 +14936,7 @@ cmd_grok() {
             fi
             ;;
         export)
+            _ensure_grok_token || return 1
             local tok="${XAI_AUTH_TOKEN:-${XAI_API_KEY:-}}"
             if [[ -z "${tok}" || "${tok}" == "ollama" ]]; then
                 echo "${C_RED}Error: No xAI Grok token or API key found. Set XAI_API_KEY or sign in with 'grok login'.${C_RESET}" >&2
