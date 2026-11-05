@@ -13452,6 +13452,11 @@ def load(path):
         return tomlkit.parse(fh.read())
 
 def save(doc, path):
+    # Drop emptied bookkeeping tables: older tomlkit (e.g. Ubuntu's 0.12)
+    # would otherwise write them back as bare [disabled_*] headers.
+    for key in ("disabled_providers", "disabled_models"):
+        if key in doc and not doc[key]:
+            del doc[key]
     content = tomlkit.dumps(doc)
     tomlkit.parse(content)  # validate round-trip
     mode = stat.S_IMODE(os.stat(path).st_mode) if os.path.exists(path) else 0o600
