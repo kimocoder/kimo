@@ -376,7 +376,6 @@ ALIBABA_DEFAULT_CTX="${KIMO_ALIBABA_CTX:-500000}"
 # agy speaks only the Gemini wire, so it rides the loopback shim in its
 # OpenAI-compatible mode (see agy_start_shim).
 DASHSCOPE_CLIS="claude kimi codex agy"
-ALIBABA_CLIS="${DASHSCOPE_CLIS}"
 # The token-plan (subscription) surface. Key class picks the surface: sk-sp-
 # keys belong here and 401 on pay-as-you-go intl, sk-ws-/sk- keys the other
 # way round. Both surfaces also speak the Anthropic wire under /apps/anthropic
