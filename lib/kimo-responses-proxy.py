@@ -379,6 +379,15 @@ class Proxy(BaseHTTPRequestHandler):
         headers["Content-Length"] = str(len(body))
         if self.provider == "xai" or "grok.com" in parts.netloc:
             headers.setdefault("X-Grok-Client-Version", "1.0.70")
+        if (parts.hostname or "").endswith("grok.com"):
+            # cli-chat-proxy rejects a bare bearer with x_xai_token_auth=none.
+            headers["X-XAI-Token-Auth"] = "xai-grok-cli"
+            try:
+                parsed = json.loads(body.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                parsed = None
+            if isinstance(parsed, dict) and isinstance(parsed.get("model"), str) and parsed["model"]:
+                headers["x-grok-model-override"] = parsed["model"]
         connection_cls = HTTPSConnection if parts.scheme == "https" else HTTPConnection
         port = parts.port or (443 if parts.scheme == "https" else 80)
         try:
