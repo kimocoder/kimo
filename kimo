@@ -8251,7 +8251,14 @@ cmd_launch() {
             cli_available=1
         fi
     fi
-    if [[ "${cli_available}" -eq 0 ]] && { openai_backend "${cloud_provider}" || [[ -n "${codex_mp_id}" ]]; }; then
+    # Responses backends and codex model providers need the real CLI; they
+    # never fall back to 'ollama run'. A dry run never execs the CLI, so it
+    # reports the missing binary as a note instead of failing.
+    local no_ollama_fallback=0
+    if openai_backend "${cloud_provider}" || [[ -n "${codex_mp_id}" ]]; then
+        no_ollama_fallback=1
+    fi
+    if [[ "${cli_available}" -eq 0 && "${no_ollama_fallback}" -eq 1 && "${opt_dry_run}" != true ]]; then
         echo "${C_RED}Error: '${cli_cmd}' is not installed. Run '${0##*/} install ${provider}'.${C_RESET}" >&2
         return 1
     fi
@@ -8427,10 +8434,12 @@ cmd_launch() {
         if [[ -n "${claude_wire}" ]]; then
             dry_argv=(claude --model "$(claude_window_model "${resolved_model}" "${claude_ctx}")")
         fi
-        if [[ "${cloud_provider}" != "vllm" && -z "${claude_wire}" ]]; then
+        if [[ "${cloud_provider}" != "vllm" && -z "${claude_wire}" && "${no_ollama_fallback}" -eq 0 ]]; then
             [[ "${cli_available}" -eq 1 || -z "${cli_cmd}" ]] || dry_argv=(ollama run "${resolved_model}")
         fi
-        [[ "${cli_cmd}" == codex && "${cli_available}" -eq 1 ]] || dry_argv+=("${cli_passthrough_args[@]}")
+        # codex_argv already carries the passthrough args.
+        [[ "${cli_cmd}" == codex && ( "${cli_available}" -eq 1 || "${no_ollama_fallback}" -eq 1 ) ]] \
+            || dry_argv+=("${cli_passthrough_args[@]}")
         _dry_secret() { # <var>: never print a credential
             if [[ -z "${!1+x}" ]]; then echo "<unset>"
             elif [[ "${!1}" == "ollama" ]]; then echo "ollama (placeholder)"
@@ -8527,7 +8536,7 @@ cmd_launch() {
                 echo "  evict  : ${opt_evict} (other loaded models are left alone in a dry run)"
             fi
             if [[ "${cli_available}" -ne 1 && -n "${cli_cmd}" ]]; then
-                if [[ -n "${claude_wire}" ]]; then
+                if [[ -n "${claude_wire}" || "${no_ollama_fallback}" -eq 1 ]]; then
                     echo "  note   : '${cli_cmd}' is not installed; this provider does not fall back to 'ollama run'"
                 elif [[ "${cloud_provider}" == "vllm" ]]; then
                     echo "  note   : '${cli_cmd}' is not installed; vLLM routing does not fall back to 'ollama run'"

@@ -163,6 +163,18 @@ check "live haiku tier stays on the launched model" "grok-4.7" "$(env_val "${CAP
 check "live keeps the upstream key for the proxy" "${XAI_KEY}" "$(env_val "${CAPTURE}" XAI_API_KEY)"
 check "live context window" "500000" "$(env_val "${CAPTURE}" CLAUDE_CODE_MAX_CONTEXT_TOKENS)"
 
+# Print the port a background server wrote to <file>, waiting up to 10s.
+# Prints nothing on timeout so the caller's check fails instead of set -e
+# aborting the run.
+wait_port_file() { # <file>
+    local _
+    for _ in $(seq 1 200); do
+        [[ -s "$1" ]] && break
+        sleep 0.05
+    done
+    tr -cd '0-9' <"$1" 2>/dev/null || true
+}
+
 echo "[*] [3] Messages proxy translation"
 UP_PORT_FILE="${HARNESS_ROOT}/up-port"
 UP_BODY="${HARNESS_ROOT}/up-body.json"
@@ -235,11 +247,8 @@ open(port_file, "w", encoding="utf-8").write(str(server.server_address[1]))
 server.serve_forever()
 PY
 UP_PID=$!
-for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
-    [[ -s "${UP_PORT_FILE}" ]] && break
-    sleep 0.05
-done
-UP_PORT="$(tr -cd '0-9' <"${UP_PORT_FILE}")"
+HARNESS_BG_PIDS+=("$!")
+UP_PORT="$(wait_port_file "${UP_PORT_FILE}")"
 check "upstream fixture started" "yes" "$([[ -n "${UP_PORT}" ]] && echo yes || echo no)"
 
 CLIENT_TOKEN="client-token-abc"
@@ -249,11 +258,8 @@ KIMO_ANTHROPIC_PROXY_CLIENT="${CLIENT_TOKEN}" \
     python3 "${PROXY}" --upstream "http://127.0.0.1:${UP_PORT}" --wire chat --env-key UPSTREAM_KEY \
     --provider xai --port-file "${PORT_FILE}" --exit-with-pid "$$" >/dev/null 2>&1 &
 PROXY_PID=$!
-for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
-    [[ -s "${PORT_FILE}" ]] && break
-    sleep 0.05
-done
-PROXY_PORT="$(tr -cd '0-9' <"${PORT_FILE}")"
+HARNESS_BG_PIDS+=("$!")
+PROXY_PORT="$(wait_port_file "${PORT_FILE}")"
 REQ='{"model":"grok-4.7[1m]","max_tokens":32,"stream":true,"system":"be brief","messages":[{"role":"user","content":"hi"},{"role":"assistant","content":[{"type":"text","text":"ok"},{"type":"tool_use","id":"toolu_1","name":"Bash","input":{"command":"ls"}}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"file"}]}],"tools":[{"name":"Bash","description":"run","input_schema":{"type":"object","properties":{"command":{"type":"string"}}}}]}'
 sse="$(curl -sS -m 5 -X POST "http://127.0.0.1:${PROXY_PORT}/v1/messages" -H "x-api-key: ${CLIENT_TOKEN}" -H 'Content-Type: application/json' -d "${REQ}")"
 check_contains "sse has the text" "PONG" "${sse}"
@@ -302,11 +308,8 @@ KIMO_ANTHROPIC_PROXY_CLIENT="${CLIENT_TOKEN}" \
     python3 "${PROXY}" --upstream "http://127.0.0.1:${UP_PORT}" --wire chat --env-key UPSTREAM_KEY \
     --provider xai --port-file "${PORT_FILE}" --exit-with-pid "$$" >/dev/null 2>&1 &
 PROXY_PID=$!
-for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
-    [[ -s "${PORT_FILE}" ]] && break
-    sleep 0.05
-done
-PROXY_PORT="$(tr -cd '0-9' <"${PORT_FILE}")"
+HARNESS_BG_PIDS+=("$!")
+PROXY_PORT="$(wait_port_file "${PORT_FILE}")"
 err="$(curl -sS -m 5 -X POST "http://127.0.0.1:${PROXY_PORT}/v1/messages" -H "x-api-key: ${CLIENT_TOKEN}" -H 'Content-Type: application/json' -d '{"model":"m","max_tokens":4,"stream":false,"messages":[{"role":"user","content":"hi"}]}')"
 check_contains "upstream 401 is an authentication_error" "authentication_error" "${err}"
 check_contains "upstream message is forwarded" "bad key" "${err}"
@@ -324,11 +327,8 @@ KIMO_ANTHROPIC_PROXY_CLIENT="${CLIENT_TOKEN}" \
     python3 "${PROXY}" --upstream "http://127.0.0.1:${UP_PORT}" --wire responses --env-key UPSTREAM_KEY \
     --provider codex --port-file "${PORT_FILE}" --exit-with-pid "$$" >/dev/null 2>&1 &
 PROXY_PID=$!
-for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
-    [[ -s "${PORT_FILE}" ]] && break
-    sleep 0.05
-done
-PROXY_PORT="$(tr -cd '0-9' <"${PORT_FILE}")"
+HARNESS_BG_PIDS+=("$!")
+PROXY_PORT="$(wait_port_file "${PORT_FILE}")"
 sse="$(curl -sS -m 5 -X POST "http://127.0.0.1:${PROXY_PORT}/v1/messages" -H "x-api-key: ${CLIENT_TOKEN}" -H 'Content-Type: application/json' -d '{"model":"gpt-6.1-sol[1m]","max_tokens":16,"stream":true,"system":"sys","messages":[{"role":"user","content":"hi"}]}')"
 check_contains "responses sse text" "PONG" "${sse}"
 check_contains "responses sse tool" "Bash" "${sse}"
