@@ -272,6 +272,40 @@ rc=0
 live=$(KIMO_VLLM_BASE_URL="${BASE}" "${KIMO}" launch kimi --provider vllm 2>&1) || rc=$?
 check "a second launch still exits 0" 0 "${rc}"
 check "a second launch does not duplicate aliases" 4 "$(py 'len(doc["models"])')"
+check_contains "launch lists the served models" "vLLM models at ${BASE}" "${live}"
+check_contains "launch names the auto-selected model" "using vLLM model: ${LLAMA}" "${live}"
+
+echo "[5b] endpoint discovery when no base is configured"
+reset_kimi
+reset_log
+rc=0
+disc=$(KIMO_VLLM_BASE_URLS="http://127.0.0.1:1/v1, ${BASE}" \
+    "${KIMO}" launch kimi --provider vllm 2>&1) || rc=$?
+check "discovery launch exits 0" 0 "${rc}"
+check_contains "discovery reports the found base" "found a vLLM server at ${BASE}" "${disc}"
+check "discovery launches the served alias" "${PID}/${LLAMA}" "$(flag_val "${CAPTURE}" -m)"
+check "discovery registers the fixture base" "${BASE}" "$(py 'doc["providers"]["'"${PID}"'"]["base_url"]')"
+# An explicit base pins the endpoint; the fallback list must not override it.
+rc=0
+err=$(KIMO_VLLM_BASE_URL="http://127.0.0.1:1/v1" KIMO_VLLM_BASE_URLS="${BASE}" \
+    "${KIMO}" launch kimi --provider vllm 2>&1) || rc=$?
+check "an explicit base disables discovery" 1 "${rc}"
+check_contains "the error lists the pinned base" "http://127.0.0.1:1/v1" "${err}"
+
+echo "[5c] default fallback list and chat-model selection"
+cand_fns="$(sed -n '/^vllm_normalize_base()/,/^}/p' "${KIMO}")"$'\n'"$(sed -n '/^vllm_candidate_bases()/,/^}/p' "${KIMO}")"
+cands=$(bash -c "${cand_fns}; VLLM_BASE_URL_DEFAULT=http://127.0.0.1:8000/v1; vllm_candidate_bases")
+check_contains "default fallback includes :8000" "http://127.0.0.1:8000/v1" "${cands}"
+check_contains "default fallback includes the :18000 tunnel" "http://127.0.0.1:18000/v1" "${cands}"
+cands=$(KIMO_VLLM_BASE_URLS="10.0.0.9:9000, https://gpu.example:8443/v1" \
+    bash -c "${cand_fns}; vllm_candidate_bases")
+check_contains "KIMO_VLLM_BASE_URLS is normalized" "http://10.0.0.9:9000/v1" "${cands}"
+check_contains "KIMO_VLLM_BASE_URLS keeps https" "https://gpu.example:8443/v1" "${cands}"
+pick_fn="$(sed -n '/^vllm_pick_model()/,/^}/p' "${KIMO}")"
+pick=$(bash -c "${pick_fn}; vllm_pick_model '{\"data\":[{\"id\":\"intfloat/e5-embed\"},{\"id\":\"org/Chat-7B\"}]}'")
+check "an embedding id is skipped when a chat model is served" "org/Chat-7B" "${pick}"
+pick=$(bash -c "${pick_fn}; vllm_pick_model '{\"data\":[{\"id\":\"intfloat/e5-embed\"}]}'")
+check "an embedding-only server still yields an id" "intfloat/e5-embed" "${pick}"
 
 echo "[6] context cap, effort fallback, capability override, register-all"
 rc=0

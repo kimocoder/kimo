@@ -178,5 +178,136 @@ check_contains "launch xai uses XAI_AUTH_TOKEN env_key" 'env_key=\"XAI_AUTH_TOKE
 check_contains "launch xai masks oauth secret" 'XAI_AUTH_TOKEN <kept: real value, xAI key>' "${dry_xai}"
 check_not_contains "dry-run never exposes raw token" "${MOCK_GROK_ACCESS}" "${dry_xai}"
 
+echo "[*] [5] A stale grok-login JWT must not hide the live auth.json session"
+# exp 1600000000 is 2020. The shell copies of this are what cli-chat-proxy 401s
+# as reason=no auth context. The file token is the one from section [3].
+STALE_GROK_JWT="eyJhbGciOiJFUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJzdGFsZSIsImV4cCI6MTYwMDAwMDAwMH0.stale-sig"
+state_line=$(XAI_API_KEY="${STALE_GROK_JWT}" XAI_AUTH_TOKEN="${STALE_GROK_JWT}" \
+    GROK_HOME="${GROK_HOME}" python3 "${ROOT_DIR}/lib/kimo-grok.py" token-state)
+check "stale env does not hide a live session" "valid file no" "${state_line}"
+
+rc=0
+stale_dry=$(XAI_API_KEY="${STALE_GROK_JWT}" XAI_AUTH_TOKEN="${STALE_GROK_JWT}" \
+    "${KIMO}" launch claude --provider xai --dry-run 2>&1) || rc=$?
+check "stale env still launches from auth.json" 0 "${rc}"
+check_contains "stale env uses the CLI chat proxy" "host   : https://cli-chat-proxy.grok.com/v1" "${stale_dry}"
+check_contains "stale env is replaced by the session token" "secret : XAI_AUTH_TOKEN <kept: real value, xAI key>" "${stale_dry}"
+check_contains "the expired shell key is dropped" "secret : XAI_API_KEY <unset>" "${stale_dry}"
+check_not_contains "the stale jwt is never printed" "stale-sig" "${stale_dry}"
+check_not_contains "the live jwt is never printed" "mock-sig" "${stale_dry}"
+check "auth.json is not rewritten for a still-valid session" "${MOCK_GROK_ACCESS}" \
+    "$(jq -r '.. | objects | .key? // empty' "${GROK_HOME}/auth.json" | head -1)"
+
+echo "[*] [6] An expired grok-login session is refreshed before launch"
+EXPIRED_GROK_JWT="eyJhbGciOiJFUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJleHBpcmVkIiwiZXhwIjoxNjAwMDAwMDAwfQ.expired-sig"
+FRESH_GROK_JWT="eyJhbGciOiJFUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJmcmVzaCIsImV4cCI6MTg5MzQ1NjAwMH0.fresh-sig"
+cat > "${HARNESS_ROOT}/grok_token_endpoint.py" <<'PY'
+import sys
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs
+
+mode, port_file, log, fresh = sys.argv[1:5]
+
+
+class H(BaseHTTPRequestHandler):
+    def log_message(self, *_args):
+        return
+
+    def do_POST(self):
+        body = self.rfile.read(int(self.headers.get("Content-Length") or 0))
+        with open(log, "a", encoding="utf-8") as handle:
+            handle.write(body.decode() + "\n")
+        fields = parse_qs(body.decode())
+        if mode == "refuse" or fields.get("grant_type") != ["refresh_token"]:
+            status, reply = 400, b'{"error":"invalid_grant"}'
+        else:
+            status = 200
+            reply = (
+                '{"access_token":"' + fresh + '",'
+                '"refresh_token":"rotated-grok-refresh",'
+                '"expires_in":3600,"token_type":"Bearer"}'
+            ).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(reply)))
+        self.end_headers()
+        self.wfile.write(reply)
+
+
+server = ThreadingHTTPServer(("127.0.0.1", 0), H)
+with open(port_file, "w", encoding="utf-8") as handle:
+    handle.write(str(server.server_address[1]))
+server.serve_forever()
+PY
+GROK_PORT_FILE="${HARNESS_ROOT}/grok-token.port"
+GROK_TOKEN_LOG="${HARNESS_ROOT}/grok-token.log"
+: >"${GROK_TOKEN_LOG}"
+rm -f "${GROK_PORT_FILE}"
+harness_spawn python3 "${HARNESS_ROOT}/grok_token_endpoint.py" ok "${GROK_PORT_FILE}" "${GROK_TOKEN_LOG}" "${FRESH_GROK_JWT}"
+tries=0
+until [[ -s "${GROK_PORT_FILE}" ]]; do
+    ((tries++ < 100)) || { bad "grok token endpoint did not start"; exit 1; }
+    sleep 0.05
+done
+GROK_TOKEN_URL="http://127.0.0.1:$(<"${GROK_PORT_FILE}")/oauth2/token"
+
+cat > "${GROK_HOME}/auth.json" <<EOF
+{
+  "https://auth.x.ai::mock-client": {
+    "key": "${EXPIRED_GROK_JWT}",
+    "auth_mode": "oidc",
+    "email": "test-grok@example.com",
+    "oidc_client_id": "mock-client",
+    "refresh_token": "mock-grok-refresh",
+    "expires_at": "2020-09-13T12:26:40Z"
+  }
+}
+EOF
+chmod 600 "${GROK_HOME}/auth.json"
+
+rc=0
+renewed=$(XAI_API_KEY="${STALE_GROK_JWT}" XAI_AUTH_TOKEN="${STALE_GROK_JWT}" \
+    KIMO_GROK_TOKEN_URL="${GROK_TOKEN_URL}" \
+    "${KIMO}" launch claude --provider xai --dry-run 2>&1) || rc=$?
+check "an expired grok session still launches" 0 "${rc}"
+check_contains "the grok renewal is announced" "renewing it from auth.json" "${renewed}"
+check_contains "the renewed launch uses the CLI chat proxy" "host   : https://cli-chat-proxy.grok.com/v1" "${renewed}"
+check_contains "the renewed launch names the session env" "secret : XAI_AUTH_TOKEN " "${renewed}"
+check "auth.json holds the refreshed access token" "${FRESH_GROK_JWT}" \
+    "$(jq -r '.. | objects | .key? // empty' "${GROK_HOME}/auth.json" | head -1)"
+check "a rotated grok refresh token is stored" "rotated-grok-refresh" \
+    "$(jq -r '.. | objects | .refresh_token? // empty' "${GROK_HOME}/auth.json" | head -1)"
+check "auth.json stays owner-only" 600 "$(stat -c %a "${GROK_HOME}/auth.json")"
+check_contains "the refresh grant is what was posted" "grant_type=refresh_token" "$(cat "${GROK_TOKEN_LOG}")"
+check_contains "the stored OIDC client id is posted" "client_id=mock-client" "$(cat "${GROK_TOKEN_LOG}")"
+check_not_contains "the refresh token is never printed" "mock-grok-refresh" "${renewed}"
+check_not_contains "the refreshed access token is never printed" "fresh-sig" "${renewed}"
+check_not_contains "the expired access token is never printed" "expired-sig" "${renewed}"
+
+: >"${GROK_TOKEN_LOG}"
+KIMO_GROK_TOKEN_URL="${GROK_TOKEN_URL}" "${KIMO}" launch claude --provider xai --dry-run >/dev/null 2>&1
+check "a valid grok session is not refreshed again" 0 "$(wc -l < "${GROK_TOKEN_LOG}" | tr -d ' ')"
+
+cat > "${GROK_HOME}/auth.json" <<EOF
+{
+  "https://auth.x.ai::mock-client": {
+    "key": "${EXPIRED_GROK_JWT}",
+    "auth_mode": "oidc",
+    "oidc_client_id": "mock-client",
+    "refresh_token": "mock-grok-refresh",
+    "expires_at": "2020-09-13T12:26:40Z"
+  }
+}
+EOF
+rc=0
+offline=$(XAI_API_KEY="${STALE_GROK_JWT}" XAI_AUTH_TOKEN="${STALE_GROK_JWT}" \
+    KIMO_GROK_NO_REFRESH=1 KIMO_GROK_TOKEN_URL="${GROK_TOKEN_URL}" \
+    "${KIMO}" launch claude --provider xai --dry-run 2>&1) || rc=$?
+check "KIMO_GROK_NO_REFRESH leaves an expired session unusable" 1 "${rc}"
+check_contains "the offline error names the expiry" "expired" "${offline}"
+check "offline mode does not post the refresh token" 0 "$(wc -l < "${GROK_TOKEN_LOG}" | tr -d ' ')"
+check "offline mode keeps the stored access token" "${EXPIRED_GROK_JWT}" \
+    "$(jq -r '.. | objects | .key? // empty' "${GROK_HOME}/auth.json" | head -1)"
+
 echo
 harness_summary "token_providers"

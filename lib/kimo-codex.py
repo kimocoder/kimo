@@ -344,14 +344,35 @@ def default_model(home, config, which="codex"):
 EFFORT_RANK = ("none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra")
 
 
-def register_model(models, item, pid, alias):
+def positive_int(value):
+    return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+
+def catalog_context(item, override=None):
+    """The window kimi should register for this catalog item.
+
+    Codex's `context_window` is the default it compacts against, while
+    `max_context_window` is the ceiling it allows for a `model_context_window`
+    override. Kimi is a third-party client that can ask for that ceiling, so
+    the max is the honest default here; an explicit override is clamped to it.
+    """
+    ceiling = item.get("max_context_window")
+    ceiling = ceiling if positive_int(ceiling) else None
+    context = ceiling or item.get("context_window")
+    context = context if positive_int(context) else None
+    if positive_int(override):
+        return min(override, context) if context else override
+    return context
+
+
+def register_model(models, item, pid, alias, context_override=None):
     """Upsert one kimi models[alias] entry from a catalog item."""
     model = models.setdefault(alias, {})
     model["provider"] = pid
     model["model"] = item["slug"]
     model["display_name"] = item.get("display_name") or item["slug"]
-    context = item.get("context_window")
-    if isinstance(context, int) and not isinstance(context, bool) and context > 0:
+    context = catalog_context(item, context_override)
+    if context is not None:
         model["max_context_size"] = context
     caps = ["tool_use"]
     if "image" in (item.get("input_modalities") or []):
@@ -397,7 +418,7 @@ def prune_backups(config, keep_path):
             pass
 
 
-def sync(home, config, selected, as_json, which="codex"):
+def sync(home, config, selected, as_json, which="codex", context_override=None):
     import tomlkit
     # The caller holds KIMI_CONFIG_LOCK. Validate the whole document before
     # creating a backup or touching the original file.
@@ -420,18 +441,25 @@ def sync(home, config, selected, as_json, which="codex"):
     provider.pop("custom_headers", None)
     models = doc.setdefault("models", tomlkit.table())
     available = catalog(home)
+    # An explicit --ctx belongs to the model being launched, not to every alias
+    # a full-catalog sync touches. A sync with no model selected (the internal
+    # bulk form) applies it to the whole catalog.
+    selected_alias = selected
+    if selected_alias and not selected_alias.startswith(prefix):
+        selected_alias = prefix + selected_alias.removeprefix("codex/").removeprefix("openai/")
     for item in available:
-        register_model(models, item, pid, prefix + item["slug"])
+        alias = prefix + item["slug"]
+        override = context_override if not selected_alias or alias == selected_alias else None
+        register_model(models, item, pid, alias, override)
     if selected:
-        if selected not in models:
+        if selected_alias not in models:
             if available:
                 raise ValueError(f"Unknown Codex model '{selected}'; choose a model from the Codex catalog.")
             # No catalog to validate against: an explicitly requested model is
             # registered on its own, so '--provider openai --model gpt-x' works
             # on a box that has never run the Codex CLI.
-            if not selected.startswith(prefix):
-                selected = prefix + selected.removeprefix("codex/").removeprefix("openai/")
-            register_model(models, {"slug": selected.removeprefix(prefix)}, pid, selected)
+            register_model(models, {"slug": selected.removeprefix(prefix)}, pid, selected_alias, context_override)
+            selected = selected_alias
         doc["default_model"] = selected
     if not any(k.startswith(prefix) for k in models):
         raise ValueError("No cached Codex models. Start Codex once to populate $CODEX_HOME/models_cache.json.")
@@ -459,8 +487,12 @@ def sync(home, config, selected, as_json, which="codex"):
                 os.unlink(temp)
         if backup:
             prune_backups(config, backup)
+    selected_context = None
+    if selected_alias and selected_alias in models:
+        selected_context = models[selected_alias].get("max_context_size")
     result = {"config_file": str(config), "changed": changed, "backup": backup, "provider": pid,
-              "models": [k for k in models if k.startswith(prefix)], "default_model": doc.get("default_model")}
+              "models": [k for k in models if k.startswith(prefix)], "default_model": doc.get("default_model"),
+              "max_context_size": selected_context}
     if as_json:
         print(json.dumps(result))
     else:
@@ -482,13 +514,38 @@ def check_token():
         raise ValueError("Codex OAuth token has expired. Refresh it with 'kimo codex login' before using Kimi.")
 
 
+def parse_args(args):
+    """Split '--json' and the optional '--ctx N' from the positional argument."""
+    as_json = "--json" in args
+    context = None
+    positional = []
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        index += 1
+        if arg == "--json":
+            continue
+        if arg == "--ctx" or arg.startswith("--ctx="):
+            if arg == "--ctx":
+                if index >= len(args):
+                    raise ValueError("--ctx requires a token count.")
+                value = args[index]
+                index += 1
+            else:
+                value = arg.split("=", 1)[1]
+            if not value.isdigit() or int(value) <= 0:
+                raise ValueError(f"--ctx must be a positive integer (got {value!r}).")
+            context = int(value)
+            continue
+        positional.append(arg)
+    return positional[0] if positional else "", as_json, context
+
+
 def main():
     action = sys.argv[1]
     home = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
     config = Path(os.environ["KIMI_CONFIG"])
-    as_json = "--json" in sys.argv[2:]
-    positional = [a for a in sys.argv[2:] if a != "--json"]
-    argument = positional[0] if positional else ""
+    argument, as_json, context_override = parse_args(sys.argv[2:])
     if action == "status":
         status(home, config, as_json)
     elif action == "default-model":
@@ -502,7 +559,8 @@ def main():
     elif action == "check-token":
         check_token()
     elif action in ("sync", "sync-openai"):
-        sync(home, config, argument, as_json, "openai" if action == "sync-openai" else "codex")
+        sync(home, config, argument, as_json, "openai" if action == "sync-openai" else "codex",
+             context_override)
     else:
         raise ValueError(f"unknown action '{action}'")
 

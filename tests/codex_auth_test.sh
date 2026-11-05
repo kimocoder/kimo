@@ -59,6 +59,7 @@ export PATH="${FAKE_BIN}:${PATH}"
 cat > "${HOME}/.codex/models_cache.json" <<'JSON'
 {"models":[
   {"slug":"gpt-6.1-sol","display_name":"GPT-6.1-Sol","visibility":"list","context_window":500000,
+   "max_context_window":872000,
    "input_modalities":["text","image"],"default_reasoning_level":"low",
    "supported_reasoning_levels":[{"effort":"low"},{"effort":"high"}]},
   {"slug":"test-codex-text","context_window":32000,"input_modalities":["text"]},
@@ -249,8 +250,10 @@ forced=$(CODEX_AUTH_TOKEN="${MOCK_JWT}" "${KIMO}" launch codex --provider ollama
 check_contains "explicit Ollama wins over credentials and config" 'provider: ollama' "${forced}"
 "${KIMO}" config unset cloud_provider >/dev/null
 rc=0
-"${KIMO}" launch claude --provider codex --dry-run >/dev/null 2>&1 || rc=$?
-check "unsupported cloud CLI rejected" 1 "${rc}"
+claude_codex=$("${KIMO}" launch claude --provider codex --dry-run 2>/dev/null) || rc=$?
+check "claude accepts the codex backend" 0 "${rc}"
+check_contains "claude on codex names the provider" "provider: codex" "${claude_codex}"
+check_contains "claude on codex uses the responses proxy" "anthropic -> responses" "${claude_codex}"
 CODEX_API_KEY=fixture-api-secret CODEX_AUTH_TOKEN="${MOCK_JWT}" CODEX_ACCESS_TOKEN=fixture-access-secret \
     "${KIMO}" --host http://remote.kimo-test.invalid:9 launch codex --provider ollama --model test-local >/dev/null 2>&1
 for key in CODEX_API_KEY CODEX_AUTH_TOKEN CODEX_ACCESS_TOKEN; do
@@ -277,7 +280,8 @@ check "native routing never probes Ollama" no "$([[ -f "${CAPTURE}.curl" ]] && e
 rm "${FAKE_BIN}/curl"
 
 echo "[*] [7] Safe model sync and configurable paths"
-check "catalog context used" 500000 "$(python3 -c "import tomlkit; print(tomlkit.parse(open('${HOME}/.kimi-code/config.toml').read())['models']['codex/gpt-6.1-sol']['max_context_size'])")"
+check "catalog max_context_window used" 872000 "$(python3 -c "import tomlkit; print(tomlkit.parse(open('${HOME}/.kimi-code/config.toml').read())['models']['codex/gpt-6.1-sol']['max_context_size'])")"
+check "catalog context_window is the fallback" 32000 "$(python3 -c "import tomlkit; print(tomlkit.parse(open('${HOME}/.kimi-code/config.toml').read())['models']['codex/test-codex-text']['max_context_size'])")"
 check "reasoning codex models declare an off effort for kimi" low \
     "$(python3 -c "import tomlkit; print(tomlkit.parse(open('${HOME}/.kimi-code/config.toml').read())['models']['codex/gpt-6.1-sol']['off_effort'])")"
 check "non-reasoning codex models declare no off effort" absent \
@@ -341,6 +345,14 @@ check "symlink config rejected" 1 "${rc}"
 "${KIMO}" launch kimi --provider codex --model test-codex-text -- --print hi >/dev/null 2>&1
 check "Kimi launch syncs selected model" codex/test-codex-text \
     "$(python3 -c "import tomlkit; print(tomlkit.parse(open('${HOME}/.kimi-code/config.toml').read())['default_model'])")"
+"${KIMO}" launch kimi --provider codex --model test-codex-text --ctx 20000 -- --print hi >/dev/null 2>&1
+check "--ctx overrides the launched model window" 20000 \
+    "$(python3 -c "import tomlkit; print(tomlkit.parse(open('${HOME}/.kimi-code/config.toml').read())['models']['codex/test-codex-text']['max_context_size'])")"
+check "--ctx leaves other aliases alone" 872000 \
+    "$(python3 -c "import tomlkit; print(tomlkit.parse(open('${HOME}/.kimi-code/config.toml').read())['models']['codex/gpt-6.1-sol']['max_context_size'])")"
+"${KIMO}" launch kimi --provider codex --model test-codex-text --ctx 500000 -- --print hi >/dev/null 2>&1
+check "--ctx is clamped to the catalog ceiling" 32000 \
+    "$(python3 -c "import tomlkit; print(tomlkit.parse(open('${HOME}/.kimi-code/config.toml').read())['models']['codex/test-codex-text']['max_context_size'])")"
 mv "${HOME}/.codex" "${HOME}/alternate-codex"
 alternate=$(CODEX_HOME="${HOME}/alternate-codex" "${KIMO}" codex --json)
 check "status respects CODEX_HOME" true "$(jq -r '.auth_file_exists' <<<"${alternate}")"
@@ -584,9 +596,15 @@ dry=$(CODEX_HOME="${NO_OAUTH}" OPENAI_API_KEY="${PLATFORM_KEY}" "${KIMO}" launch
 check_contains "a lone platform key auto-selects the platform backend" "provider: openai" "${dry}"
 
 rc=0
-unsupported=$("${KIMO}" launch claude --provider openai --dry-run 2>&1) || rc=$?
-check "claude has no OpenAI backend branch" 1 "${rc}"
-check_contains "the rejection names the supported CLIs" "codex kimi" "${unsupported}"
+claude_openai=$(OPENAI_API_KEY="${PLATFORM_KEY}" "${KIMO}" launch claude --provider openai --dry-run 2>/dev/null) || rc=$?
+check "claude accepts the platform backend" 0 "${rc}"
+check_contains "claude on openai names the provider" "provider: openai" "${claude_openai}"
+check_contains "claude on openai uses the responses proxy" "anthropic -> responses" "${claude_openai}"
+check_not_contains "the claude dry run never prints the platform key" "${PLATFORM_KEY}" "${claude_openai}"
+rc=0
+still_closed=$("${KIMO}" launch qwen --provider openai --dry-run 2>&1) || rc=$?
+check "qwen still has no OpenAI backend" 1 "${rc}"
+check_contains "the rejection names claude as a supported CLI" "codex kimi claude" "${still_closed}"
 
 "${KIMO}" config set cloud_provider openai >/dev/null
 check "config accepts the openai backend" openai "$("${KIMO}" config get cloud_provider)"
