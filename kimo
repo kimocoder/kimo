@@ -9947,6 +9947,16 @@ _install_single_cli() {
                 fi
                 rm -rf "${tmp_dir}" 2>/dev/null || true
             fi
+            local installed_cs="${HOME:-/root}/.cyberstrike/bin/cyberstrike"
+            [[ ! -f "${installed_cs}" && -f "/usr/local/bin/cyberstrike" ]] && installed_cs="/usr/local/bin/cyberstrike"
+            if [[ -f "${installed_cs}" ]]; then
+                if [[ -n "${cur_bin}" && "${cur_bin}" != "${installed_cs}" && -w "${cur_bin}" ]]; then
+                    cp -f "${installed_cs}" "${cur_bin}" 2>/dev/null || true
+                elif [[ -w "/usr/local/bin" && ! -e "/usr/local/bin/cyberstrike" ]]; then
+                    ln -sf "${installed_cs}" "/usr/local/bin/cyberstrike" 2>/dev/null || true
+                fi
+            fi
+            hash -d cyberstrike 2>/dev/null || hash -r 2>/dev/null || true
             for _cs_dir in "${HOME:-/root}/.cyberstrike/bin" "${HOME:-/root}/.local/share/cyberstrike/bin" "/usr/local/bin"; do
                 [[ -d "${_cs_dir}" && ":${PATH}:" != *":${_cs_dir}:"* ]] && export PATH="${_cs_dir}:${PATH}"
             done
