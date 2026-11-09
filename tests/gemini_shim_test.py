@@ -1,15 +1,19 @@
 #!/usr/bin/env python3
-"""Contract tests for lib/ollama-gemini-shim.py against both upstream wires:
-a scripted Ollama /api/chat daemon, and a scripted OpenAI-compatible
-/chat/completions API shaped like Model Studio's compatible-mode surface.
+"""Contract tests for lib/ollama-gemini-shim.py against the upstream wires:
+a scripted Ollama /api/chat daemon, a scripted OpenAI-compatible
+/chat/completions API shaped like Model Studio's compatible-mode surface,
+and a scripted Responses /responses API shaped like the ChatGPT Codex route.
 
 Run: tests/lib/run-hermetic.sh python3 tests/gemini_shim_test.py
 """
 
 from __future__ import annotations
 
+import base64
 import importlib.util
 import json
+import os
+import tempfile
 import threading
 import unittest
 import urllib.error
@@ -720,6 +724,263 @@ class OpenAIShimTest(GeminiClientMixin, unittest.TestCase):
         with self.assertRaises(ValueError):
             shim.GeminiShimServer(("127.0.0.1", 0), "http://127.0.0.1:1", "d",
                                   upstream_kind="gemini")
+
+
+def _jwt(account: str) -> str:
+    def part(obj: dict) -> str:
+        raw = base64.urlsafe_b64encode(json.dumps(obj).encode()).decode().rstrip("=")
+        return raw
+    body = {"https://api.openai.com/auth": {"chatgpt_account_id": account}}
+    return part({"alg": "none"}) + "." + part(body) + ".sig"
+
+
+class ResponsesUpstream(BaseHTTPRequestHandler):
+    """Fake Responses server. SSE when the body asks to stream, else one JSON object."""
+
+    protocol_version = "HTTP/1.1"
+    requests: list = []
+    paths: list = []
+    headers: list = []
+
+    def log_message(self, format, *args):  # noqa: A002  # pylint: disable=redefined-builtin
+        pass
+
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length") or 0)
+        payload = json.loads(self.rfile.read(length))
+        ResponsesUpstream.requests.append(payload)
+        ResponsesUpstream.paths.append(self.path)
+        ResponsesUpstream.headers.append({
+            "authorization": self.headers.get("Authorization"),
+            "beta": self.headers.get("OpenAI-Beta"),
+            "originator": self.headers.get("originator"),
+            "version": self.headers.get("version"),
+            "session_id": self.headers.get("session_id"),
+            "session-id": self.headers.get("session-id"),
+            "user_agent": self.headers.get("User-Agent"),
+            "hint": self.headers.get("x-codex-routing-hint"),
+            "account": self.headers.get("Chatgpt-Account-Id"),
+            "lite": self.headers.get("x-openai-internal-codex-responses-lite"),
+            "residency": self.headers.get("x-openai-internal-codex-residency"),
+            "accept": self.headers.get("Accept"),
+        })
+        if payload.get("stream") is False:
+            body = json.dumps({
+                "status": "completed",
+                "output": [{"type": "message", "role": "assistant",
+                            "content": [{"type": "output_text", "text": "PONG"}]}],
+                "usage": {"input_tokens": 2, "output_tokens": 1},
+            }).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        events = "\n\n".join([
+            sse({"type": "response.reasoning_summary_text.delta", "delta": "think"}),
+            sse({"type": "response.output_text.delta", "delta": "PONG"}),
+            sse({"type": "response.output_item.added", "output_index": 1,
+                 "item": {"type": "function_call", "call_id": "call_9", "name": "Bash", "arguments": ""}}),
+            sse({"type": "response.function_call_arguments.delta", "output_index": 1,
+                 "delta": "{\"command\":\"ls\"}"}),
+            sse({"type": "response.completed",
+                 "response": {"status": "completed", "usage": {"input_tokens": 3, "output_tokens": 4}}}),
+        ]) + "\n\n"
+        raw = events.encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Content-Length", str(len(raw)))
+        self.end_headers()
+        self.wfile.write(raw)
+
+
+class ResponsesShimTest(GeminiClientMixin, unittest.TestCase):
+    """Responses kind, with and without the ChatGPT Codex header contract."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.upstream = serve(ThreadingHTTPServer(("127.0.0.1", 0), ResponsesUpstream))
+        origin = f"http://127.0.0.1:{cls.upstream.server_address[1]}"
+        cls.home = tempfile.TemporaryDirectory()
+        cache = {
+            "client_version": "9.9.9-test",
+            "models": [
+                {"slug": "gpt-6.1-sol", "display_name": "GPT-6.1-Sol", "visibility": "list",
+                 "default_reasoning_level": "medium", "use_responses_lite": False},
+                {"slug": "gpt-6.1-terra", "display_name": "GPT-6.1 Terra", "visibility": "list",
+                 "default_reasoning_level": "low", "use_responses_lite": True},
+                {"slug": "hidden", "visibility": "hide", "display_name": "Hidden"},
+            ],
+        }
+        os.makedirs(cls.home.name, exist_ok=True)
+        with open(os.path.join(cls.home.name, "models_cache.json"), "w", encoding="utf-8") as handle:
+            json.dump(cache, handle)
+        cls._prev_home = os.environ.get("CODEX_HOME")
+        os.environ["CODEX_HOME"] = cls.home.name
+        cls.token = _jwt("acc-agy")
+        cls.codex = serve(shim.GeminiShimServer(
+            ("127.0.0.1", 0), origin, "gpt-6.1-sol", upstream_token=cls.token,
+            upstream_kind="responses", codex=True))
+        cls.plain = serve(shim.GeminiShimServer(
+            ("127.0.0.1", 0), origin, "gpt-6.1-sol", upstream_kind="responses"))
+        cls.base = f"http://127.0.0.1:{cls.codex.server_address[1]}"
+        cls.plain_base = f"http://127.0.0.1:{cls.plain.server_address[1]}"
+
+    @classmethod
+    def tearDownClass(cls):
+        for server in (cls.codex, cls.plain, cls.upstream):
+            server.shutdown()
+            server.server_close()
+        if cls._prev_home is None:
+            os.environ.pop("CODEX_HOME", None)
+        else:
+            os.environ["CODEX_HOME"] = cls._prev_home
+        cls.home.cleanup()
+
+    def setUp(self):
+        ResponsesUpstream.requests = []
+        ResponsesUpstream.paths = []
+        ResponsesUpstream.headers = []
+
+    def test_a_non_jwt_token_omits_the_account_header(self):
+        headers = shim.codex_headers("codex-oauth-fixture", "gpt-6.1-sol",
+                                     version="0.167.0", session_id="abc", lite=False)
+        self.assertNotIn("Chatgpt-Account-Id", headers)
+        self.assertNotIn("x-openai-internal-codex-residency", headers)
+        self.assertEqual(headers["OpenAI-Beta"], "responses=experimental")
+        self.assertEqual(headers["originator"], "codex_cli_rs")
+        self.assertNotIn("responses_websockets", headers["OpenAI-Beta"])
+
+    def test_codex_turn_is_a_streaming_responses_post(self):
+        request = {
+            "systemInstruction": {"parts": [{"text": "sys"}]},
+            "contents": [
+                {"role": "user", "parts": [{"text": "hi"},
+                                           {"inlineData": {"mimeType": "image/png", "data": "iVBORw0K"}}]},
+                {"role": "model", "parts": [
+                    {"text": "ok"},
+                    {"functionCall": {"name": "Bash", "id": "call_1", "args": {"command": "ls"}}},
+                ]},
+                {"role": "user", "parts": [
+                    {"functionResponse": {"name": "Bash", "id": "call_1", "response": {"output": "file"}}},
+                ]},
+            ],
+            "tools": [{"functionDeclarations": [{
+                "name": "Bash", "description": "run",
+                "parameters": {"type": "OBJECT", "properties": {"command": {"type": "STRING"}}},
+            }]}],
+            "toolConfig": {"functionCallingConfig": {"mode": "ANY", "allowedFunctionNames": ["Bash"]}},
+            "generationConfig": {"maxOutputTokens": 16, "temperature": 0.2, "topK": 20},
+        }
+        status, body = self.post("/v1beta/models/gpt-6.1-sol:generateContent", request)
+        self.assertEqual(status, 200, body)
+        sent = ResponsesUpstream.requests[0]
+        headers = ResponsesUpstream.headers[0]
+        self.assertTrue(ResponsesUpstream.paths[0].endswith("/responses"), ResponsesUpstream.paths[0])
+        self.assertEqual(sent["model"], "gpt-6.1-sol")
+        self.assertIs(sent["stream"], True)
+        self.assertIs(sent["store"], False)
+        self.assertEqual(sent["instructions"], "sys")
+        self.assertIn("reasoning.encrypted_content", sent["include"])
+        self.assertEqual(sent["reasoning"], {"effort": "medium", "summary": "auto"})
+        self.assertNotIn("parallel_tool_calls", sent)
+        self.assertEqual(sent["max_output_tokens"], 16)
+        self.assertEqual(sent["temperature"], 0.2)
+        self.assertNotIn("top_k", sent)
+        self.assertEqual(sent["input"][0]["content"][0], {"type": "input_text", "text": "hi"})
+        self.assertEqual(sent["input"][0]["content"][1]["type"], "input_image")
+        self.assertEqual(sent["input"][1]["content"], [{"type": "output_text", "text": "ok"}])
+        self.assertEqual(sent["input"][2], {
+            "type": "function_call", "call_id": "call_1", "name": "Bash",
+            "arguments": '{"command": "ls"}'})
+        self.assertEqual(sent["input"][3]["type"], "function_call_output")
+        self.assertEqual(sent["input"][3]["call_id"], "call_1")
+        self.assertEqual(sent["tools"], [{
+            "type": "function", "name": "Bash", "description": "run",
+            "parameters": {"type": "object", "properties": {"command": {"type": "string"}}},
+        }])
+        self.assertEqual(sent["tool_choice"], {"type": "function", "name": "Bash"})
+        self.assertEqual(headers["authorization"], f"Bearer {self.token}")
+        self.assertEqual(headers["beta"], "responses=experimental")
+        self.assertEqual(headers["originator"], "codex_cli_rs")
+        self.assertEqual(headers["version"], "9.9.9-test")
+        self.assertEqual(headers["user_agent"], "codex_cli_rs/9.9.9-test")
+        self.assertEqual(headers["hint"], "model=gpt-6.1-sol")
+        self.assertEqual(headers["account"], "acc-agy")
+        self.assertTrue(headers["session_id"])
+        self.assertEqual(headers["session_id"], headers["session-id"])
+        self.assertEqual(headers["accept"], "text/event-stream")
+        self.assertIsNone(headers["lite"])
+        self.assertIsNone(headers["residency"])
+        parsed = json.loads(body)
+        parts = parsed["candidates"][0]["content"]["parts"]
+        self.assertEqual(parts[0], {"text": "think", "thought": True})
+        self.assertEqual(parts[1], {"text": "PONG"})
+        self.assertEqual(parts[2]["functionCall"]["name"], "Bash")
+        self.assertEqual(parts[2]["functionCall"]["args"], {"command": "ls"})
+        self.assertEqual(parsed["modelVersion"], "gpt-6.1-sol")
+        self.assertEqual(parsed["usageMetadata"]["promptTokenCount"], 3)
+        self.assertEqual(parsed["usageMetadata"]["candidatesTokenCount"], 4)
+
+    def test_display_name_resolves_to_the_catalog_slug(self):
+        status, body = self.post("/v1beta/models/GPT-6.1-Sol:generateContent", self.user())
+        self.assertEqual(status, 200, body)
+        self.assertEqual(ResponsesUpstream.requests[0]["model"], "gpt-6.1-sol")
+        self.assertEqual(ResponsesUpstream.headers[0]["hint"], "model=gpt-6.1-sol")
+        self.assertEqual(json.loads(body)["modelVersion"], "GPT-6.1-Sol")
+
+    def test_lite_models_get_the_lite_contract_only(self):
+        status, _ = self.post("/v1beta/models/gpt-6.1-terra:generateContent", self.user())
+        self.assertEqual(status, 200)
+        sent = ResponsesUpstream.requests[0]
+        headers = ResponsesUpstream.headers[0]
+        self.assertEqual(sent["model"], "gpt-6.1-terra")
+        self.assertEqual(sent["reasoning"]["effort"], "low")
+        self.assertEqual(sent["reasoning"]["context"], "all_turns")
+        self.assertIs(sent["parallel_tool_calls"], False)
+        self.assertEqual(sent["instructions"], "You are a coding assistant.")
+        self.assertEqual(headers["lite"], "true")
+        self.assertEqual(headers["hint"], "model=gpt-6.1-terra")
+        self.assertIsNone(headers["residency"])
+
+    def test_model_list_is_the_catalog_without_a_network_call(self):
+        with urllib.request.urlopen(self.base + "/v1beta/models", timeout=5) as resp:
+            names = [item["name"] for item in json.loads(resp.read())["models"]]
+        self.assertIn("models/gpt-6.1-sol", names)
+        self.assertIn("models/gpt-6.1-terra", names)
+        self.assertNotIn("models/hidden", names)
+        self.assertEqual(ResponsesUpstream.requests, [])
+
+    def test_plain_responses_does_not_send_codex_headers(self):
+        saved = self.base
+        self.base = self.plain_base
+        try:
+            status, body = self.post("/v1beta/models/gpt-6.1-sol:generateContent", self.user("hi"))
+        finally:
+            self.base = saved
+        self.assertEqual(status, 200, body)
+        sent = ResponsesUpstream.requests[0]
+        headers = ResponsesUpstream.headers[0]
+        self.assertIs(sent["stream"], False)
+        self.assertIs(sent["store"], False)
+        self.assertNotIn("include", sent)
+        self.assertNotIn("instructions", sent)
+        self.assertEqual(sent["input"][0]["content"][0]["text"], "hi")
+        self.assertIsNone(headers["originator"])
+        self.assertIsNone(headers["beta"])
+        self.assertIsNone(headers["account"])
+        self.assertIsNone(headers["lite"])
+        self.assertEqual(headers["user_agent"], "kimo-gemini-shim")
+        self.assertIsNone(headers["authorization"])
+        self.assertEqual(json.loads(body)["candidates"][0]["content"]["parts"], [{"text": "PONG"}])
+
+    def test_stream_relays_text(self):
+        status, body = self.post("/v1beta/models/gpt-6.1-sol:streamGenerateContent?alt=sse", self.user())
+        self.assertEqual(status, 200, body)
+        self.assertIn("PONG", body)
+        self.assertIn("Bash", body)
+        self.assertIs(ResponsesUpstream.requests[0]["stream"], True)
 
 
 if __name__ == "__main__":

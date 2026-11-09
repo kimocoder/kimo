@@ -449,7 +449,7 @@ def fetch_live_models(token: str, timeout: float = 6) -> list[tuple[str, str, in
             headers["X-Grok-Client-Version"] = "1.0.70"
         req = urllib.request.Request(url, headers=headers)
         try:
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:  # nosec B310
                 data = json.loads(resp.read().decode("utf-8"))
             res = []
             for item in data.get("data", []):

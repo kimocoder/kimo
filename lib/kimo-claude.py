@@ -367,7 +367,7 @@ def fetch_live_models(token: str, timeout: float = 10) -> list[tuple[str, str, i
         headers["x-api-key"] = token
     req = urllib.request.Request("https://api.anthropic.com/v1/models", headers=headers)
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:  # nosec B310
             data = json.loads(resp.read().decode("utf-8"))
         res = []
         for item in data.get("data", []):

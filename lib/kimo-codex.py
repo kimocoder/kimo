@@ -9,6 +9,7 @@ import json
 import math
 import os
 from pathlib import Path
+import re
 import shutil
 import stat
 import sys
@@ -541,10 +542,165 @@ def parse_args(args):
     return positional[0] if positional else "", as_json, context
 
 
+FALLBACK_CODEX_MODELS: list[tuple[str, str, str]] = [
+    ("gpt-6.1-sol", "GPT-6.1-Sol", "Latest workhorse model for coding and everyday work."),
+    ("gpt-6-astra", "GPT-6 Astra", "Deep reasoning frontier model."),
+    ("gpt-6.1-terra", "GPT-6.1 Terra", "Fast, lightweight reasoning model."),
+    ("gpt-6-sol", "GPT-6 Sol", "High-performance coding model."),
+    ("gpt-5.1-codex", "GPT-5.1 Codex", "Fast, lightweight coding model."),
+    ("gpt-5.1", "GPT-5.1", "Broad capabilities across text and code."),
+    ("gpt-4o", "GPT-4o", "Versatile flagship model."),
+    ("gpt-4o-mini", "GPT-4o mini", "Fast and affordable model for everyday tasks."),
+    ("o1", "o1", "Reasoning model designed for complex problems."),
+    ("o3-mini", "o3-mini", "Efficient reasoning model for code and math."),
+]
+
+COMPAT_ALIASES: list[str] = [
+    "claude-opus-5-5",
+    "opus-5.5",
+    "opus",
+    "claude-opus-4-8",
+    "claude-opus-5",
+    "claude-sonnet-5-5",
+    "claude-sonnet-4-5",
+    "claude-sonnet-5",
+    "sonnet",
+    "claude-3-5-haiku",
+    "claude-3-5-haiku-20241022",
+    "haiku",
+    "default",
+    "claude",
+]
+
+
+KIMO_PICKER_MARK = "kimo:codex"
+
+
+def bare_slug(model: str) -> str:
+    """Strip a kimo alias prefix and a Claude context suffix from a model id."""
+    text = (model or "").strip()
+    for prefix in ("codex/", "openai/", "claude-codex-"):
+        if text.startswith(prefix):
+            text = text[len(prefix):]
+    return re.sub(r"\[[^\[\]]+\]$", "", text).strip()
+
+
+def model_window(home: Path, model: str) -> int:
+    """Context window Codex records for a slug, else the Claude launch default."""
+    slug = bare_slug(model)
+    for item in catalog(home):
+        if item.get("slug") != slug:
+            continue
+        raw = item.get("context_window") or item.get("max_context_window") or 0
+        if isinstance(raw, int) and not isinstance(raw, bool) and raw > 0:
+            return raw
+    return 272000
+
+
+def populate_claude(home: Path, active_model: str = "") -> None:
+    """Add Codex slugs to the user-level Claude /model picker.
+
+    Only ~/.claude/settings.json (or $CLAUDE_CONFIG_DIR) is written. Project
+    settings ignore modelPicker, and availableModels is an allowlist: writing
+    one hid the catalog again the moment a session resumed on opus-5.5.
+    """
+    items = []
+    seen = set()
+    for entry in catalog(home):
+        slug = entry.get("slug")
+        if isinstance(slug, str) and slug and slug not in seen:
+            seen.add(slug)
+            items.append({
+                "slug": slug,
+                "display_name": entry.get("display_name") or slug,
+                "description": entry.get("description") or f"{slug} via codex",
+            })
+    for slug, name, desc in FALLBACK_CODEX_MODELS:
+        if slug not in seen:
+            seen.add(slug)
+            items.append({"slug": slug, "display_name": name, "description": desc})
+    if not items:
+        return
+
+    chosen = bare_slug(active_model)
+    items.sort(key=lambda item: 0 if item["slug"] == chosen else 1)
+    owned = {item["slug"] for item in items} | set(COMPAT_ALIASES)
+
+    claude_home = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude")
+    settings_file = claude_home / "settings.json"
+    try:
+        claude_home.mkdir(parents=True, exist_ok=True)
+        doc = {}
+        if settings_file.is_file():
+            try:
+                parsed = json.loads(settings_file.read_text(encoding="utf-8"))
+                if isinstance(parsed, dict):
+                    doc = parsed
+            except (OSError, json.JSONDecodeError):
+                doc = {}
+
+        picker = doc.get("modelPicker")
+        if not isinstance(picker, dict):
+            picker = {}
+        kept = []
+        known = set()
+        raw_options = picker.get("options")
+        if isinstance(raw_options, list):
+            for opt in raw_options:
+                if not isinstance(opt, dict) or not isinstance(opt.get("model"), str):
+                    continue
+                if opt.get("kimo") == KIMO_PICKER_MARK or opt["model"] in owned:
+                    continue
+                kept.append(opt)
+                known.add(opt["model"])
+        for item in items:
+            slug = item["slug"]
+            if slug in known:
+                continue
+            kept.append({
+                "model": slug,
+                "label": item["display_name"],
+                "description": item["description"],
+                "kimo": KIMO_PICKER_MARK,
+            })
+            known.add(slug)
+        picker["options"] = kept
+        picker.setdefault("replaceBuiltInOptions", False)
+        doc["modelPicker"] = picker
+
+        existing_available = doc.get("availableModels")
+        if (
+            isinstance(existing_available, list)
+            and existing_available
+            and all(isinstance(entry, str) and entry in owned for entry in existing_available)
+            and any(entry not in COMPAT_ALIASES for entry in existing_available)
+        ):
+            doc.pop("availableModels", None)
+
+        fd, temp = tempfile.mkstemp(prefix=f"{settings_file.name}.", dir=str(claude_home))
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump(doc, handle, indent=2)
+                handle.write("\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.chmod(temp, 0o600)
+            os.replace(temp, settings_file)
+        finally:
+            if os.path.exists(temp):
+                try:
+                    os.unlink(temp)
+                except OSError:
+                    pass
+    except OSError:
+        return
+
+
 def main():
     action = sys.argv[1]
     home = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
-    config = Path(os.environ["KIMI_CONFIG"])
+    config_path = os.environ.get("KIMI_CONFIG")
+    config = Path(config_path) if config_path else (Path.home() / ".kimi-code" / "config.toml")
     argument, as_json, context_override = parse_args(sys.argv[2:])
     if action == "status":
         status(home, config, as_json)
@@ -561,6 +717,10 @@ def main():
     elif action in ("sync", "sync-openai"):
         sync(home, config, argument, as_json, "openai" if action == "sync-openai" else "codex",
              context_override)
+    elif action == "claude-populate":
+        populate_claude(home, argument)
+    elif action == "model-window":
+        print(model_window(home, argument))
     else:
         raise ValueError(f"unknown action '{action}'")
 

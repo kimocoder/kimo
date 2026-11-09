@@ -144,7 +144,10 @@ cat > "${FAKE_BIN}/claude" <<'SH'
     printf '%s\n' "$@"
     printf 'ENV\n'
     for key in ANTHROPIC_BASE_URL ANTHROPIC_API_BASE ANTHROPIC_AUTH_TOKEN ANTHROPIC_API_KEY \
-        ANTHROPIC_MODEL ANTHROPIC_DEFAULT_HAIKU_MODEL XAI_API_KEY CLAUDE_CODE_MAX_CONTEXT_TOKENS; do
+        ANTHROPIC_MODEL ANTHROPIC_DEFAULT_OPUS_MODEL ANTHROPIC_DEFAULT_HAIKU_MODEL \
+        ANTHROPIC_DEFAULT_SONNET_MODEL ANTHROPIC_DEFAULT_FABLE_MODEL \
+        CLAUDE_CODE_SUBAGENT_MODEL CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY \
+        XAI_API_KEY CLAUDE_CODE_MAX_CONTEXT_TOKENS; do
         printf '%s=%s\n' "${key}" "${!key-<unset>}"
     done
 } > "${CLAUDE_PROVIDERS_CAPTURE:?}"
@@ -162,6 +165,19 @@ check "live ANTHROPIC_API_KEY is unset" "<unset>" "$(env_val "${CAPTURE}" ANTHRO
 check "live haiku tier stays on the launched model" "grok-4.7" "$(env_val "${CAPTURE}" ANTHROPIC_DEFAULT_HAIKU_MODEL)"
 check "live keeps the upstream key for the proxy" "${XAI_KEY}" "$(env_val "${CAPTURE}" XAI_API_KEY)"
 check "live context window" "500000" "$(env_val "${CAPTURE}" CLAUDE_CODE_MAX_CONTEXT_TOKENS)"
+
+rc=0
+PATH="${FAKE_BIN}:${PATH}" \
+    ANTHROPIC_DEFAULT_OPUS_MODEL="claude-opus-5-5" \
+    CODEX_AUTH_TOKEN="${CODEX_TOKEN}" \
+    "${KIMO}" launch claude --provider codex --model codex/gpt-6.1-sol >/dev/null || rc=$?
+check "live codex launch execs claude" 0 "${rc}"
+check "live codex model flag is the slug" "gpt-6.1-sol" "$(flag_val "${CAPTURE}" --model)"
+check "stale opus pin is replaced with the codex slug" "gpt-6.1-sol" "$(env_val "${CAPTURE}" ANTHROPIC_DEFAULT_OPUS_MODEL)"
+check "haiku tier is the codex slug" "gpt-6.1-sol" "$(env_val "${CAPTURE}" ANTHROPIC_DEFAULT_HAIKU_MODEL)"
+check "fable tier is the codex slug" "gpt-6.1-sol" "$(env_val "${CAPTURE}" ANTHROPIC_DEFAULT_FABLE_MODEL)"
+check "gateway model discovery is enabled" "1" "$(env_val "${CAPTURE}" CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY)"
+check "codex launch base is loopback" "http://127.0.0.1:" "$(env_val "${CAPTURE}" ANTHROPIC_BASE_URL | cut -c1-17)"
 
 # Print the port a background server wrote to <file>, waiting up to 10s.
 # Prints nothing on timeout so the caller's check fails instead of set -e
@@ -197,6 +213,9 @@ class H(BaseHTTPRequestHandler):
             self.headers.get("x-goog-api-key") or "",
             self.headers.get("Chatgpt-Account-Id") or "",
             self.headers.get("X-Grok-Client-Version") or "",
+            self.headers.get("originator") or "",
+            self.headers.get("OpenAI-Beta") or "",
+            self.headers.get("x-codex-routing-hint") or "",
         ]))
         hits = int(open(hits_file, encoding="utf-8").read().strip() or "0") + 1
         open(hits_file, "w", encoding="utf-8").write(str(hits))
@@ -342,17 +361,117 @@ path, auth, goog, account, grok = lines[:5]
 assert path.endswith("/responses"), path
 assert payload["model"] == "gpt-6.1-sol", payload["model"]
 assert payload["store"] is False, payload["store"]
+assert payload["stream"] is True, payload["stream"]
 assert payload["instructions"] == "sys", payload
 assert payload["max_output_tokens"] == 16, payload
+assert "reasoning.encrypted_content" in payload["include"], payload
 assert account == "acc-123", account
 assert auth.startswith("Bearer "), auth
 print("responses-ok")
 PY
 )"
 check "responses translation" "responses-ok" "${responses_ok}"
+codex_headers="$(python3 - "${UP_META}" <<'PY'
+import sys
+lines = open(sys.argv[1], encoding="utf-8").read().splitlines()
+assert len(lines) >= 8, lines
+assert lines[5] == "codex_cli_rs", lines[5]
+assert lines[6] == "responses=experimental", lines[6]
+assert lines[7] == "model=gpt-6.1-sol", lines[7]
+print("codex-headers-ok")
+PY
+)"
+check "codex upstream gets originator and OpenAI-Beta" "codex-headers-ok" "${codex_headers}"
+
+probe="$(curl -sS -m 5 -X POST "http://127.0.0.1:${PROXY_PORT}/v1/messages" -H "x-api-key: ${CLIENT_TOKEN}" -H 'Content-Type: application/json' -d '{"model":"gpt-6.1-sol","max_tokens":1,"stream":false,"messages":[{"role":"user","content":"hi"}]}')"
+check_contains "a non-stream model probe still returns the text" "PONG" "${probe}"
+probe_stream="$(python3 -c 'import json,sys; print("yes" if json.load(open(sys.argv[1]))["stream"] is True else "no")' "${UP_BODY}")"
+check "a non-stream probe is streamed upstream" "yes" "${probe_stream}"
+lite="$(python3 - "${PROXY}" <<'PY'
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("anthropic_proxy", sys.argv[1])
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+out = {"model": "gpt-6.1-sol", "instructions": "sys", "stream": True, "store": False}
+mod._apply_codex_request(out, [{
+    "slug": "gpt-6.1-sol",
+    "default_reasoning_level": "low",
+    "use_responses_lite": True,
+}])
+assert out["instructions"] == "sys", out
+assert out["reasoning"]["effort"] == "low", out
+assert out["reasoning"]["context"] == "all_turns", out
+assert out["parallel_tool_calls"] is False, out
+print("lite-ok")
+PY
+)"
+check "responses-lite models get the lite contract" "lite-ok" "${lite}"
+
+models="$(curl -sS -m 5 "http://127.0.0.1:${PROXY_PORT}/v1/models?limit=1000" -H "x-api-key: ${CLIENT_TOKEN}")"
+models_ok="$(python3 - "${models}" <<'PY'
+import json, sys
+data = json.loads(sys.argv[1])["data"]
+ids = [item["id"] for item in data]
+assert "gpt-6.1-sol" in ids, ids
+assert "claude-codex-gpt-6.1-sol" in ids, ids
+print("models-ok")
+PY
+)"
+check "models list publishes the codex slug and a discovery alias" "models-ok" "${models_ok}"
+
+MODEL_BODY="${HARNESS_ROOT}/model-body.json"
+one="$(curl -sS -m 5 -o "${MODEL_BODY}" -w '%{http_code}' "http://127.0.0.1:${PROXY_PORT}/v1/models/gpt-6.1-sol" -H "x-api-key: ${CLIENT_TOKEN}")"
+check "model retrieve is 200" "200" "${one}"
+check "model retrieve echoes the requested id" "gpt-6.1-sol" "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["id"])' "${MODEL_BODY}")"
+
+alias_sse="$(curl -sS -m 5 -X POST "http://127.0.0.1:${PROXY_PORT}/v1/messages" -H "x-api-key: ${CLIENT_TOKEN}" -H 'Content-Type: application/json' -d '{"model":"opus-5.5","max_tokens":8,"stream":true,"messages":[{"role":"user","content":"hi"}]}')"
+check_contains "an opus alias still streams" "PONG" "${alias_sse}"
+alias_model="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["model"])' "${UP_BODY}")"
+check "opus-5.5 is rewritten to the catalog slug" "gpt-6.1-sol" "${alias_model}"
+
+doubled="$(curl -sS -m 5 -o /dev/null -w '%{http_code}' -X POST "http://127.0.0.1:${PROXY_PORT}/v1/v1/messages" -H "x-api-key: ${CLIENT_TOKEN}" -H 'Content-Type: application/json' -d '{"model":"gpt-6.1-sol","max_tokens":8,"stream":true,"messages":[{"role":"user","content":"hi"}]}')"
+check "a doubled /v1 prefix is not a 404" "200" "${doubled}"
 
 kill "${PROXY_PID}" "${UP_PID}" 2>/dev/null || true
 wait "${PROXY_PID}" "${UP_PID}" 2>/dev/null || true
+
+echo "[*] [4] User picker lists Codex slugs and does not keep an allowlist"
+PICKER_DIR="${HARNESS_ROOT}/claude-config"
+mkdir -p "${PICKER_DIR}"
+cat > "${PICKER_DIR}/settings.json" <<'JSON'
+{
+  "permissions": {"allow": ["Bash(ls)"]},
+  "availableModels": ["gpt-6.1-sol", "opus"],
+  "modelPicker": {"options": [{"model": "my-custom", "label": "Mine"}]}
+}
+JSON
+CLAUDE_CONFIG_DIR="${PICKER_DIR}" CODEX_HOME="${HOME}/.codex" \
+    python3 "${ROOT_DIR}/lib/kimo-codex.py" claude-populate gpt-6.1-sol
+picker_ok="$(python3 - "${PICKER_DIR}/settings.json" <<'PY'
+import json, sys
+doc = json.load(open(sys.argv[1], encoding="utf-8"))
+assert "availableModels" not in doc, doc.get("availableModels")
+assert doc["permissions"]["allow"] == ["Bash(ls)"]
+options = doc["modelPicker"]["options"]
+models = [opt["model"] for opt in options]
+assert models[0] == "my-custom", models
+assert "gpt-6.1-sol" in models, models
+row = next(opt for opt in options if opt["model"] == "gpt-6.1-sol")
+assert row["label"] == "gpt-6.1-sol" or row["label"]
+assert row["kimo"] == "kimo:codex"
+print("picker-ok")
+PY
+)"
+check "picker keeps user rows and drops the codex allowlist" "picker-ok" "${picker_ok}"
+# The fixture catalog has no display_name, so the label falls back to the slug.
+# A display name from the cache is what /model shows.
+cat > "${HOME}/.codex/models_cache.json" <<'JSON'
+{"models":[{"slug":"gpt-6.1-sol","display_name":"GPT-6.1-Sol","visibility":"list","context_window":500000}]}
+JSON
+check "catalog window is the model's context_window" "500000" \
+    "$(CODEX_HOME="${HOME}/.codex" python3 "${ROOT_DIR}/lib/kimo-codex.py" model-window gpt-6.1-sol)"
+dry_ctx="$(CODEX_AUTH_TOKEN="${CODEX_TOKEN}" "${KIMO}" launch claude --provider codex --dry-run)"
+check_contains "dry-run context follows the catalog window" "context: 500000 tokens" "${dry_ctx}"
 
 echo
 harness_summary "claude_providers_test"

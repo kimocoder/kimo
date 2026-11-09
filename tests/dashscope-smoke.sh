@@ -19,6 +19,10 @@
 #     never sees that key, and its settings are restored afterwards
 #   * provider 'alibaba' routes to freetier-managed [providers.alibaba] with
 #     500,000 context by default and syncs config.toml max_context_size
+#   * 'launch claude --provider alibaba' uses that same block through the
+#     localhost Messages proxy (chat/completions upstream). The stored key
+#     is not exported to claude. Keyed '--provider dashscope' still has no
+#     freetier fallback.
 #
 #
 # Usage: tests/dashscope-smoke.sh
@@ -329,6 +333,211 @@ check "live alibaba launch synced max_context_size in config.toml" "500000" "${g
 check "config accepts alibaba" "alibaba" "$("${KIMO}" config get cloud_provider)"
 dry_cfg=$(KIMI_CONFIG="${ALI_CONFIG}" "${KIMO}" launch kimi --dry-run)
 check_contains "configured backend alibaba is used" "provider: alibaba" "${dry_cfg}"
+"${KIMO}" config unset cloud_provider >/dev/null
+
+echo "[*] [11] Claude on the free-tier block (same models as kimi)"
+# The upstream is a loopback OpenAI fixture. Nothing in this section may
+# call the real Model Studio host.
+ALI_KEY="sk-ws-fixture-claude-ali"
+harness_fake_ollama --openai-models deepseek-v4.1-flash-1017,qwen3-coder-flash-2025-07-28,real-wire-id \
+    --openai-bearer "${ALI_KEY}" --openai-chat PONG
+ALI_UP_LOG="${FAKE_OLLAMA_LOG}"
+CLAUDE_ALI_CONFIG="${HARNESS_ROOT}/ali-claude/config.toml"
+mkdir -p "$(dirname "${CLAUDE_ALI_CONFIG}")"
+cat > "${CLAUDE_ALI_CONFIG}" <<TOML
+default_model = "alibaba/deepseek-v4.1-flash-1017"
+[providers.alibaba]
+type = "openai"
+base_url = "${FAKE_OLLAMA_URL}/v1"
+api_key = "${ALI_KEY}"
+[models."alibaba/deepseek-v4.1-flash-1017"]
+provider = "alibaba"
+model = "deepseek-v4.1-flash-1017"
+max_context_size = 131072
+max_output_size = 32768
+[models."alibaba/qwen3-coder-flash-2025-07-28"]
+provider = "alibaba"
+model = "qwen3-coder-flash-2025-07-28"
+max_context_size = 131072
+max_output_size = 32768
+[models."alibaba/alias-only"]
+provider = "alibaba"
+model = "real-wire-id"
+max_context_size = 131072
+max_output_size = 32768
+TOML
+
+rc=0
+missing=$("${KIMO}" launch claude --provider alibaba --dry-run 2>&1) || rc=$?
+check "claude alibaba without a freetier block fails" 1 "${rc}"
+check_contains "the missing-block error names the free-tier model" "free-tier model" "${missing}"
+
+NOKEY_CONFIG="${HARNESS_ROOT}/ali-nokey/config.toml"
+mkdir -p "$(dirname "${NOKEY_CONFIG}")"
+cat > "${NOKEY_CONFIG}" <<'TOML'
+default_model = "alibaba/deepseek-v4.1-flash-1017"
+[providers.alibaba]
+type = "openai"
+base_url = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
+[models."alibaba/deepseek-v4.1-flash-1017"]
+provider = "alibaba"
+model = "deepseek-v4.1-flash-1017"
+max_context_size = 131072
+TOML
+rc=0
+nokey_ali=$(KIMI_CONFIG="${NOKEY_CONFIG}" "${KIMO}" launch claude --provider alibaba --dry-run 2>&1) || rc=$?
+check "claude alibaba without a stored credential fails" 1 "${rc}"
+check_contains "the missing-credential error names providers.alibaba" "[providers.alibaba]" "${nokey_ali}"
+
+dry_claude=$(KIMI_CONFIG="${CLAUDE_ALI_CONFIG}" "${KIMO}" launch claude --provider alibaba --dry-run)
+check_contains "claude alibaba provider is alibaba" "provider: alibaba" "${dry_claude}"
+check_contains "claude alibaba default wire id is the bare slug" "model  : deepseek-v4.1-flash-1017" "${dry_claude}"
+check_contains "claude alibaba context is 500000" "context: 500000 tokens" "${dry_claude}"
+check_contains "claude alibaba wire is the messages proxy" "wire   : anthropic -> chat (${FAKE_OLLAMA_URL}/v1)" "${dry_claude}"
+check_contains "claude alibaba argv passes the bare slug" "argv   : claude --model deepseek-v4.1-flash-1017" "${dry_claude}"
+check_contains "claude alibaba note keeps the key out of claude" "not exported to claude" "${dry_claude}"
+check_not_contains "dry-run does not print the stored key" "${ALI_KEY}" "${dry_claude}"
+
+dry_ctx=$(KIMI_CONFIG="${CLAUDE_ALI_CONFIG}" "${KIMO}" launch claude --provider alibaba --ctx 12345 --dry-run)
+check_contains "--ctx overrides claude alibaba context" "context: 12345 tokens" "${dry_ctx}"
+
+dry_explicit=$(KIMI_CONFIG="${CLAUDE_ALI_CONFIG}" "${KIMO}" launch claude --provider alibaba -m alibaba/qwen3-coder-flash-2025-07-28 --dry-run)
+check_contains "explicit alibaba alias becomes the wire id" "model  : qwen3-coder-flash-2025-07-28" "${dry_explicit}"
+
+dry_bare=$(KIMI_CONFIG="${CLAUDE_ALI_CONFIG}" "${KIMO}" launch claude --provider alibaba -m deepseek-v4.1-flash-1017 --dry-run)
+check_contains "bare model name stays the wire id" "model  : deepseek-v4.1-flash-1017" "${dry_bare}"
+
+dry_field=$(KIMI_CONFIG="${CLAUDE_ALI_CONFIG}" "${KIMO}" launch claude --provider alibaba -m alibaba/alias-only --dry-run)
+check_contains "the config model field is the wire id" "model  : real-wire-id" "${dry_field}"
+
+dry_hijack=$(DASHSCOPE_API_KEY="sk-hijack-not-freetier" KIMI_CONFIG="${CLAUDE_ALI_CONFIG}" \
+    "${KIMO}" launch claude --provider alibaba --dry-run)
+check_contains "an env key does not switch alibaba onto the opus tier" "model  : deepseek-v4.1-flash-1017" "${dry_hijack}"
+check_not_contains "an env key does not switch alibaba onto apps/anthropic" "apps/anthropic" "${dry_hijack}"
+check_contains "an env key still uses the free-tier chat proxy" "wire   : anthropic -> chat (${FAKE_OLLAMA_URL}/v1)" "${dry_hijack}"
+check_not_contains "dry-run masks the unused env key" "sk-hijack-not-freetier" "${dry_hijack}"
+
+cat > "${FAKE_BIN}/claude" <<'SH'
+#!/usr/bin/env bash
+out="${DASHSCOPE_TEST_CAPTURE:?}"
+argv=("$@")
+model=""
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --model) model="${2:-}"; shift 2 ;;
+        *) shift ;;
+    esac
+done
+answer=""
+answer_opus=""
+model_meta=""
+base="${ANTHROPIC_BASE_URL-}"
+token="${ANTHROPIC_AUTH_TOKEN-}"
+if [[ -n "${base}" && -n "${token}" && -n "${model}" ]]; then
+    ns=$(jq -nc --arg m "alibaba/${model}" '{model:$m,max_tokens:16,stream:false,messages:[{role:"user",content:"hi"}]}')
+    op=$(jq -nc '{model:"opus",max_tokens:16,stream:false,messages:[{role:"user",content:"hi"}]}')
+    answer="$(curl -sS -m 20 -X POST "${base}/v1/messages" \
+        -H 'Content-Type: application/json' -H "x-api-key: ${token}" -d "${ns}" || true)"
+    answer_opus="$(curl -sS -m 20 -X POST "${base}/v1/messages" \
+        -H 'Content-Type: application/json' -H "x-api-key: ${token}" -d "${op}" || true)"
+    model_meta="$(curl -sS -m 20 "${base}/v1/models/${model}" -H "x-api-key: ${token}" || true)"
+fi
+{
+    printf 'ARGV\n'
+    printf '%s\n' "${argv[@]}"
+    printf 'ENV\n'
+    for key in ANTHROPIC_BASE_URL ANTHROPIC_API_BASE ANTHROPIC_AUTH_TOKEN ANTHROPIC_API_KEY ANTHROPIC_MODEL \
+        ANTHROPIC_DEFAULT_HAIKU_MODEL ANTHROPIC_DEFAULT_SONNET_MODEL ANTHROPIC_DEFAULT_OPUS_MODEL \
+        ANTHROPIC_DEFAULT_FABLE_MODEL CLAUDE_CODE_SUBAGENT_MODEL CLAUDE_CODE_MAX_CONTEXT_TOKENS \
+        KIMO_ALIBABA_API_KEY KIMO_CLAUDE_CATALOG_CTX DASHSCOPE_API_KEY MODELSTUDIO_API_KEY; do
+        printf '%s=%s\n' "${key}" "${!key-<unset>}"
+    done
+    printf 'ANSWER=%s\n' "${answer}"
+    printf 'ANSWER_OPUS=%s\n' "${answer_opus}"
+    printf 'MODEL_META=%s\n' "${model_meta}"
+} > "${out}"
+exit 0
+SH
+chmod +x "${FAKE_BIN}/claude"
+
+: >"${ALI_UP_LOG}"
+KIMI_CONFIG="${CLAUDE_ALI_CONFIG}" "${KIMO}" launch claude --provider alibaba >/dev/null 2>&1
+check "live claude alibaba argv is the bare slug" "deepseek-v4.1-flash-1017" "$(flag_val "${CAPTURE}" --model)"
+check "live claude alibaba sets ANTHROPIC_MODEL" "deepseek-v4.1-flash-1017" "$(env_val "${CAPTURE}" ANTHROPIC_MODEL)"
+check_match "live claude points at the loopback proxy" '^http://127\.0\.0\.1:[0-9]+$' "$(env_val "${CAPTURE}" ANTHROPIC_BASE_URL)"
+check "live claude proxy is not the upstream itself" "different" \
+    "$([[ "$(env_val "${CAPTURE}" ANTHROPIC_BASE_URL)" == "${FAKE_OLLAMA_URL}" ]] && echo same || echo different)"
+check "live claude context is 500000" "500000" "$(env_val "${CAPTURE}" CLAUDE_CODE_MAX_CONTEXT_TOKENS)"
+check "haiku pin is the launched slug" "deepseek-v4.1-flash-1017" "$(env_val "${CAPTURE}" ANTHROPIC_DEFAULT_HAIKU_MODEL)"
+check "sonnet pin is the launched slug" "deepseek-v4.1-flash-1017" "$(env_val "${CAPTURE}" ANTHROPIC_DEFAULT_SONNET_MODEL)"
+check "opus pin is the launched slug" "deepseek-v4.1-flash-1017" "$(env_val "${CAPTURE}" ANTHROPIC_DEFAULT_OPUS_MODEL)"
+check "fable pin is the launched slug" "deepseek-v4.1-flash-1017" "$(env_val "${CAPTURE}" ANTHROPIC_DEFAULT_FABLE_MODEL)"
+check "subagents use the launched slug" "deepseek-v4.1-flash-1017" "$(env_val "${CAPTURE}" CLAUDE_CODE_SUBAGENT_MODEL)"
+check "claude alibaba leaves x-api-key unset" "<unset>" "$(env_val "${CAPTURE}" ANTHROPIC_API_KEY)"
+check "the inline key is not exported to claude" "<unset>" "$(env_val "${CAPTURE}" KIMO_ALIBABA_API_KEY)"
+check "catalog ctx knob is not exported to claude" "<unset>" "$(env_val "${CAPTURE}" KIMO_CLAUDE_CATALOG_CTX)"
+check "DASHSCOPE_API_KEY is not given to claude" "<unset>" "$(env_val "${CAPTURE}" DASHSCOPE_API_KEY)"
+client_token="$(env_val "${CAPTURE}" ANTHROPIC_AUTH_TOKEN)"
+check "claude's bearer is not the stored key" "no" "$([[ "${client_token}" == "${ALI_KEY}" || -z "${client_token}" ]] && echo yes || echo no)"
+check_not_contains "the capture never contains the stored key" "${ALI_KEY}" "$(<"${CAPTURE}")"
+check_contains "a namespaced id is answered" "PONG" "$(env_val "${CAPTURE}" ANSWER)"
+check_contains "the namespaced response echoes the id claude sent" "alibaba/deepseek-v4.1-flash-1017" "$(env_val "${CAPTURE}" ANSWER)"
+check_contains "an opus alias is answered on the free-tier model" "PONG" "$(env_val "${CAPTURE}" ANSWER_OPUS)"
+check_contains "model metadata reports the free-tier window" '"context_window": 500000' "$(env_val "${CAPTURE}" MODEL_META)"
+check_contains "upstream saw chat/completions" "POST /v1/chat/completions" "$(<"${ALI_UP_LOG}")"
+check_contains "upstream was asked for the bare slug" '"model":"deepseek-v4.1-flash-1017"' "$(<"${ALI_UP_LOG}")"
+check_not_contains "upstream was not asked for opus" '"model":"opus"' "$(<"${ALI_UP_LOG}")"
+check_not_contains "upstream was not asked for the alibaba/ alias" '"model":"alibaba/deepseek-v4.1-flash-1017"' "$(<"${ALI_UP_LOG}")"
+got_ctx="$(python3 -c "import tomlkit; doc = tomlkit.parse(open('${CLAUDE_ALI_CONFIG}').read()); print(doc.get('models', {}).get('alibaba/deepseek-v4.1-flash-1017', {}).get('max_context_size', ''))")"
+check "claude launch does not rewrite kimi max_context_size" "131072" "${got_ctx}"
+got_key="$(python3 -c "import tomlkit; doc = tomlkit.parse(open('${CLAUDE_ALI_CONFIG}').read()); print(doc.get('providers', {}).get('alibaba', {}).get('api_key', ''))")"
+check "claude launch does not rewrite the stored key" "${ALI_KEY}" "${got_key}"
+if [[ -f "${HOME}/.claude/settings.json" ]]; then
+    bad "claude alibaba wrote user settings"
+else
+    ok "claude alibaba does not write user settings"
+fi
+proxy_base="$(env_val "${CAPTURE}" ANTHROPIC_BASE_URL)"
+proxy_dead=0
+for _try in 1 2 3 4 5 6 7 8 9 10; do
+    if ! curl -sS -m 1 -o /dev/null "${proxy_base}/v1/models" >/dev/null 2>&1; then
+        proxy_dead=1
+        break
+    fi
+    sleep 0.3
+done
+check "messages proxy stopped after claude exited" 1 "${proxy_dead}"
+
+ENV_CONFIG="${HARNESS_ROOT}/ali-envkey/config.toml"
+mkdir -p "$(dirname "${ENV_CONFIG}")"
+cat > "${ENV_CONFIG}" <<TOML
+default_model = "alibaba/qwen3-coder-flash-2025-07-28"
+[providers.alibaba]
+type = "openai"
+base_url = "${FAKE_OLLAMA_URL}/v1"
+api_key_env = "DASHSCOPE_API_KEY"
+[models."alibaba/qwen3-coder-flash-2025-07-28"]
+provider = "alibaba"
+model = "qwen3-coder-flash-2025-07-28"
+max_context_size = 131072
+TOML
+: >"${ALI_UP_LOG}"
+DASHSCOPE_API_KEY="${ALI_KEY}" KIMI_CONFIG="${ENV_CONFIG}" "${KIMO}" launch claude --provider alibaba >/dev/null 2>&1
+check "api_key_env launch uses the model field" "qwen3-coder-flash-2025-07-28" "$(env_val "${CAPTURE}" ANTHROPIC_MODEL)"
+check "api_key_env is not left in claude's environment" "<unset>" "$(env_val "${CAPTURE}" DASHSCOPE_API_KEY)"
+check_contains "api_key_env still reaches the upstream" '"model":"qwen3-coder-flash-2025-07-28"' "$(<"${ALI_UP_LOG}")"
+check_contains "api_key_env turn is answered" "PONG" "$(env_val "${CAPTURE}" ANSWER)"
+unset DASHSCOPE_API_KEY
+
+rc=0
+empty_env=$(KIMI_CONFIG="${ENV_CONFIG}" "${KIMO}" launch claude --provider alibaba --dry-run 2>&1) || rc=$?
+check "an empty api_key_env fails" 1 "${rc}"
+check_contains "the empty api_key_env error names the variable" "DASHSCOPE_API_KEY" "${empty_env}"
+
+"${KIMO}" config set cloud_provider alibaba >/dev/null
+dry_cfg_claude=$(KIMI_CONFIG="${CLAUDE_ALI_CONFIG}" "${KIMO}" launch claude --dry-run)
+check_contains "configured backend alibaba launches claude on the free tier" "provider: alibaba" "${dry_cfg_claude}"
+check_contains "configured backend keeps the bare slug" "model  : deepseek-v4.1-flash-1017" "${dry_cfg_claude}"
 "${KIMO}" config unset cloud_provider >/dev/null
 
 echo

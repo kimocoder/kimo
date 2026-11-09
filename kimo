@@ -358,6 +358,8 @@ CODEX_CLAUDE_CTX="${KIMO_CODEX_CTX:-272000}"
 # CLIs whose launch branch knows how to reach either OpenAI backend.
 # claude speaks Anthropic /v1/messages, so it rides the localhost messages
 # proxy (Responses upstream) instead of Codex's native -c overlays.
+# agy is not listed: it speaks Gemini, and only the ChatGPT Codex backend
+# (not the metered platform) is wired, through the loopback shim.
 OPENAI_CLIS="codex kimi claude"
 
 # Alibaba Model Studio's international OpenAI-compatible surface, selected
@@ -543,7 +545,7 @@ _kimo_responses_proxy_start() {
 # process cannot spend the upstream key. The proxy exits when this process's
 # pid disappears, which remains true after exec replaces the shell with Claude.
 _kimo_anthropic_proxy_start() {
-    local upstream="$1" wire="$2" env_key="$3" client_token="$4" provider="${5:-}"
+    local upstream="$1" wire="$2" env_key="$3" client_token="$4" provider="${5:-}" model="${6:-}"
     local helper port_file port waited
     if [[ "${wire}" != chat && "${wire}" != responses ]]; then
         echo "${C_RED}Error: internal: claude proxy wire must be chat or responses.${C_RESET}" >&2
@@ -562,6 +564,7 @@ _kimo_anthropic_proxy_start() {
         --exit-with-pid "$$"
         --provider "${provider}"
     )
+    [[ -n "${model}" ]] && proxy_cmd+=(--model "${model}")
     [[ -n "${env_key}" ]] && proxy_cmd+=(--env-key "${env_key}")
     KIMO_ANTHROPIC_PROXY_CLIENT="${client_token}" "${proxy_cmd[@]}" >/dev/null 2>&1 &
     waited=0
@@ -592,6 +595,92 @@ _hosted_key_var() {
         return 0
     done
     return 1
+}
+
+# OpenAI wire id, base URL, and credential for one free-tier alias in kimi's
+# config. Prints four lines: wire id, base URL, "inline" or "env", then the
+# key or the env-var name. Exit 2 when the base URL is unusable, 1 when the
+# provider block cannot authenticate. The key is not a safe argv value; the
+# caller keeps an inline key in memory and hands it to the messages proxy
+# through the environment.
+# Args: <alias or bare slug>
+_kimi_alibaba_wire() {
+    local default_base="${KIMI_FT_BASE_URL_DEFAULT:-https://dashscope-intl.aliyuncs.com/compatible-mode/v1}"
+    python3 - "${KIMI_CONFIG}" "$1" "${default_base}" <<'PY'
+import re
+import sys
+
+path, want, default_base = sys.argv[1:]
+try:
+    import tomlkit
+    with open(path, encoding="utf-8") as fh:
+        doc = tomlkit.parse(fh.read())
+except (OSError, ValueError, ImportError):
+    sys.exit(1)
+
+providers = doc.get("providers") or {}
+models = doc.get("models") or {}
+if not isinstance(providers, dict):
+    sys.exit(1)
+if not isinstance(models, dict):
+    models = {}
+
+alias = want.strip()
+if alias and "/" not in alias:
+    alias = "alibaba/" + alias
+
+entry = models.get(alias)
+provider_name = "alibaba"
+wire = ""
+if isinstance(entry, dict):
+    named = entry.get("provider")
+    if isinstance(named, str) and named.strip():
+        provider_name = named.strip()
+    model = entry.get("model")
+    if isinstance(model, str) and model.strip():
+        wire = model.strip()
+if not wire:
+    for prefix in ("alibaba/", "modelscope/"):
+        if alias.startswith(prefix):
+            wire = alias[len(prefix):]
+            break
+if not wire or any(ch.isspace() for ch in wire) or any(ch in wire for ch in "\"'"):
+    sys.exit(1)
+
+prov = providers.get(provider_name)
+if not isinstance(prov, dict) and provider_name != "alibaba":
+    prov = providers.get("alibaba")
+if not isinstance(prov, dict):
+    sys.exit(1)
+
+base = prov.get("base_url") or default_base
+if not isinstance(base, str) or not base.strip():
+    base = default_base
+base = base.strip().rstrip("/")
+if not re.fullmatch(r"https?://\S+", base):
+    sys.exit(2)
+
+def env_ok(name: object) -> bool:
+    return isinstance(name, str) and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name) is not None
+
+api_key = prov.get("api_key") if isinstance(prov.get("api_key"), str) else ""
+env_name = prov.get("api_key_env") if isinstance(prov.get("api_key_env"), str) else ""
+api_key = api_key.strip()
+env_name = env_name.strip()
+# Some configs store the secret itself in api_key_env.
+if env_name and not env_ok(env_name) and not api_key:
+    api_key = env_name
+    env_name = ""
+if any(ch in api_key for ch in "\r\n"):
+    sys.exit(1)
+if api_key:
+    mode, cred = "inline", api_key
+elif env_ok(env_name):
+    mode, cred = "env", env_name
+else:
+    sys.exit(1)
+sys.stdout.write(wire + "\n" + base + "\n" + mode + "\n" + cred + "\n")
+PY
 }
 
 # First freetier-managed kimi alias with remaining free quota: default_model
@@ -813,7 +902,7 @@ ${C_YELLOW}Supported CLIs (${0##*/} launch):${C_RESET}
   ${C_BOLD}claude${C_RESET}      Anthropic Claude Code CLI via OpenAI-compatible endpoint bridge
   ${C_BOLD}grok${C_RESET}        Grok Build TUI; dynamically injects model endpoint and context_window
   ${C_BOLD}kimi${C_RESET}        Kimi Code CLI; configures host provider, model alias & /effort levels
-  ${C_BOLD}agy${C_RESET}         Google Antigravity CLI; spawns transient Gemini-to-Ollama wire shim
+  ${C_BOLD}agy${C_RESET}         Google Antigravity CLI; Gemini shim to Ollama, DashScope, or Codex
   ${C_BOLD}codex${C_RESET}       OpenAI Codex CLI routed to local/remote Ollama backend
   ${C_BOLD}qwen${C_RESET}        Qwen Code CLI routed to local/remote Ollama backend
   ${C_BOLD}opencode${C_RESET}    OpenCode AI assistant routed to Ollama models
@@ -1455,17 +1544,19 @@ claude_window_model() {
     printf '%s\n' "${id}"
 }
 
-# Model id Claude should send for an OpenAI catalog backend. An explicit
+# Model id a client should send for an OpenAI catalog backend. An explicit
 # --model is stripped of the codex/ and openai/ alias prefixes. Otherwise the
 # first listed catalog model is used; an Ollama preset is not a wire id.
-# Prints the bare slug. Args: <codex|openai> <true|false explicit> <want> <preset>
+# Prints the bare slug.
+# Args: <codex|openai> <true|false explicit> <want> <preset> [cli name]
 _claude_take_catalog_model() {
-    local backend="$1" explicit="$2" want="$3" preset="$4" slug=""
+    local backend="$1" explicit="$2" want="$3" preset="$4" who="${5:-claude}" slug=""
     if [[ "${explicit}" == true && -n "${want}" && "${want}" != claude \
-        && "${want}" != openai && "${want}" != codex && "${want}" != "${preset}" ]]; then
+        && "${want}" != openai && "${want}" != codex && "${want}" != "${preset}" \
+        && "${want}" != agy ]]; then
         slug="${want}"
     elif ! slug=$(_codex_helper default-model "${backend}" 2>/dev/null); then
-        echo "${C_RED}Error: '--provider ${backend}' needs a model for claude, and no Codex catalog is cached.${C_RESET}" >&2
+        echo "${C_RED}Error: '--provider ${backend}' needs a model for ${who}, and no Codex catalog is cached.${C_RESET}" >&2
         echo "${C_DIM}    Pass --model <id>, or start Codex once so ${CODEX_HOME}/models_cache.json exists.${C_RESET}" >&2
         return 1
     fi
@@ -1475,6 +1566,20 @@ _claude_take_catalog_model() {
         return 1
     fi
     printf '%s\n' "${slug}"
+}
+
+# Context window Claude should assume for a Codex catalog slug. An unrecognized
+# id is 200K unless CLAUDE_CODE_MAX_CONTEXT_TOKENS says otherwise, and a resumed
+# transcript that is already past 200K then fails compaction. Prints a positive
+# integer. Args: <slug>
+_claude_catalog_ctx() {
+    local ctx=""
+    ctx=$(_codex_helper model-window "$1" 2>/dev/null || true)
+    if [[ "${ctx}" =~ ^[1-9][0-9]*$ ]]; then
+        printf '%s\n' "${ctx}"
+        return 0
+    fi
+    printf '%s\n' "${CODEX_CLAUDE_CTX}"
 }
 
 # Record how this launch points Claude Code at a hosted provider.
@@ -5835,9 +5940,10 @@ cmd_sync() {
 # --model alone therefore does nothing: agy rejects the unknown id with a
 # warning and quietly runs a Google model instead, while this script's banner
 # claims an Ollama model and host. A per-session shim translates the Gemini
-# wire format to /api/chat against whichever host the model resolved to, or to
-# /chat/completions when the host is a hosted OpenAI-compatible API instead
-# ('--provider dashscope': Model Studio exposes no Gemini endpoint).
+# wire format to /api/chat against whichever host the model resolved to, to
+# /chat/completions for a hosted OpenAI-compatible API ('--provider dashscope':
+# Model Studio exposes no Gemini endpoint), or to /responses for the ChatGPT
+# Codex route ('--provider codex'), which serves neither of those paths.
 AGY_SETTINGS="${AGY_SETTINGS:-${HOME:-/root}/.gemini/antigravity-cli/settings.json}"
 GEMINI_SHIM_PATHS=(
     "${KIMO_GEMINI_SHIM:-}"
@@ -5996,12 +6102,13 @@ agy_cleanup() {
 # neither wait on it nor kill it, and every launch would leak a listener.
 #
 # <kind> is the wire the upstream speaks: 'ollama' (default) posts /api/chat,
-# 'openai' posts /chat/completions, which is how a hosted OpenAI-compatible
-# API such as Model Studio is reached. <token_var> names the environment
-# variable holding that API's key; the value reaches the shim by environment
-# and is never expanded into argv or exported to agy.
+# 'openai' posts /chat/completions (Model Studio), 'responses' posts /responses
+# (ChatGPT Codex). <token_var> names the environment variable holding that
+# API's key. <codex_mode> 1 tells the shim to send the Codex headers; the
+# value reaches the shim by environment and is never expanded into argv or
+# exported to agy.
 agy_start_shim() {
-    local shim="$1" upstream="$2" model="$3" kind="${4:-ollama}" token_var="${5:-}" tries=0
+    local shim="$1" upstream="$2" model="$3" kind="${4:-ollama}" token_var="${5:-}" codex_mode="${6:-0}" tries=0
     # An ambient KIMO_SHIM_UPSTREAM_TOKEN still works for a token-protected
     # Ollama bridge; a provider key named by <token_var> takes over.
     local upstream_token="${KIMO_SHIM_UPSTREAM_TOKEN:-}"
@@ -6019,10 +6126,21 @@ agy_start_shim() {
     if [[ -z "${AGY_SHIM_KEY}" || "${AGY_SHIM_KEY}" == ollama ]]; then
         AGY_SHIM_KEY=$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))') || return 1
     fi
-    # Environment, not argv: argv is world-readable in /proc and ps. The
-    # assignment prefix scopes both to this process alone, so agy inherits
-    # neither the session key nor the provider credential.
-    KIMO_SHIM_CLIENT_KEY="${AGY_SHIM_KEY}" KIMO_SHIM_UPSTREAM_TOKEN="${upstream_token}" \
+    # Environment, not argv: argv is world-readable in /proc and ps. env
+    # scopes the assignments to the shim process, so agy inherits neither the
+    # session key nor the provider credential. The Codex token is removed
+    # from the shim as well; the shim reads it only from the assignment below.
+    local -a shim_env=(
+        "KIMO_SHIM_CLIENT_KEY=${AGY_SHIM_KEY}"
+        "KIMO_SHIM_UPSTREAM_TOKEN=${upstream_token}"
+    )
+    if [[ "${codex_mode}" == 1 ]]; then
+        # CODEX_HOME is a shell variable when kimo filled in the default; pass
+        # the resolved path so the shim can read models_cache.json.
+        shim_env+=("KIMO_SHIM_CODEX=1" "CODEX_HOME=${CODEX_HOME}")
+    fi
+    env -u CODEX_AUTH_TOKEN -u CODEX_API_KEY -u CODEX_ACCESS_TOKEN \
+        "${shim_env[@]}" \
         python3 -u "${shim}" --host 127.0.0.1 --port 0 \
         --upstream "${upstream}" --upstream-kind "${kind}" \
         --default-model "${model}" --print-port \
@@ -7052,6 +7170,9 @@ ${C_YELLOW}Cloud Provider: OpenAI (--provider codex | --provider openai):${C_RES
   /v1/messages proxy that posts {base}/responses upstream. Claude receives a
   per-launch token for that proxy; the real key stays in OPENAI_API_KEY or
   CODEX_AUTH_TOKEN. Without --model, claude uses the first catalog slug.
+  agy speaks Gemini, so '--provider codex' starts the loopback shim in its
+  Responses mode and registers the catalog slug as a custom model. The token
+  stays in the shim. '--provider openai' is not wired for agy.
 
   Neither backend probes hosts, resolves Ollama tags, evicts models or applies
   tune settings - there is no VRAM to manage. Set \$KIMO_CODEX_NO_REFRESH=1 to
@@ -7081,8 +7202,13 @@ ${C_YELLOW}Cloud Provider: DashScope (--provider dashscope):${C_RESET}
   override); claude defaults to 'auto'. With no usable env key at all, kimi
   falls back to the freetier-managed [providers.alibaba] aliases (free-quota
   models, kimi's own stored credential) - 'bl auth login --console' plus
-  '${0##*/} freetier' keeps that block fresh. Like every hosted backend it
-  skips host probing, Ollama tag resolution, eviction and tune settings.
+  '${0##*/} freetier' keeps that block fresh. 'launch claude --provider alibaba'
+  uses that same block: Claude Code speaks /v1/messages, so a localhost proxy
+  posts {base}/chat/completions and the stored key is not exported to claude.
+  Context is ${ALIBABA_DEFAULT_CTX} (--ctx or \$KIMO_ALIBABA_CTX). Keyed
+  '--provider dashscope' for claude does not fall back to that block. Like
+  every hosted backend it skips host probing, Ollama tag resolution, eviction
+  and tune settings.
 
 ${C_YELLOW}Self-hosted: vLLM (--provider vllm):${C_RESET}
   An OpenAI-compatible vLLM server, not an Ollama daemon. Wired for
@@ -7169,12 +7295,14 @@ ${C_YELLOW}CLI Integration Mechanics:${C_RESET}
                 for the duration of the session, then cleanly restored on exit.
                 Against Ollama the shim translates to /api/chat; with '--provider dashscope'
                 it translates to /chat/completions on the Model Studio surface instead and
-                carries that provider's key upstream itself.
+                carries that provider's key upstream itself. With '--provider codex' it
+                posts {base}/responses (stream, store false, Codex headers) and holds
+                CODEX_AUTH_TOKEN itself.
                 GEMINI_API_KEY is never scrubbed: it is the shim's own session key rather
                 than a provider credential, and it only ever reaches the loopback shim, so
                 no secret leaves this box. A provider key is passed to the shim by
                 environment and unset before agy starts - a Google client is never handed
-                an Alibaba credential it has no use for.
+                an Alibaba or ChatGPT credential it has no use for.
                 The shim answers only requests carrying that key (a random one per
                 session when GEMINI_API_KEY is unset), so other local processes can't use it.
   ${C_BOLD}grok${C_RESET}         Grok Build takes no endpoint flag; its catalog and inference are directed
@@ -7202,9 +7330,10 @@ ${C_YELLOW}CLI Integration Mechanics:${C_RESET}
                 remote/LAN/tunnel hosts get a placeholder ('ollama') so the secret never
                 leaves this box. API_TIMEOUT_MS is left untouched (claude defaults to 600000 ms).
                 Hosted providers that are not already Anthropic-compatible (openai, codex,
-                xai, qwencloud, gemini, vllm) go through a localhost /v1/messages proxy.
-                '--provider anthropic' uses Anthropic's own API. DashScope and abliteration
-                keep their Anthropic-compatible bases and do not use the proxy.
+                xai, qwencloud, gemini, vllm, alibaba) go through a localhost /v1/messages proxy.
+                '--provider anthropic' uses Anthropic's own API. Keyed DashScope and abliteration
+                keep their Anthropic-compatible bases and do not use the proxy. '--provider alibaba'
+                uses the same free-tier models as kimi; that block is an OpenAI chat endpoint.
   ${C_BOLD}codex${C_RESET}        Ollama uses --oss --local-provider ollama. Hosted Responses providers
                 (dashscope, qwencloud, xai, anthropic) are -c model_providers overlays
                 with wire_api=responses; ChatGPT and the platform API stay native.
@@ -7319,8 +7448,10 @@ ${C_YELLOW}Examples:${C_RESET}
   ${0##*/} launch kimi --provider dashscope --model qwen3-coder-plus
   ${0##*/} launch claude --provider dashscope            ${C_DIM}# Anthropic wire on /apps/anthropic${C_RESET}
   ${0##*/} launch kimi --provider dashscope              ${C_DIM}# no env key: rides kimi's freetier block${C_RESET}
+  ${0##*/} launch claude --provider alibaba             ${C_DIM}# same free-tier models, via the messages proxy${C_RESET}
   ${0##*/} launch codex --provider dashscope             ${C_DIM}# Responses wire, default qwen3.8-max${C_RESET}
   ${0##*/} launch agy --provider dashscope               ${C_DIM}# Gemini wire via the shim's OpenAI mode${C_RESET}
+  ${0##*/} launch agy --provider codex                  ${C_DIM}# Gemini wire via the shim's Responses mode${C_RESET}
 
   ${C_DIM}# vLLM (OpenAI-compatible server, default http://127.0.0.1:8000/v1)${C_RESET}
   ${0##*/} launch kimi --provider vllm
@@ -7515,6 +7646,9 @@ cmd_launch() {
     # key, and the OpenAI-surface base URL. Ollama routing leaves them empty.
     local ablit_key="" ablit_ctx="" ablit_openai_url="" ablit_caps="" ablit_efforts=""
     local dashscope_key=""
+    # Inline free-tier secret from kimi's [providers.alibaba]. Exported only
+    # for the messages proxy process, then dropped before exec claude.
+    local alibaba_inline_key=""
     # vLLM: OpenAI base (already including /v1), optional bearer, and the
     # served-model catalogue captured before dry-run returns. vllm_wire is
     # empty when the launch must ask /v1/models which id to use.
@@ -7526,12 +7660,17 @@ cmd_launch() {
     local codex_mp_id="" codex_mp_name="" codex_mp_base="" codex_mp_env="" codex_mp_ctx=""
     # Set when Claude Code should talk to a hosted provider. native is
     # Anthropic's own Messages API. chat and responses go through the localhost
-    # proxy. Empty for Ollama, abliteration and DashScope (those have their own
-    # Anthropic-compatible bases).
+    # proxy. Empty for Ollama, abliteration and keyed DashScope (those have
+    # their own Anthropic-compatible bases). Alibaba free-tier for claude is
+    # chat: the kimi block is an OpenAI /chat/completions endpoint.
     local claude_wire="" claude_up_base="" claude_key_var="" claude_ctx=""
 
     if openai_backend "${cloud_provider}"; then
-        if [[ " ${OPENAI_CLIS} " != *" ${provider} "* ]]; then
+        # agy speaks only Gemini. Codex models reach it through the loopback
+        # shim's Responses kind. The metered platform (--provider openai) is a
+        # different surface and stays unwired for agy.
+        if [[ " ${OPENAI_CLIS} " != *" ${provider} "* \
+            && ! ( "${cloud_provider}" == codex && "${provider}" == agy ) ]]; then
             echo "${C_RED}Error: '--provider ${cloud_provider}' supports ${OPENAI_CLIS}; '${provider}' has no OpenAI launch branch yet.${C_RESET}" >&2
             echo "${C_DIM}    Those CLIs are wired for a self-hosted Ollama host. Drop --provider to route '${provider}' to Ollama.${C_RESET}" >&2
             return 1
@@ -7567,7 +7706,7 @@ cmd_launch() {
             elif [[ "${provider}" == claude ]]; then
                 resolved_model=$(_claude_take_catalog_model openai "${opt_model_explicit}" "${target_model}" "${DEFAULT_MODELS[claude]:-}") || return 1
                 _claude_use responses "${active_host%/}/v1" OPENAI_API_KEY \
-                    "${opt_launch_ctx:-${OPENAI_CLAUDE_CTX}}" || return 1
+                    "${opt_launch_ctx:-$(_claude_catalog_ctx "${resolved_model}")}" || return 1
             else
                 _codex_warn_chatgpt_login
                 if ! ${opt_model_explicit} && [[ "${target_model}" != openai/* ]]; then
@@ -7590,7 +7729,11 @@ cmd_launch() {
             elif [[ "${provider}" == claude ]]; then
                 resolved_model=$(_claude_take_catalog_model codex "${opt_model_explicit}" "${target_model}" "${DEFAULT_MODELS[claude]:-}") || return 1
                 _claude_use responses "${active_host%/}" CODEX_AUTH_TOKEN \
-                    "${opt_launch_ctx:-${CODEX_CLAUDE_CTX}}" || return 1
+                    "${opt_launch_ctx:-$(_claude_catalog_ctx "${resolved_model}")}" || return 1
+            elif [[ "${provider}" == agy ]]; then
+                # agy rejects an unregistered --model, so this cannot be left
+                # empty the way the Codex CLI's own launch is.
+                resolved_model=$(_claude_take_catalog_model codex "${opt_model_explicit}" "${target_model}" "${DEFAULT_MODELS[agy]:-}" agy) || return 1
             else
                 if ! ${opt_model_explicit} && [[ "${target_model}" != codex/* ]]; then
                     # Let Codex resolve its own model/profile and stored login.
@@ -7620,22 +7763,65 @@ cmd_launch() {
             dashscope_env="${dashscope_var}"
             break
         done
-        if [[ "${provider}" == kimi && ( "${cloud_provider}" == "alibaba" || "${provider_selected}" == "alibaba" ) ]]; then
-            # Provider alibaba explicitly targets Kimi's managed [providers.alibaba] block
+        if [[ ( "${provider}" == kimi || "${provider}" == claude ) && ( "${cloud_provider}" == "alibaba" || "${provider_selected}" == "alibaba" ) ]]; then
+            # Provider alibaba explicitly targets Kimi's managed [providers.alibaba] block.
+            # kimi speaks that OpenAI surface natively. claude does not, so it
+            # rides the localhost Messages proxy; the stored key never reaches
+            # claude's environment. A DashScope env key does not switch this
+            # path onto the pay-as-you-go Anthropic surface.
             dashscope_surface="freetier"
             active_host="${KIMI_FT_BASE_URL_DEFAULT}"
+            local ft_alias=""
             if ${opt_model_explicit}; then
-                resolved_model="${target_model}"
-                if [[ "${resolved_model}" != */* ]]; then
-                    resolved_model="alibaba/${resolved_model}"
+                ft_alias="${target_model}"
+                if [[ "${ft_alias}" != */* ]]; then
+                    ft_alias="alibaba/${ft_alias}"
                 fi
-            elif ! resolved_model=$(_kimi_freetier_alias); then
-                resolved_model=""
+            elif ! ft_alias=$(_kimi_freetier_alias); then
+                ft_alias=""
             fi
-            if [[ -z "${resolved_model}" ]]; then
+            if [[ -z "${ft_alias}" ]]; then
                 echo "${C_RED}Error: '--provider alibaba' needs a free-tier model in kimi's config.${C_RESET}" >&2
                 echo "${C_DIM}    Sync the free-tier block: 'bl auth login --console --console-site international' then '${0##*/} freetier'.${C_RESET}" >&2
                 return 1
+            fi
+            if [[ "${provider}" == claude ]]; then
+                local ft_meta="" ft_rc=0 ft_wire="" ft_base="" ft_mode="" ft_cred=""
+                ft_meta=$(_kimi_alibaba_wire "${ft_alias}") || ft_rc=$?
+                if [[ "${ft_rc}" -ne 0 ]]; then
+                    if [[ "${ft_rc}" -eq 2 ]]; then
+                        echo "${C_RED}Error: '--provider alibaba' base URL in kimi's [providers.alibaba] is not an http(s) URL.${C_RESET}" >&2
+                    else
+                        echo "${C_RED}Error: '--provider alibaba' needs the free-tier credential in kimi's [providers.alibaba].${C_RESET}" >&2
+                        echo "${C_DIM}    Sync the free-tier block: 'bl auth login --console --console-site international' then '${0##*/} freetier'.${C_RESET}" >&2
+                    fi
+                    return 1
+                fi
+                { IFS= read -r ft_wire || true; IFS= read -r ft_base || true; IFS= read -r ft_mode || true; IFS= read -r ft_cred || true; } <<<"${ft_meta}"
+                if [[ "${ft_mode}" == inline ]]; then
+                    if [[ -z "${ft_cred}" ]]; then
+                        echo "${C_RED}Error: '--provider alibaba' needs the free-tier credential in kimi's [providers.alibaba].${C_RESET}" >&2
+                        return 1
+                    fi
+                    alibaba_inline_key="${ft_cred}"
+                    _claude_use chat "${ft_base}" KIMO_ALIBABA_API_KEY \
+                        "${opt_launch_ctx:-${ALIBABA_DEFAULT_CTX}}" || return 1
+                elif [[ "${ft_mode}" == env ]]; then
+                    if [[ -z "${ft_cred}" || -z "${!ft_cred:-}" || "${!ft_cred}" == ollama ]]; then
+                        echo "${C_RED}Error: '--provider alibaba' names ${ft_cred:-api_key_env}, but that variable is empty.${C_RESET}" >&2
+                        echo "${C_DIM}    Export it, or sync the free-tier block: 'bl auth login --console --console-site international' then '${0##*/} freetier'.${C_RESET}" >&2
+                        return 1
+                    fi
+                    _claude_use chat "${ft_base}" "${ft_cred}" \
+                        "${opt_launch_ctx:-${ALIBABA_DEFAULT_CTX}}" || return 1
+                else
+                    echo "${C_RED}Error: '--provider alibaba' needs the free-tier credential in kimi's [providers.alibaba].${C_RESET}" >&2
+                    return 1
+                fi
+                resolved_model="${ft_wire}"
+                active_host="${ft_base}"
+            else
+                resolved_model="${ft_alias}"
             fi
         elif [[ -n "${dashscope_key}" ]]; then
             if [[ "${provider}" == codex && ( "${dashscope_key}" == xai-* || "${dashscope_key}" == sk-ant-* ) ]]; then
@@ -8446,10 +8632,14 @@ cmd_launch() {
             elif [[ "${cloud_provider}" == "vllm" && "$1" == "VLLM_API_KEY" ]]; then echo "<kept: real value, vLLM key>"
             elif [[ "${cloud_provider}" == "vllm" && "$1" == "OPENAI_API_KEY" && "${!1}" == "EMPTY" ]]; then echo "EMPTY (vLLM placeholder, no API key)"
             elif [[ "${cloud_provider}" == "abliteration" ]]; then echo "<kept: real value, abliteration.ai provider>"
+            elif [[ "${cloud_provider}" == "codex" && "${cli_cmd}" == agy && "$1" == CODEX_AUTH_TOKEN ]]; then
+                echo "<kept: loopback shim only, not exported to agy>"
             elif [[ "${cloud_provider}" == "codex" ]]; then echo "<kept: real value, codex token/key>"
             elif [[ "${cloud_provider}" == "openai" ]]; then echo "<kept: real value, OpenAI platform key>"
             elif [[ "${cloud_provider}" == "dashscope" && "${cli_cmd}" == agy && ( "$1" == DASHSCOPE_API_KEY || "$1" == MODELSTUDIO_API_KEY ) ]]; then
                 echo "<kept: loopback shim only, not exported to agy>"
+            elif [[ "${dashscope_surface:-}" == freetier && "${cli_cmd}" == claude && -n "${claude_key_var}" && "$1" == "${claude_key_var}" ]]; then
+                echo "<kept: loopback proxy only, not exported to claude>"
             elif [[ "${cloud_provider}" == "dashscope" || "${cloud_provider}" == "alibaba" ]]; then echo "<kept: real value, DashScope key>"
             elif [[ "${cloud_provider}" == "qwencloud" ]]; then echo "<kept: real value, QwenCloud key>"
             elif [[ "${cloud_provider}" == "xai" ]]; then echo "<kept: real value, xAI key>"
@@ -8503,7 +8693,10 @@ cmd_launch() {
                 echo "  caps   : ${ablit_caps}"
             elif [[ "${cloud_provider}" == "dashscope" || "${cloud_provider}" == "alibaba" ]]; then
                 echo "  evict  : n/a (hosted API, no VRAM to free)"
-                if [[ "${provider}" == claude ]]; then
+                if [[ -n "${claude_wire}" ]]; then
+                    echo "  context: ${claude_ctx} tokens"
+                    echo "  wire   : anthropic -> ${claude_wire} (${claude_up_base})"
+                elif [[ "${provider}" == claude ]]; then
                     echo "  context: ${CLAUDE_CODE_MAX_CONTEXT_TOKENS:-${DASHSCOPE_CLAUDE_MAX_CONTEXT}} tokens"
                 elif [[ "${cloud_provider}" == "alibaba" || "${provider_selected}" == "alibaba" || "${resolved_model}" =~ deepseek ]]; then
                     echo "  context: ${opt_launch_ctx:-${ALIBABA_DEFAULT_CTX}} tokens"
@@ -8532,6 +8725,9 @@ cmd_launch() {
                 echo "  wire   : openai ${vllm_base}"
             elif hosted_provider "${cloud_provider}"; then
                 echo "  evict  : n/a (hosted API, no VRAM to free)"
+                if [[ "${cli_cmd}" == agy && "${cloud_provider}" == codex ]]; then
+                    echo "  wire   : gemini -> responses (loopback shim)"
+                fi
             else
                 echo "  evict  : ${opt_evict} (other loaded models are left alone in a dry run)"
             fi
@@ -8562,6 +8758,8 @@ cmd_launch() {
                 claude)
                     if [[ "${claude_wire}" == native ]]; then
                         echo "  ${C_DIM}(Claude Code uses Anthropic's Messages API directly. \$KIMO_ANTHROPIC_BASE_URL is only the Codex Responses origin.)${C_RESET}"
+                    elif [[ -n "${claude_wire}" && "${dashscope_surface:-}" == freetier ]]; then
+                        echo "  ${C_DIM}(Claude Code speaks /v1/messages. A live launch points it at a localhost proxy that posts {base}/chat/completions. The free-tier key stays in kimi's [providers.alibaba] and is not exported to claude.)${C_RESET}"
                     elif [[ -n "${claude_wire}" ]]; then
                         echo "  ${C_DIM}(Claude Code speaks /v1/messages. A live launch points it at a localhost proxy; the upstream key stays in ${claude_key_var:-the provider env}. A [1m] suffix is stripped before the upstream request.)${C_RESET}"
                     fi
@@ -8578,7 +8776,11 @@ cmd_launch() {
                     elif [[ "${cloud_provider}" == "vllm" ]]; then
                         echo "  ${C_DIM}(at launch kimi gets [providers.${vllm_pid}] plus served-model aliases when /v1/models answers; this dry run writes no config)${C_RESET}"
                     elif openai_backend "${cloud_provider}"; then
-                        echo "  ${C_DIM}(Kimi's ${cloud_provider}/ aliases are synced at launch; this dry run writes no config)${C_RESET}"
+                        if [[ "${cli_cmd}" == agy ]]; then
+                            echo "  ${C_DIM}(agy speaks Gemini. A live launch points it at a localhost shim that posts /responses; CODEX_AUTH_TOKEN stays in the shim and is not exported to agy.)${C_RESET}"
+                        else
+                            echo "  ${C_DIM}(Kimi's ${cloud_provider}/ aliases are synced at launch; this dry run writes no config)${C_RESET}"
+                        fi
                     else
                         echo "  ${C_DIM}(${cli_cmd} also gets session config at launch: kimi aliases, grok context_window, agy shim, cyberstrike provider)${C_RESET}"
                     fi
@@ -8609,21 +8811,67 @@ cmd_launch() {
                         echo "${C_DIM}[*] claude on Anthropic: ${claude_shown} (context ${claude_ctx})${C_RESET}"
                         exec "${cli_cmd}" --model "${claude_shown}" "${cli_passthrough_args[@]}"
                     fi
+                    if [[ "${cloud_provider}" == "codex" || "${cloud_provider}" == "openai" ]]; then
+                        _codex_helper claude-populate "${resolved_model}" >/dev/null 2>&1 || true
+                    fi
                     local claude_token="" claude_port=""
                     claude_token=$(python3 -c 'import secrets; print(secrets.token_hex(16))')
-                    if ! claude_port=$(_kimo_anthropic_proxy_start "${claude_up_base}" "${claude_wire}" "${claude_key_var}" "${claude_token}" "${cloud_provider}"); then
+                    # The proxy inherits this environment. An inline free-tier
+                    # key exists only in kimi's config, so it is exported for
+                    # that child and removed again before claude starts.
+                    if [[ -n "${alibaba_inline_key}" ]]; then
+                        export KIMO_ALIBABA_API_KEY="${alibaba_inline_key}"
+                    fi
+                    if [[ "${dashscope_surface:-}" == freetier ]]; then
+                        export KIMO_CLAUDE_CATALOG_CTX="${claude_ctx}"
+                    fi
+                    if ! claude_port=$(_kimo_anthropic_proxy_start "${claude_up_base}" "${claude_wire}" "${claude_key_var}" "${claude_token}" "${cloud_provider}" "${resolved_model}"); then
+                        unset KIMO_ALIBABA_API_KEY KIMO_CLAUDE_CATALOG_CTX
                         echo "${C_RED}Error: could not start the local Anthropic messages proxy for ${cloud_provider}.${C_RESET}" >&2
                         return 1
                     fi
+                    unset KIMO_ALIBABA_API_KEY KIMO_CLAUDE_CATALOG_CTX
+                    if [[ "${dashscope_surface:-}" == freetier && -n "${claude_key_var}" ]]; then
+                        unset "${claude_key_var}"
+                    fi
                     unset ANTHROPIC_API_KEY
                     export ANTHROPIC_BASE_URL="http://127.0.0.1:${claude_port}"
+                    # API_BASE keeps the /v1 suffix older clients append "/messages"
+                    # to. Claude Code appends "/v1/messages" to BASE_URL. The proxy
+                    # accepts both, including a doubled /v1/v1/messages, because a
+                    # 404 there is reported as "the selected model may not exist".
                     export ANTHROPIC_API_BASE="http://127.0.0.1:${claude_port}/v1"
                     export ANTHROPIC_AUTH_TOKEN="${claude_token}"
                     export ANTHROPIC_MODEL="${claude_shown}"
-                    export ANTHROPIC_DEFAULT_OPUS_MODEL="${ANTHROPIC_DEFAULT_OPUS_MODEL:-${claude_shown}}"
-                    export ANTHROPIC_DEFAULT_SONNET_MODEL="${ANTHROPIC_DEFAULT_SONNET_MODEL:-${claude_shown}}"
-                    export ANTHROPIC_DEFAULT_HAIKU_MODEL="${ANTHROPIC_DEFAULT_HAIKU_MODEL:-${claude_shown}}"
-                    export CLAUDE_CODE_SUBAGENT_MODEL="${CLAUDE_CODE_SUBAGENT_MODEL:-${claude_shown}}"
+                    if [[ "${cloud_provider}" == "codex" || "${cloud_provider}" == "openai" ]]; then
+                        # Force these. A stale ANTHROPIC_DEFAULT_OPUS_MODEL left in
+                        # the environment (or saved by /model on an older session)
+                        # is what a resume sends, and Claude Code then looks up
+                        # opus-5.5 instead of the Codex catalog. v2.1.195 and later
+                        # also let the opus pin outrank the model stored in a
+                        # resumed transcript.
+                        export ANTHROPIC_DEFAULT_OPUS_MODEL="${resolved_model}"
+                        export ANTHROPIC_DEFAULT_SONNET_MODEL="${resolved_model}"
+                        export ANTHROPIC_DEFAULT_HAIKU_MODEL="${resolved_model}"
+                        export ANTHROPIC_DEFAULT_FABLE_MODEL="${resolved_model}"
+                        export CLAUDE_CODE_SUBAGENT_MODEL="${resolved_model}"
+                        export CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1
+                    elif [[ "${dashscope_surface:-}" == freetier ]]; then
+                        # Same reason: a stale opus pin, or the keyed DashScope
+                        # tier map, is a model this free-tier credential cannot
+                        # serve. The proxy also rewrites those aliases, and the
+                        # pin keeps the request from depending on that.
+                        export ANTHROPIC_DEFAULT_OPUS_MODEL="${resolved_model}"
+                        export ANTHROPIC_DEFAULT_SONNET_MODEL="${resolved_model}"
+                        export ANTHROPIC_DEFAULT_HAIKU_MODEL="${resolved_model}"
+                        export ANTHROPIC_DEFAULT_FABLE_MODEL="${resolved_model}"
+                        export CLAUDE_CODE_SUBAGENT_MODEL="${resolved_model}"
+                    else
+                        export ANTHROPIC_DEFAULT_OPUS_MODEL="${ANTHROPIC_DEFAULT_OPUS_MODEL:-${claude_shown}}"
+                        export ANTHROPIC_DEFAULT_SONNET_MODEL="${ANTHROPIC_DEFAULT_SONNET_MODEL:-${claude_shown}}"
+                        export ANTHROPIC_DEFAULT_HAIKU_MODEL="${ANTHROPIC_DEFAULT_HAIKU_MODEL:-${claude_shown}}"
+                        export CLAUDE_CODE_SUBAGENT_MODEL="${CLAUDE_CODE_SUBAGENT_MODEL:-${claude_shown}}"
+                    fi
                     export CLAUDE_CODE_EFFORT_LEVEL="${CLAUDE_CODE_EFFORT_LEVEL:-high}"
                     if [[ "${claude_ctx}" =~ ^[0-9]+$ ]] && (( claude_ctx >= 2 )); then
                         export CLAUDE_CODE_AUTO_COMPACT_WINDOW="${CLAUDE_CODE_AUTO_COMPACT_WINDOW:-$((claude_ctx / 2))}"
@@ -9147,14 +9395,17 @@ cmd_launch() {
             agy)
                 # No exec here: the shim must be reaped and modelProvider
                 # removed from agy's settings once the session ends.
-                local shim rc=0 shim_kind="ollama" shim_token_var=""
-                # A hosted OpenAI-compatible surface has no /api/chat, so the
-                # shim translates to /chat/completions instead and carries the
-                # provider key upstream. DashScope is the only hosted provider
-                # wired for agy; every other cloud_provider is rejected above.
+                local shim rc=0 shim_kind="ollama" shim_token_var="" shim_codex=0
+                # A hosted surface has no /api/chat. DashScope is OpenAI
+                # chat/completions. Codex is the ChatGPT Responses route
+                # (no /v1, no /chat/completions); the shim holds the token.
                 if [[ "${cloud_provider}" == "dashscope" || "${cloud_provider}" == "alibaba" ]]; then
                     shim_kind="openai"
                     shim_token_var="${dashscope_env:-}"
+                elif [[ "${cloud_provider}" == "codex" ]]; then
+                    shim_kind="responses"
+                    shim_token_var="CODEX_AUTH_TOKEN"
+                    shim_codex=1
                 fi
                 if ! shim=$(find_gemini_shim); then
                     echo "${C_RED}Error: Gemini shim not found (looked in: ${GEMINI_SHIM_PATHS[*]}).${C_RESET}" >&2
@@ -9165,7 +9416,7 @@ cmd_launch() {
                     echo "${C_RED}Error: jq is required to patch ${AGY_SETTINGS}.${C_RESET}" >&2
                     exit 1
                 fi
-                if ! agy_start_shim "${shim}" "${active_host}" "${resolved_model}" "${shim_kind}" "${shim_token_var}"; then
+                if ! agy_start_shim "${shim}" "${active_host}" "${resolved_model}" "${shim_kind}" "${shim_token_var}" "${shim_codex}"; then
                     exit 1
                 fi
                 echo "${C_DIM}[*] Gemini shim on 127.0.0.1:${AGY_SHIM_PORT} -> ${active_host} (${shim_kind} wire, pid ${AGY_SHIM_PID})${C_RESET}"
@@ -9181,8 +9432,12 @@ cmd_launch() {
                 if [[ -n "${shim_token_var}" ]]; then
                     # The running shim already holds the provider key; agy talks
                     # to the shim with GEMINI_API_KEY and has no use for a
-                    # DashScope credential, so a Google client is not handed one.
+                    # DashScope or ChatGPT credential, so a Google client is
+                    # not handed one.
                     unset DASHSCOPE_API_KEY MODELSTUDIO_API_KEY
+                    if [[ "${shim_codex}" == 1 ]]; then
+                        unset CODEX_AUTH_TOKEN CODEX_API_KEY CODEX_ACCESS_TOKEN
+                    fi
                 fi
                 echo "${C_DIM}[*] agy now runs on ${resolved_model} via the Gemini wire format.${C_RESET}"
 
