@@ -7,6 +7,14 @@ compatible-mode endpoint do not speak that wire. This process binds
 127.0.0.1, checks a per-launch client token, and translates one request
 into either Chat Completions or the Responses API.
 
+`--wire messages` does not translate. Ollama Cloud already speaks Messages.
+Claude Code 2.1.321 still renames the model on resume: a session whose
+stored model is a first-party id (Fable, claude-fable-5-2) makes the next
+launch send `beam[1m]`. ollama.com does not serve that id, and the client
+reports `Model 'beam' not found` and stays on Fable. This wire strips the
+suffix, rewrites a resumed first-party id to the launched model, and echoes
+the id Claude asked for so its existence check still passes.
+
 The upstream credential is read from the environment variable named by
 --env-key. It is never taken from the client, never written to disk, and
 redacted if an upstream error echoes it. The process exits when
@@ -76,6 +84,14 @@ PROVIDER_MODELS: dict[str, list[tuple[str, str, int, str]]] = {
         ("gemini-2.0-flash", "Gemini 2.0 Flash", 1000000, "Fast multimodal model"),
         ("gemini-1.5-pro", "Gemini 1.5 Pro", 2000000, "Long-context reasoning model"),
         ("gemini-1.5-flash", "Gemini 1.5 Flash", 1000000, "Fast lightweight model"),
+    ],
+    "kalidroid": [
+        ("qwen3.8-27b", "Qwen 3.8 27B", 131072, "Kalidroid house model"),
+        ("kimi-k2.6", "Kimi K2.6", 131072, "Kimi K2.6 via Kalidroid"),
+        ("kimi-k2.7-code", "Kimi K2.7 Code", 131072, "Kimi K2.7 coding model via Kalidroid"),
+        ("kimi-k2.7-code-highspeed", "Kimi K2.7 Code Highspeed", 131072, "Faster Kimi K2.7 code model via Kalidroid"),
+        ("kimi-k3", "Kimi K3", 131072, "Kimi K3 via Kalidroid"),
+        ("kimi-k3.1-pro", "Kimi K3.1 Pro", 131072, "Kimi K3.1 Pro via Kalidroid"),
     ],
     "dashscope": [
         ("qwen3.8-max", "Qwen 3.8 Max", 1000000, "Frontier Qwen model"),
@@ -226,7 +242,12 @@ def is_anthropic_model(model: str) -> bool:
         return True
     if lower.startswith("claude-") or lower.startswith("anthropic/"):
         return True
-    return re.fullmatch(r"(opus|sonnet|haiku|fable)([-.][0-9]+)*", lower) is not None
+    if re.fullmatch(r"(opus|sonnet|haiku|fable)([-.][0-9]+)*", lower):
+        return True
+    # "Fable 5.2" is the picker label. The wire id is usually claude-fable-5-2,
+    # but a resume can hand the label across with a space in it.
+    folded = _norm_model(lower)
+    return re.fullmatch(r"(opus|sonnet|haiku|fable)[0-9]*", folded) is not None
 
 
 def _populate_claude_settings(catalog: list[dict], provider: str, chosen_model: str = "") -> None:
@@ -324,6 +345,46 @@ class ProxyError(Exception):
         super().__init__(message)
         self.status = status
         self.message = message
+
+
+def rewrite_asked_model(value: object, upstream_model: str, asked: str) -> object:
+    """Put Claude's id back on a Messages body the upstream answered as `upstream_model`.
+
+    The existence check compares the response model with the id Claude sent.
+    Returning `beam` for a `beam[1m]` probe is reported as "may not exist".
+    """
+    if not asked or asked == upstream_model:
+        return value
+    if isinstance(value, dict):
+        rewritten: dict = {}
+        for key, item in value.items():
+            if key == "model" and item == upstream_model:
+                rewritten[key] = asked
+            else:
+                rewritten[key] = rewrite_asked_model(item, upstream_model, asked)
+        return rewritten
+    if isinstance(value, list):
+        return [rewrite_asked_model(item, upstream_model, asked) for item in value]
+    return value
+
+
+def rewrite_sse_line(line: bytes, upstream_model: str, asked: str) -> bytes:
+    """Rewrite one SSE line. Non-data lines and non-JSON data stay as they were."""
+    if not asked or asked == upstream_model:
+        return line
+    marker = b"data:"
+    index = line.find(marker)
+    if index < 0:
+        return line
+    raw = line[index + len(marker):].strip()
+    if not raw or raw == b"[DONE]":
+        return line
+    try:
+        parsed = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return line
+    parsed = rewrite_asked_model(parsed, upstream_model, asked)
+    return line[:index] + b"data: " + json.dumps(parsed, separators=(",", ":")).encode("utf-8")
 
 
 def bare_model(model: object) -> str:
@@ -593,6 +654,15 @@ def resolve_upstream_model(
                 slug_l = item["slug"].lower()
                 if any(k in slug_l for k in ("terra", "mini", "flash", "haiku")):
                     return item["slug"]
+        return launched()
+
+    # Alibaba's free-tier key cannot serve a Codex slug. A previous
+    # `launch claude --provider codex` leaves CLAUDE_CODE_SUBAGENT_MODEL
+    # and the family pins set to gpt-6.1-sol in user settings, and that
+    # file outranks the launch environment. Subagents then send gpt-6.1-sol
+    # and DashScope answers 404, which Claude Code reports as "may not exist".
+    # Anything that is not the launched free-tier id is rewritten to it.
+    if provider == "alibaba":
         return launched()
 
     if clean and clean != "claude":
@@ -1233,6 +1303,11 @@ class Proxy(BaseHTTPRequestHandler):
         if path in COUNT_PATHS:
             self._json(200, json.dumps({"input_tokens": estimate_tokens(payload)}).encode())
             return
+        if self.wire == "messages":
+            if path not in MESSAGE_PATHS:
+                raise ProxyError(404, "not found")
+            self._forward_messages(payload, path)
+            return
         if path not in MESSAGE_PATHS:
             raise ProxyError(404, "not found")
         # A grok-login JWT is aimed at cli-chat-proxy.grok.com. That host speaks
@@ -1320,6 +1395,98 @@ class Proxy(BaseHTTPRequestHandler):
         finally:
             conn.close()
 
+    def _forward_messages(self, payload: dict, path: str) -> None:
+        """Forward one Messages call. The upstream sees the hosted id.
+
+        A resumed Fable session and a beam[1m] probe both become the launched
+        model. The response still carries the id Claude sent.
+        """
+        asked_raw = payload.get("model")
+        asked = asked_raw.strip() if isinstance(asked_raw, str) and asked_raw.strip() else (self.active_model or "claude")
+        upstream_model = resolve_upstream_model(asked, self.provider, self.active_model, self.catalog)
+        outgoing = dict(payload)
+        outgoing["model"] = upstream_model
+        secret = self._secret()
+        if self.env_key and not secret:
+            raise ProxyError(502, f"{self.env_key} is empty; the upstream credential is missing")
+        conn, upstream = self._open_messages(outgoing, secret, path)
+        try:
+            status = upstream.status
+            content_type = upstream.headers.get("Content-Type") or ""
+            client_stream = bool(payload.get("stream")) or "text/event-stream" in content_type
+            if client_stream and status < 400:
+                self.send_response(status)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Cache-Control", "no-cache")
+                self.end_headers()
+                pending = b""
+                while True:
+                    chunk = upstream.read(8192)
+                    if not chunk:
+                        break
+                    pending += chunk
+                    while b"\n" in pending:
+                        line, pending = pending.split(b"\n", 1)
+                        self.wfile.write(rewrite_sse_line(line, upstream_model, asked) + b"\n")
+                if pending:
+                    self.wfile.write(rewrite_sse_line(pending, upstream_model, asked))
+                try:
+                    self.wfile.flush()
+                except BrokenPipeError:
+                    return
+                return
+            raw = upstream.read(MAX_BODY)
+            text = redact(raw.decode("utf-8", "replace"), secret)
+            try:
+                parsed = json.loads(text)
+            except json.JSONDecodeError:
+                parsed = None
+            if isinstance(parsed, (dict, list)):
+                parsed = rewrite_asked_model(parsed, upstream_model, asked)
+                self._json(status, json.dumps(parsed).encode("utf-8"))
+                return
+            body = text.encode("utf-8")
+            try:
+                self.send_response(status)
+                self.send_header("Content-Type", content_type.split(";", 1)[0] or "text/plain")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            except BrokenPipeError:
+                return
+        finally:
+            conn.close()
+
+    def _open_messages(self, payload: dict, secret: str, path: str):
+        parts = urlsplit(self.upstream.rstrip("/"))
+        if parts.scheme not in ("http", "https") or not parts.hostname:
+            raise ProxyError(502, "upstream URL is not http(s)")
+        upstream_path = path if path.startswith("/") else "/" + path
+        if parts.path and parts.path != "/":
+            upstream_path = parts.path.rstrip("/") + upstream_path
+        data = json.dumps(payload).encode("utf-8")
+        headers = {
+            "Content-Type": "application/json",
+            "Accept": self.headers.get("Accept") or "application/json, text/event-stream",
+            "Content-Length": str(len(data)),
+            "Host": parts.netloc,
+        }
+        if secret and secret != "EMPTY":
+            headers["Authorization"] = f"Bearer {secret}"
+        for name in ("anthropic-version", "anthropic-beta"):
+            value = self.headers.get(name)
+            if value:
+                headers[name] = value
+        connection_cls = HTTPSConnection if parts.scheme == "https" else HTTPConnection
+        port = parts.port or (443 if parts.scheme == "https" else 80)
+        try:
+            conn = connection_cls(parts.hostname, port, timeout=self.timeout)
+            conn.request("POST", upstream_path, body=data, headers=headers)
+            upstream = conn.getresponse()
+        except OSError as exc:
+            raise ProxyError(502, f"upstream unreachable: {exc}") from exc
+        return conn, upstream
+
     def _open(self, payload: dict, secret: str, wire: str):
         parts = urlsplit(self.upstream.rstrip("/"))
         if parts.scheme not in ("http", "https") or not parts.hostname:
@@ -1403,7 +1570,7 @@ def _watch_pid(pid: int) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser(description="Translate Anthropic Messages to an OpenAI-compatible upstream")
     parser.add_argument("--upstream", required=True)
-    parser.add_argument("--wire", choices=("chat", "responses"), required=True)
+    parser.add_argument("--wire", choices=("chat", "responses", "messages"), required=True)
     parser.add_argument("--env-key", default="")
     parser.add_argument("--provider", default="")
     parser.add_argument("--model", default="")

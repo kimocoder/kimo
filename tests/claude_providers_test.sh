@@ -97,6 +97,20 @@ check_contains "gemini chat wire" "anthropic -> chat (https://generativelanguage
 check_contains "gemini default model" "model  : gemini-2.5-flash" "${dry}"
 check_not_contains "gemini does not hit the Codex Responses guard" "does not support the OpenAI Responses API" "${dry}"
 
+KD_KEY="kd_ai_fixture-claude"
+dry=$(KALIDROID_API_KEY="${KD_KEY}" "${KIMO}" launch claude --provider kalidroid --dry-run)
+check_contains "kalidroid chat wire" "anthropic -> chat (https://dashboard.kalidroid.com/api/ai/openai/v1)" "${dry}"
+check_contains "kalidroid default model" "model  : qwen3.8-27b" "${dry}"
+check_contains "kalidroid context" "context: 131072 tokens" "${dry}"
+check_contains "kalidroid key is masked" "secret : KALIDROID_API_KEY <kept: real value, Kalidroid key>" "${dry}"
+check_not_contains "dry-run never prints the kalidroid key" "${KD_KEY}" "${dry}"
+check_not_contains "claude kalidroid does not hit the Codex Responses guard" "does not support the OpenAI Responses API" "${dry}"
+check_not_contains "kalidroid does not append a second /v1" "/v1/v1" "${dry}"
+check_not_contains "kalidroid does not set OLLAMA_HOST" "OLLAMA_HOST=" "${dry}"
+dry=$(KALIDROID_API_KEY="${KD_KEY}" "${KIMO}" launch claude --provider Kalidroid --model kalidroid/kimi-k3 --dry-run)
+check_contains "Kalidroid alias on claude" "provider: kalidroid" "${dry}"
+check_contains "kalidroid/ prefix is stripped for claude" "model  : kimi-k3" "${dry}"
+
 rc=0
 # A live codex launch still refuses the official Gemini host. Claude must not.
 err_gm=$(GEMINI_API_KEY="${GM_KEY}" "${KIMO}" launch codex --provider gemini 2>&1) || rc=$?

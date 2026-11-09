@@ -103,6 +103,14 @@ PROVIDER_MODELS: dict[str, list[tuple[str, str, int]]] = {
         ("gemini-1.5-pro", "Gemini 1.5 Pro", 2000000),
         ("gemini-1.5-flash", "Gemini 1.5 Flash", 1000000),
     ],
+    "kalidroid": [
+        ("qwen3.8-27b", "Qwen 3.8 27B", 131072),
+        ("kimi-k2.6", "Kimi K2.6", 131072),
+        ("kimi-k2.7-code", "Kimi K2.7 Code", 131072),
+        ("kimi-k2.7-code-highspeed", "Kimi K2.7 Code Highspeed", 131072),
+        ("kimi-k3", "Kimi K3", 131072),
+        ("kimi-k3.1-pro", "Kimi K3.1 Pro", 131072),
+    ],
 }
 
 FALLBACK_MODEL_TEMPLATE: dict = {

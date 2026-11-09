@@ -48,6 +48,9 @@ exit 0
 SH
 chmod +x "${FAKE_BIN}/kimi"
 export PATH="${FAKE_BIN}:${PATH}"
+# This machine may have a live vLLM on 127.0.0.1:8000. Do not let its key
+# file change dry-runs that expect VLLM_API_KEY to be unset.
+export KIMO_VLLM_NO_OWNER_KEY=1
 
 FIXTURE="${HARNESS_ROOT}/vllm_fixture.py"
 PORT_FILE="${HARNESS_ROOT}/vllm.port"
@@ -256,11 +259,13 @@ check "no key does not store api_key_env" "" "$(py 'doc["providers"]["'"${PID}"'
 check "default_model is the launched alias" "${PID}/${LLAMA}" "$(py 'doc["default_model"]')"
 check "four served models are registered" 4 "$(py 'len(doc["models"])')"
 check "llama capabilities" tool_use "$(caps_of "${PID}/${LLAMA}")"
-check "llama context is max_model_len" 8192 "$(py 'doc["models"]["'"${PID}/${LLAMA}"'"]["max_context_size"]')"
+check "llama context leaves template slack" 7936 "$(py 'doc["models"]["'"${PID}/${LLAMA}"'"]["max_context_size"]')"
+check "llama max output fits the window" 2048 "$(py 'doc["models"]["'"${PID}/${LLAMA}"'"]["max_output_size"]')"
 check "llama has no efforts" False "$(py '"support_efforts" in doc["models"]["'"${PID}/${LLAMA}"'"]')"
 check "llama display name" "${LLAMA} (vllm)" "$(py 'doc["models"]["'"${PID}/${LLAMA}"'"]["display_name"]')"
 check "R1 capabilities" "thinking,tool_use" "$(caps_of "${PID}/${R1}")"
-check "R1 context" 16384 "$(py 'doc["models"]["'"${PID}/${R1}"'"]["max_context_size"]')"
+check "R1 context leaves template slack" 16128 "$(py 'doc["models"]["'"${PID}/${R1}"'"]["max_context_size"]')"
+check "reserve is an eighth of the smallest window" 224 "$(py 'doc["loop_control"]["reserved_context_size"]')"
 check "R1 efforts" "low,medium,high" "$(py '"," .join(doc["models"]["'"${PID}/${R1}"'"]["support_efforts"])')"
 check "R1 off effort" low "$(py 'doc["models"]["'"${PID}/${R1}"'"]["off_effort"]')"
 check "R1 reasoning key" reasoning_content "$(py 'doc["models"]["'"${PID}/${R1}"'"]["reasoning_key"]')"
@@ -279,7 +284,11 @@ echo "[5b] endpoint discovery when no base is configured"
 reset_kimi
 reset_log
 rc=0
-disc=$(KIMO_VLLM_BASE_URLS="http://127.0.0.1:1/v1, ${BASE}" \
+# A live vLLM on :8000 must not satisfy this check. KIMO_VLLM_DEFAULT_BASE
+# moves the first probe off that port without pinning the base, so discovery
+# still walks KIMO_VLLM_BASE_URLS.
+disc=$(KIMO_VLLM_DEFAULT_BASE="http://127.0.0.1:1/v1" \
+    KIMO_VLLM_BASE_URLS="http://127.0.0.1:1/v1, ${BASE}" \
     "${KIMO}" launch kimi --provider vllm 2>&1) || rc=$?
 check "discovery launch exits 0" 0 "${rc}"
 check_contains "discovery reports the found base" "found a vLLM server at ${BASE}" "${disc}"
@@ -297,6 +306,7 @@ cand_fns="$(sed -n '/^vllm_normalize_base()/,/^}/p' "${KIMO}")"$'\n'"$(sed -n '/
 cands=$(bash -c "${cand_fns}; VLLM_BASE_URL_DEFAULT=http://127.0.0.1:8000/v1; vllm_candidate_bases")
 check_contains "default fallback includes :8000" "http://127.0.0.1:8000/v1" "${cands}"
 check_contains "default fallback includes the :18000 tunnel" "http://127.0.0.1:18000/v1" "${cands}"
+check_contains "default fallback includes the GPU box" "http://192.168.1.104:8000/v1" "${cands}"
 cands=$(KIMO_VLLM_BASE_URLS="10.0.0.9:9000, https://gpu.example:8443/v1" \
     bash -c "${cand_fns}; vllm_candidate_bases")
 check_contains "KIMO_VLLM_BASE_URLS is normalized" "http://10.0.0.9:9000/v1" "${cands}"
@@ -315,13 +325,20 @@ check "small --ctx is stored" 100 "$(py 'doc["models"]["'"${PID}/${LLAMA}"'"]["m
 rc=0
 live=$(KIMO_VLLM_BASE_URL="${BASE}" "${KIMO}" launch kimi --provider vllm --model "${R1}" --ctx 999999 2>&1) || rc=$?
 check "oversized --ctx still launches" 0 "${rc}"
-check_contains "oversized --ctx is capped" "Capping to 16384" "${live}"
-check "R1 context is the server window" 16384 "$(py 'doc["models"]["'"${PID}/${R1}"'"]["max_context_size"]')"
+check_contains "oversized --ctx is capped" "Capping to 16128" "${live}"
+check "R1 context leaves room under the server window" 16128 "$(py 'doc["models"]["'"${PID}/${R1}"'"]["max_context_size"]')"
 rc=0
 live=$(KIMO_KIMI_EFFORT=max KIMO_VLLM_BASE_URL="${BASE}" "${KIMO}" launch kimi --provider vllm --model "${R1}" 2>&1) || rc=$?
 check "unknown effort still launches" 0 "${rc}"
 check_contains "unknown effort warns" "not in" "${live}"
 check "unknown effort falls back to high" high "$(py 'doc["models"]["'"${PID}/${R1}"'"]["default_effort"]')"
+rc=0
+live=$(KIMO_KIMI_EFFORT=high KIMO_VLLM_BASE_URL="${BASE}" \
+    "${KIMO}" launch kimi --provider vllm --model qwen3.8-27b 2>&1) || rc=$?
+check "qwen3.8 launch exits 0" 0 "${rc}"
+check_contains "qwen3.8 maps high to medium" "using medium" "${live}"
+check "qwen3.8 efforts omit high" "low,medium,xhigh" "$(py '"," .join(doc["models"]["'"${PID}/qwen3.8-27b"'"]["support_efforts"])')"
+check "qwen3.8 default effort is medium" medium "$(py 'doc["models"]["'"${PID}/qwen3.8-27b"'"]["default_effort"]')"
 rc=0
 live=$(KIMO_KIMI_CAPABILITIES=thinking,tool_use KIMO_VLLM_BASE_URL="${BASE}" \
     "${KIMO}" launch kimi --provider vllm --model "${LLAMA}" 2>&1) || rc=$?
@@ -455,6 +472,89 @@ check "live launch without kimi exits 1" 1 "${rc}"
 check_contains "the error tells the user to install kimi" "install kimi" "${miss}"
 check_not_contains "live launch does not fall through to ollama" "Falling back to native" "${miss}"
 check "ollama was not executed" "" "$(harness_stub_calls ollama)"
+
+echo "[11] a proxy must not hide a loopback vLLM"
+reset_kimi
+reset_log
+printf 'ok\n' >"${MODE_FILE}"
+rc=0
+live=$(http_proxy=http://127.0.0.1:9 HTTPS_PROXY=http://127.0.0.1:9 ALL_PROXY=socks5h://127.0.0.1:9 \
+    KIMO_VLLM_BASE_URL="${BASE}" "${KIMO}" launch kimi --provider vllm 2>&1) || rc=$?
+check "proxy does not hide the loopback server" 0 "${rc}"
+check "proxy launch still selects the served model" "${PID}/${LLAMA}" "$(flag_val "${CAPTURE}" -m)"
+check_contains "proxy launch lists the fixture" "vLLM models at ${BASE}" "${live}"
+
+echo "[12] API key file: loopback home file, explicit file, unsafe files ignored"
+reset_kimi
+reset_log
+printf 'ok\n' >"${MODE_FILE}"
+KEY="vllm-test-key"
+KEYFILE="${HARNESS_ROOT}/home/vllm/api.key"
+mkdir -p "${HARNESS_ROOT}/home/vllm"
+printf '%s\n' "${KEY}" >"${KEYFILE}"
+chmod 600 "${KEYFILE}"
+unset VLLM_API_KEY || true
+rc=0
+dry=$(KIMO_VLLM_BASE_URL="${BASE}" "${KIMO}" launch kimi --provider vllm --model m --dry-run 2>&1) || rc=$?
+check "home key file dry-run exits 0" 0 "${rc}"
+check_contains "home key file is masked" "<kept: real value, vLLM key>" "${dry}"
+check_contains "home key file names its path" "vLLM API key from ${KEYFILE}" "${dry}"
+check_not_contains "home key file is not printed" "${KEY}" "${dry}"
+rc=0
+live=$(KIMO_VLLM_BASE_URL="${BASE}" "${KIMO}" launch kimi --provider vllm 2>&1) || rc=$?
+check "home key file launch exits 0" 0 "${rc}"
+check "home key file reaches the child" "${KEY}" "$(env_val "${CAPTURE}" VLLM_API_KEY)"
+check "home key file is the probe bearer" "$(printf '/v1/models\tBearer %s' "${KEY}")" "$(tail -n1 "${LOG_FILE}")"
+check "home key file config names the env var" VLLM_API_KEY "$(py 'doc["providers"]["'"${PID}"'"].get("api_key_env", "")')"
+check "home key file config has no api_key" "" "$(py 'doc["providers"]["'"${PID}"'"].get("api_key", "")')"
+check_not_contains "home key file is not in config.toml" "${KEY}" "$(cat "${KIMI_CFG}")"
+check_not_contains "home key file is not in the launch output" "${KEY}" "${live}"
+rc=0
+live=$(VLLM_API_KEY="from-env" KIMO_VLLM_BASE_URL="${BASE}" "${KIMO}" launch kimi --provider vllm --model m 2>&1) || rc=$?
+check "VLLM_API_KEY beats the home file" 0 "${rc}"
+check "the child gets the env key, not the file" "from-env" "$(env_val "${CAPTURE}" VLLM_API_KEY)"
+check "the probe bearer is the env key" "$(printf '/v1/models\tBearer %s' "from-env")" "$(tail -n1 "${LOG_FILE}")"
+unset VLLM_API_KEY || true
+rc=0
+dry=$(KIMO_VLLM_BASE_URL="http://10.0.0.5:8000/v1" "${KIMO}" launch kimi --provider vllm --model m --dry-run 2>&1) || rc=$?
+check "home key file is not used for a remote base" 0 "${rc}"
+check_contains "remote base leaves VLLM_API_KEY unset" "VLLM_API_KEY <unset>" "${dry}"
+check_not_contains "remote base does not print the home key" "${KEY}" "${dry}"
+rc=0
+dry=$(KIMO_VLLM_API_KEY_FILE="${KEYFILE}" KIMO_VLLM_BASE_URL="http://10.0.0.5:8000/v1" \
+    "${KIMO}" launch kimi --provider vllm --model m --dry-run 2>&1) || rc=$?
+check "explicit key file works off-box" 0 "${rc}"
+check_contains "explicit key file is masked" "<kept: real value, vLLM key>" "${dry}"
+check_contains "explicit key file names its path" "vLLM API key from ${KEYFILE}" "${dry}"
+check_not_contains "explicit key file is not printed" "${KEY}" "${dry}"
+chmod 666 "${KEYFILE}"
+rc=0
+dry=$(KIMO_VLLM_BASE_URL="${BASE}" "${KIMO}" launch kimi --provider vllm --model m --dry-run 2>&1) || rc=$?
+check "other-writable home file is ignored" 0 "${rc}"
+check_contains "ignored home file leaves the key unset" "VLLM_API_KEY <unset>" "${dry}"
+check_not_contains "ignored home file is not printed" "${KEY}" "${dry}"
+chmod 600 "${KEYFILE}"
+printf 'bad key\n' >"${KEYFILE}"
+rc=0
+err=$(KIMO_VLLM_BASE_URL="${BASE}" "${KIMO}" launch kimi --provider vllm --model m --dry-run 2>&1) || rc=$?
+check "a key file with whitespace is rejected" 1 "${rc}"
+check_contains "whitespace file rejection names the file" "${KEYFILE}" "${err}"
+check_not_contains "whitespace file contents are not printed" "bad key" "${err}"
+rc=0
+err=$(KIMO_VLLM_API_KEY_FILE="${HARNESS_ROOT}/no-such-vllm-key" "${KIMO}" launch kimi --provider vllm --model m --dry-run 2>&1) || rc=$?
+check "a missing explicit key file is rejected" 1 "${rc}"
+check_contains "missing key file names the variable" "KIMO_VLLM_API_KEY_FILE" "${err}"
+printf '%s\n' "${KEY}" >"${KEYFILE}"
+chmod 600 "${KEYFILE}"
+ln -s "${KEYFILE}" "${HARNESS_ROOT}/vllm-key.link"
+rc=0
+err=$(KIMO_VLLM_API_KEY_FILE="${HARNESS_ROOT}/vllm-key.link" "${KIMO}" launch kimi --provider vllm --model m --dry-run 2>&1) || rc=$?
+check "a symlink key file is rejected" 1 "${rc}"
+check_contains "symlink rejection says symlink" "symlink" "${err}"
+check_not_contains "symlink rejection does not print the key" "${KEY}" "${err}"
+rm -rf "${HARNESS_ROOT}/home/vllm" "${HARNESS_ROOT}/vllm-key.link"
+unset VLLM_API_KEY || true
+printf 'ok\n' >"${MODE_FILE}"
 
 echo
 harness_summary "vllm-smoke"

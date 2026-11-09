@@ -17,6 +17,7 @@ KIMO="${ROOT_DIR}/kimo"
 unset DASHSCOPE_API_KEY MODELSTUDIO_API_KEY QWENCLOUD_API_KEY XAI_API_KEY XAI_AUTH_TOKEN \
     ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN CLAUDE_CODE_OAUTH_TOKEN \
     GEMINI_API_KEY GEMINI_AUTH_TOKEN GOOGLE_API_KEY GOOGLE_OAUTH_TOKEN \
+    KALIDROID_API_KEY KIMO_KALIDROID_BASE_URL KIMO_KALIDROID_MODEL KIMO_KALIDROID_CTX \
     KIMO_QWENCLOUD_BASE_URL KIMO_QWENCLOUD_REGION KIMO_XAI_BASE_URL \
     KIMO_ANTHROPIC_BASE_URL KIMO_GEMINI_BASE_URL KIMO_CLOUD_PROVIDER
 
@@ -37,7 +38,7 @@ cat > "${FAKE_BIN}/codex" <<'SH'
     printf 'ENV\n'
     for key in DASHSCOPE_API_KEY MODELSTUDIO_API_KEY QWENCLOUD_API_KEY XAI_API_KEY \
         ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN OPENAI_BASE_URL CODEX_OSS_BASE_URL \
-        OLLAMA_HOST OPENAI_API_KEY KIMO_RESPONSES_UPSTREAM; do
+        OLLAMA_HOST OPENAI_API_KEY KALIDROID_API_KEY KIMO_RESPONSES_UPSTREAM; do
         printf '%s=%s\n' "${key}" "${!key-<unset>}"
     done
 } > "${CODEX_PROVIDERS_CAPTURE:?}"
@@ -61,6 +62,8 @@ ANT_HOST="https://api.anthropic.com/v1"
 GM_KEY="AIzaSy-fixture-key-42"
 GM_TOK="ya29.fixture-token-42"
 GM_HOST="https://generativelanguage.googleapis.com/v1beta/openai"
+KD_KEY="kd_ai_fixture-key-42"
+KD_HOST="https://dashboard.kalidroid.com/api/ai/openai/v1"
 
 # <label> <provider> <host> <model> <env-var> <ctx>
 expect_responses() {
@@ -158,6 +161,23 @@ err_gm_guard=$(GEMINI_API_KEY="${GM_KEY}" "${KIMO}" launch codex --provider gemi
 check "gemini without custom base fails official endpoint guard" 1 "${rc}"
 check_contains "guard mentions lack of responses API" "does not support the OpenAI Responses API" "${err_gm_guard}"
 
+echo "[*] [4.6] Kalidroid on Codex"
+dry=$(KALIDROID_API_KEY="${KD_KEY}" "${KIMO}" launch codex --provider kalidroid --dry-run)
+expect_responses "kalidroid" kalidroid "${KD_HOST}" qwen3.8-27b KALIDROID_API_KEY 131072 "${dry}"
+check_contains "kalidroid key is masked" "secret : KALIDROID_API_KEY <kept: real value, Kalidroid key>" "${dry}"
+check_not_contains "dry-run never prints the kalidroid key" "${KD_KEY}" "${dry}"
+check_contains "kalidroid display name" 'name=\"Kalidroid\"' "${dry}"
+dry=$(KALIDROID_API_KEY="${KD_KEY}" "${KIMO}" launch codex --provider Kalidroid --model kalidroid/kimi-k2.7-code --dry-run)
+check_contains "Kalidroid normalizes to kalidroid" "provider: kalidroid" "${dry}"
+check_contains "kalidroid/ prefix is stripped" "model  : kimi-k2.7-code" "${dry}"
+dry=$(KIMO_KALIDROID_BASE_URL=https://example.invalid/v1 KALIDROID_API_KEY="${KD_KEY}" "${KIMO}" launch codex --provider kalidroid --dry-run)
+check_contains "kalidroid base URL override" "host   : https://example.invalid/v1" "${dry}"
+rc=0
+err_kd_guard=$(KALIDROID_API_KEY="${KD_KEY}" "${KIMO}" launch codex --provider kalidroid 2>&1) || rc=$?
+check "kalidroid without custom base fails official endpoint guard" 1 "${rc}"
+check_contains "guard names Kalidroid chat completions" "does not support the OpenAI Responses API" "${err_kd_guard}"
+check_contains "guard points at launch claude" "launch claude --provider kalidroid" "${err_kd_guard}"
+
 echo "[*] [5] Credentials, supported CLIs, config and scrubbing"
 rc=0
 nokey=$("${KIMO}" launch codex --provider qwencloud --dry-run 2>&1) || rc=$?
@@ -188,10 +208,11 @@ bogus=$("${KIMO}" config set cloud_provider not-a-provider 2>&1) || rc=$?
 check "an unknown backend is rejected" 1 "${rc}"
 check_contains "the rejection lists qwencloud" "qwencloud" "${bogus}"
 
-XAI_API_KEY="${XAI_KEY}" QWENCLOUD_API_KEY="${QW_KEY}" "${KIMO}" --host http://remote.kimo-test.invalid:9 \
+XAI_API_KEY="${XAI_KEY}" QWENCLOUD_API_KEY="${QW_KEY}" KALIDROID_API_KEY="${KD_KEY}" "${KIMO}" --host http://remote.kimo-test.invalid:9 \
     launch codex --provider ollama --model test-local >/dev/null 2>&1
 check "remote Ollama clears XAI_API_KEY" "<unset>" "$(env_val "${CAPTURE}" XAI_API_KEY)"
 check "remote Ollama clears QWENCLOUD_API_KEY" "<unset>" "$(env_val "${CAPTURE}" QWENCLOUD_API_KEY)"
+check "remote Ollama clears KALIDROID_API_KEY" "<unset>" "$(env_val "${CAPTURE}" KALIDROID_API_KEY)"
 
 echo "[*] [6] Launch argv, env and an untouched Codex config"
 DASHSCOPE_API_KEY="${DS_KEY}" "${KIMO}" launch codex --provider dashscope -- exec --json 'hello world' >/dev/null 2>&1
@@ -333,6 +354,11 @@ comp_gm=$(bash -c "source '${COMP_SCRIPT}'; COMP_WORDS=(kimo launch codex --prov
 check_contains "completion offers gemini models with prefix" "gemini/gemini-2.5-flash" "${comp_gm}"
 check_contains "completion offers gemini models bare" "gemini-2.5-flash" "${comp_gm}"
 
+comp_kd=$(bash -c "source '${COMP_SCRIPT}'; COMP_WORDS=(kimo launch codex --provider kalidroid -m ''); COMP_CWORD=6; _kimo; printf '%s\n' \"\${COMPREPLY[@]}\"")
+check_contains "completion offers kalidroid models with prefix" "kalidroid/qwen3.8-27b" "${comp_kd}"
+check_contains "completion offers kalidroid models bare" "qwen3.8-27b" "${comp_kd}"
+check_contains "completion offers kalidroid kimi models" "kalidroid/kimi-k2.7-code" "${comp_kd}"
+
 echo "[*] [11] API configuration validation on launch codex"
 rc=0
 err_codex_auth=$(CODEX_AUTH_TOKEN="" CODEX_API_KEY="" HOME="${HARNESS_ROOT}/nonexistent_home" "${KIMO}" launch codex --provider codex --dry-run 2>&1) || rc=$?
@@ -393,6 +419,19 @@ rc=0
 err_gm_fmt=$(GEMINI_API_KEY="bad-gm-key" "${KIMO}" launch codex --provider gemini --dry-run 2>&1) || rc=$?
 check "launch codex --provider gemini rejects invalid format" 1 "${rc}"
 check_contains "error message requires AIzaSy or ya29 prefix" "expected Gemini credential format" "${err_gm_fmt}"
+
+rc=0
+err_kd_missing=$("${KIMO}" launch codex --provider kalidroid --dry-run 2>&1) || rc=$?
+check "a missing kalidroid key fails" 1 "${rc}"
+check_contains "the error names KALIDROID_API_KEY" "KALIDROID_API_KEY" "${err_kd_missing}"
+rc=0
+err_kd_fmt=$(KALIDROID_API_KEY="sk-not-kalidroid" "${KIMO}" launch codex --provider kalidroid --dry-run 2>&1) || rc=$?
+check "launch codex --provider kalidroid rejects a non-kd_ai key" 1 "${rc}"
+check_contains "error message requires kd_ai_ prefix" "expected 'kd_ai_...'" "${err_kd_fmt}"
+rc=0
+err_kd_kimi=$("${KIMO}" launch kimi --provider kalidroid --dry-run 2>&1) || rc=$?
+check "kimi has no kalidroid branch" 1 "${rc}"
+check_contains "the rejection names codex and claude" "supports codex claude" "${err_kd_kimi}"
 
 echo
 harness_summary "codex_providers"

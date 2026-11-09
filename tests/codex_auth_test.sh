@@ -615,11 +615,11 @@ check_contains "the configured backend is used" "provider: openai" "${dry}"
 rc=0
 unknown=$("${KIMO}" launch kimi --provider not-a-backend --dry-run 2>&1) || rc=$?
 check "an unknown backend is rejected" 1 "${rc}"
-check_contains "the rejection lists every backend" "ollama abliteration codex openai" "${unknown}"
+check_contains "the rejection lists every backend" "ollama ollama-cloud abliteration codex openai dashscope alibaba qwencloud xai anthropic claude gemini kalidroid vllm" "${unknown}"
 rc=0
 missing=$("${KIMO}" launch kimi --provider 2>&1) || rc=$?
 check "a missing backend argument is rejected" 1 "${rc}"
-check_contains "the missing-argument error lists every backend" "ollama, abliteration, codex, openai" "${missing}"
+check_contains "the missing-argument error lists every backend" "ollama, ollama-cloud, abliteration, codex, openai, dashscope, alibaba, qwencloud, xai, anthropic, claude, gemini, kalidroid, vllm" "${missing}"
 
 # An explicitly requested model needs no cached catalog, so a box that has never
 # run the Codex CLI can still use the platform backend.
@@ -655,7 +655,7 @@ check_contains "Bash completion includes Codex native commands" 'exec review res
 # Both completion scripts are emitted from quoted heredocs, so they cannot expand
 # KIMO_LAUNCH_PROVIDERS; assert they still offer exactly what launch accepts.
 providers=$(sed -n 's/^KIMO_LAUNCH_PROVIDERS="\(.*\)"$/\1/p' "${KIMO}")
-check "the accepted backends are declared once" "ollama abliteration codex openai dashscope alibaba qwencloud xai anthropic claude gemini vllm" "${providers}"
+check "the accepted backends are declared once" "ollama ollama-cloud abliteration codex openai dashscope alibaba qwencloud xai anthropic claude gemini kalidroid vllm" "${providers}"
 check_contains "Bash completion offers every backend" "${providers}" "${bash_completion}"
 check_contains "Zsh completion offers every backend" "${providers}" "$("${KIMO}" completion zsh)"
 check_contains "Zsh completion includes Codex bridge" '--sync[Synchronize Codex provider' "$("${KIMO}" completion zsh)"

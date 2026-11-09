@@ -436,10 +436,13 @@ token="${ANTHROPIC_AUTH_TOKEN-}"
 if [[ -n "${base}" && -n "${token}" && -n "${model}" ]]; then
     ns=$(jq -nc --arg m "alibaba/${model}" '{model:$m,max_tokens:16,stream:false,messages:[{role:"user",content:"hi"}]}')
     op=$(jq -nc '{model:"opus",max_tokens:16,stream:false,messages:[{role:"user",content:"hi"}]}')
+    codex_body=$(jq -nc '{model:"gpt-6.1-sol",max_tokens:16,stream:false,messages:[{role:"user",content:"hi"}]}')
     answer="$(curl -sS -m 20 -X POST "${base}/v1/messages" \
         -H 'Content-Type: application/json' -H "x-api-key: ${token}" -d "${ns}" || true)"
     answer_opus="$(curl -sS -m 20 -X POST "${base}/v1/messages" \
         -H 'Content-Type: application/json' -H "x-api-key: ${token}" -d "${op}" || true)"
+    curl -sS -m 20 -X POST "${base}/v1/messages" \
+        -H 'Content-Type: application/json' -H "x-api-key: ${token}" -d "${codex_body}" >/dev/null || true
     model_meta="$(curl -sS -m 20 "${base}/v1/models/${model}" -H "x-api-key: ${token}" || true)"
 fi
 {
@@ -460,6 +463,20 @@ exit 0
 SH
 chmod +x "${FAKE_BIN}/claude"
 
+mkdir -p "${HOME}/.claude"
+cat > "${HOME}/.claude/settings.json" << 'EOF'
+{
+  "model": "opus",
+  "permissions": {"allow": ["Bash(echo ok)"]},
+  "env": {
+    "ANTHROPIC_DEFAULT_OPUS_MODEL": "gpt-6.1-sol",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL": "gpt-6.1-sol",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "gpt-6.1-sol",
+    "CLAUDE_CODE_SUBAGENT_MODEL": "gpt-6.1-sol",
+    "KEEP_ME": "yes"
+  }
+}
+EOF
 : >"${ALI_UP_LOG}"
 KIMI_CONFIG="${CLAUDE_ALI_CONFIG}" "${KIMO}" launch claude --provider alibaba >/dev/null 2>&1
 check "live claude alibaba argv is the bare slug" "deepseek-v4.1-flash-1017" "$(flag_val "${CAPTURE}" --model)"
@@ -487,16 +504,18 @@ check_contains "model metadata reports the free-tier window" '"context_window": 
 check_contains "upstream saw chat/completions" "POST /v1/chat/completions" "$(<"${ALI_UP_LOG}")"
 check_contains "upstream was asked for the bare slug" '"model":"deepseek-v4.1-flash-1017"' "$(<"${ALI_UP_LOG}")"
 check_not_contains "upstream was not asked for opus" '"model":"opus"' "$(<"${ALI_UP_LOG}")"
+check_not_contains "upstream was not asked for a Codex subagent slug" '"model":"gpt-6.1-sol"' "$(<"${ALI_UP_LOG}")"
 check_not_contains "upstream was not asked for the alibaba/ alias" '"model":"alibaba/deepseek-v4.1-flash-1017"' "$(<"${ALI_UP_LOG}")"
+check "settings keep the user's model choice" "opus" "$(python3 -c 'import json; print(json.load(open("'"${HOME}"'/.claude/settings.json"))["model"])')"
+check "settings keep unrelated env" "yes" "$(python3 -c 'import json; print(json.load(open("'"${HOME}"'/.claude/settings.json"))["env"]["KEEP_ME"])')"
+check "settings drop the Codex subagent pin" "absent" "$(python3 -c 'import json; env=json.load(open("'"${HOME}"'/.claude/settings.json")).get("env", {}); print("absent" if "CLAUDE_CODE_SUBAGENT_MODEL" not in env else env["CLAUDE_CODE_SUBAGENT_MODEL"])')"
+check "settings drop the Codex opus pin" "absent" "$(python3 -c 'import json; env=json.load(open("'"${HOME}"'/.claude/settings.json")).get("env", {}); print("absent" if "ANTHROPIC_DEFAULT_OPUS_MODEL" not in env else env["ANTHROPIC_DEFAULT_OPUS_MODEL"])')"
 got_ctx="$(python3 -c "import tomlkit; doc = tomlkit.parse(open('${CLAUDE_ALI_CONFIG}').read()); print(doc.get('models', {}).get('alibaba/deepseek-v4.1-flash-1017', {}).get('max_context_size', ''))")"
 check "claude launch does not rewrite kimi max_context_size" "131072" "${got_ctx}"
 got_key="$(python3 -c "import tomlkit; doc = tomlkit.parse(open('${CLAUDE_ALI_CONFIG}').read()); print(doc.get('providers', {}).get('alibaba', {}).get('api_key', ''))")"
 check "claude launch does not rewrite the stored key" "${ALI_KEY}" "${got_key}"
-if [[ -f "${HOME}/.claude/settings.json" ]]; then
-    bad "claude alibaba wrote user settings"
-else
-    ok "claude alibaba does not write user settings"
-fi
+picker="$(python3 -c 'import json; print(json.load(open("'"${HOME}"'/.claude/settings.json")).get("modelPicker", ""))')"
+check "alibaba launch does not install a Codex model picker" "" "${picker}"
 proxy_base="$(env_val "${CAPTURE}" ANTHROPIC_BASE_URL)"
 proxy_dead=0
 for _try in 1 2 3 4 5 6 7 8 9 10; do
@@ -539,6 +558,79 @@ dry_cfg_claude=$(KIMI_CONFIG="${CLAUDE_ALI_CONFIG}" "${KIMO}" launch claude --dr
 check_contains "configured backend alibaba launches claude on the free tier" "provider: alibaba" "${dry_cfg_claude}"
 check_contains "configured backend keeps the bare slug" "model  : deepseek-v4.1-flash-1017" "${dry_cfg_claude}"
 "${KIMO}" config unset cloud_provider >/dev/null
+
+# A modelscope/ default_model must not steal --provider alibaba from the
+# free-tier block freetier just wrote.
+MS_CONFIG="${HARNESS_ROOT}/ali-ms/config.toml"
+mkdir -p "$(dirname "${MS_CONFIG}")"
+cat > "${MS_CONFIG}" <<TOML
+default_model = "modelscope/deepseek-ai/DeepSeek-V4-Flash-0731"
+[providers.alibaba]
+type = "openai"
+base_url = "${FAKE_OLLAMA_URL}/v1"
+api_key = "${ALI_KEY}"
+[providers.modelscope]
+type = "openai"
+base_url = "https://api-inference.modelscope.cn/v1"
+api_key = "sk-dashscope-not-a-modelscope-token"
+[models."modelscope/deepseek-ai/DeepSeek-V4-Flash-0731"]
+provider = "modelscope"
+model = "deepseek-ai/DeepSeek-V4-Flash-0731"
+max_context_size = 131072
+[models."alibaba/qwen3-coder-flash-2025-07-28"]
+provider = "alibaba"
+model = "qwen3-coder-flash-2025-07-28"
+max_context_size = 131072
+TOML
+dry_ms=$(KIMI_CONFIG="${MS_CONFIG}" "${KIMO}" launch claude --provider alibaba --dry-run)
+check_contains "alibaba launch ignores a modelscope default" "model  : qwen3-coder-flash-2025-07-28" "${dry_ms}"
+check_contains "alibaba launch stays on the free-tier host" "wire   : anthropic -> chat (${FAKE_OLLAMA_URL}/v1)" "${dry_ms}"
+check_not_contains "alibaba launch does not target ModelScope" "api-inference.modelscope.cn" "${dry_ms}"
+
+# The model freetier wrote can itself be a ModelScope id. A DashScope sk-
+# key on that host is the 401 "valid ModelScope token is supplied".
+MS_ONLY="${HARNESS_ROOT}/ms-only/config.toml"
+mkdir -p "$(dirname "${MS_ONLY}")"
+cat > "${MS_ONLY}" <<'TOML'
+default_model = "alibaba/deepseek-ai/DeepSeek-V4-Flash-0731"
+[providers.alibaba]
+type = "openai"
+base_url = "https://api-inference.modelscope.cn/v1"
+api_key = "sk-dashscope-not-a-modelscope-token"
+[models."alibaba/deepseek-ai/DeepSeek-V4-Flash-0731"]
+provider = "alibaba"
+model = "deepseek-ai/DeepSeek-V4-Flash-0731"
+max_context_size = 131072
+TOML
+rc=0
+ms_need=$(KIMI_CONFIG="${MS_ONLY}" "${KIMO}" launch claude --provider alibaba --dry-run 2>&1) || rc=$?
+check "ModelScope host without a token fails" 1 "${rc}"
+check_contains "the error names ModelScope" "ModelScope" "${ms_need}"
+check_contains "the error tells where the token comes from" "myaccesstoken" "${ms_need}"
+check_not_contains "the error does not print the dashscope key" "sk-dashscope-not-a-modelscope-token" "${ms_need}"
+
+MS_TOKEN="ms-fixture-modelscope-token"
+harness_fake_ollama --openai-chat PONG --openai-bearer "${MS_TOKEN}"
+MS_LOG="${FAKE_OLLAMA_LOG}"
+cat > "${MS_ONLY}" <<TOML
+default_model = "alibaba/deepseek-ai/DeepSeek-V4-Flash-0731"
+[providers.modelscope]
+type = "openai"
+base_url = "${FAKE_OLLAMA_URL}/v1"
+api_key = "sk-dashscope-not-a-modelscope-token"
+[models."alibaba/deepseek-ai/DeepSeek-V4-Flash-0731"]
+provider = "modelscope"
+model = "deepseek-ai/DeepSeek-V4-Flash-0731"
+max_context_size = 131072
+TOML
+: >"${MS_LOG}"
+MODELSCOPE_API_KEY="${MS_TOKEN}" KIMI_CONFIG="${MS_ONLY}" "${KIMO}" launch claude --provider alibaba >/dev/null 2>&1
+check "ModelScope wire id keeps the org slash" "deepseek-ai/DeepSeek-V4-Flash-0731" "$(flag_val "${CAPTURE}" --model)"
+check_contains "ModelScope turn is answered with the access token" "PONG" "$(env_val "${CAPTURE}" ANSWER)"
+check_contains "upstream was asked for the slashed ModelScope id" '"model":"deepseek-ai/DeepSeek-V4-Flash-0731"' "$(<"${MS_LOG}")"
+check_not_contains "claude does not see the ModelScope token" "${MS_TOKEN}" "$(<"${CAPTURE}")"
+check_not_contains "claude does not see the rejected DashScope key" "sk-dashscope-not-a-modelscope-token" "$(<"${CAPTURE}")"
+unset MODELSCOPE_API_KEY
 
 echo
 harness_summary "dashscope_smoke"
