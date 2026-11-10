@@ -468,7 +468,7 @@ def fetch_live_models(token: str, timeout: float = 6) -> list[tuple[str, str, in
     return GROK_MODELS
 
 
-def sync(home: Path, config: Path, selected: str, as_json: bool) -> None:
+def sync(home: Path, config: Path, selected: str, as_json: bool, context_override: int | None = None) -> None:
     import tomlkit
     config.parent.mkdir(parents=True, exist_ok=True)
     doc = read_config(config)
@@ -478,12 +478,16 @@ def sync(home: Path, config: Path, selected: str, as_json: bool) -> None:
 
     p = providers.setdefault("xai", tomlkit.table())
     p["type"] = "openai"
-    p["base_url"] = "https://api.x.ai/v1"
-    p["api_key_env"] = "XAI_AUTH_TOKEN"
+    base = os.environ.get("KIMO_XAI_BASE_URL") or "https://api.x.ai/v1"
+    p["base_url"] = base.rstrip("/")
+    token = get_working_token(home)
+    if token.startswith("xai-"):
+        p["api_key_env"] = "XAI_API_KEY"
+    else:
+        p["api_key_env"] = "XAI_AUTH_TOKEN"
     if "api_key" in p:
         del p["api_key"]
 
-    token = get_working_token(home)
     available_models = fetch_live_models(token)
 
     for slug, name, ctx, out, think in available_models:
@@ -499,10 +503,27 @@ def sync(home: Path, config: Path, selected: str, as_json: bool) -> None:
             caps.append("thinking")
         m["capabilities"] = caps
 
+    target = ""
     if selected:
-        target = selected if selected.startswith("xai/") else f"xai/{selected}"
-        if target in models:
-            doc["default_model"] = target
+        target = selected if selected.startswith("xai/") else f"xai/{selected.removeprefix('grok/')}"
+        if target not in models:
+            slug = target.removeprefix("xai/")
+            m = models.setdefault(target, tomlkit.table())
+            m["provider"] = "xai"
+            m["model"] = slug
+            m["display_name"] = f"{slug} (xAI Grok)"
+            m["max_context_size"] = context_override or 500000
+            m["max_output_size"] = 65536
+            m["capabilities"] = ["tool_use", "thinking"]
+        doc["default_model"] = target
+
+    if context_override is not None:
+        if target and target in models:
+            models[target]["max_context_size"] = context_override
+        else:
+            for k, m in models.items():
+                if k.startswith("xai/"):
+                    m["max_context_size"] = context_override
 
     # Backup
     ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%S+0000")
@@ -513,8 +534,17 @@ def sync(home: Path, config: Path, selected: str, as_json: bool) -> None:
         prune_backups(config, backup)
 
     config.write_text(tomlkit.dumps(doc), encoding="utf-8")
+    selected_ctx = models.get(target, {}).get("max_context_size") if target else (
+        context_override or (models.get(doc.get("default_model", ""), {}).get("max_context_size") or 500000)
+    )
     if as_json:
-        print(json.dumps({"ok": True, "provider": "xai", "models": len(available_models)}))
+        print(json.dumps({
+            "ok": True,
+            "provider": "xai",
+            "models": len([k for k in models if k.startswith("xai/")]),
+            "default_model": doc.get("default_model"),
+            "max_context_size": selected_ctx,
+        }))
     else:
         print(f"[+] Synchronized {len(available_models)} xAI Grok models into {config}")
 
@@ -539,7 +569,15 @@ def main():
     home = Path(os.environ.get("HOME") or Path.home())
     config = Path(os.environ.get("KIMI_CONFIG") or home / ".kimi-code" / "config.toml")
     as_json = "--json" in sys.argv[2:]
-    positional = [a for a in sys.argv[2:] if a != "--json"]
+    context_override = None
+    args = sys.argv[2:]
+    for i, a in enumerate(args):
+        if a == "--ctx" and i + 1 < len(args):
+            try:
+                context_override = int(args[i + 1])
+            except ValueError:
+                pass
+    positional = [a for i, a in enumerate(args) if a != "--json" and a != "--ctx" and (i == 0 or args[i - 1] != "--ctx")]
     argument = positional[0] if positional else ""
 
     if action == "status":
@@ -568,7 +606,7 @@ def main():
             print(f"export XAI_AUTH_TOKEN={tok}")
             print(f"export XAI_API_KEY={tok}")
     elif action == "sync":
-        sync(home, config, argument, as_json)
+        sync(home, config, argument, as_json, context_override=context_override)
     elif action == "default-model":
         print(default_model(home, config))
     else:

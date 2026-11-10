@@ -190,9 +190,13 @@ rc=0
 XAI_API_KEY=ollama "${KIMO}" launch codex --provider xai --dry-run >/dev/null 2>&1 || rc=$?
 check "the ollama placeholder is not an xAI key" 1 "${rc}"
 rc=0
-bad=$("${KIMO}" launch kimi --provider xai --dry-run 2>&1) || rc=$?
-check "xai is codex-only" 1 "${rc}"
-check_contains "the rejection names codex" "supports codex" "${bad}"
+bad=$("${KIMO}" launch agy --provider xai --dry-run 2>&1) || rc=$?
+check "xai rejects agy" 1 "${rc}"
+check_contains "the rejection names supported clis" "supports codex claude kimi" "${bad}"
+dry_kimi=$(XAI_API_KEY="${XAI_KEY}" "${KIMO}" launch kimi --provider xai --dry-run)
+check_contains "xai kimi provider" "provider: xai" "${dry_kimi}"
+check_contains "xai kimi model" "model  : grok-4.7" "${dry_kimi}"
+check_contains "xai kimi argv" "kimi -m xai/grok-4.7" "${dry_kimi}"
 rc=0
 badurl=$(KIMO_XAI_BASE_URL='http://api.x.ai/v1' XAI_API_KEY="${XAI_KEY}" "${KIMO}" launch codex --provider xai --dry-run 2>&1) || rc=$?
 check "a non-https base URL is rejected" 1 "${rc}"
@@ -261,7 +265,7 @@ sleep 0.2
 PORT_FILE="${HARNESS_ROOT}/proxy-port"
 python3 "${ROOT_DIR}/lib/kimo-responses-proxy.py" --upstream "http://127.0.0.1:8877/v1" --port-file "${PORT_FILE}" --exit-with-pid "$$" >/dev/null 2>&1 &
 PROXY_PID=$!
-for _ in 1 2 3 4 5 6 7 8 9 10; do
+for _ in $(seq 1 100); do
     [[ -s "${PORT_FILE}" ]] && break
     sleep 0.1
 done

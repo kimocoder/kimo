@@ -67,9 +67,12 @@ check "a missing xai key fails" 1 "${rc}"
 check_contains "the error names XAI_API_KEY" "XAI_API_KEY" "${missing}"
 
 rc=0
-closed=$("${KIMO}" launch kimi --provider xai --dry-run 2>&1) || rc=$?
-check "kimi still has no xai branch" 1 "${rc}"
-check_contains "the rejection names claude" "supports codex claude" "${closed}"
+closed=$("${KIMO}" launch agy --provider xai --dry-run 2>&1) || rc=$?
+check "agy still has no xai branch" 1 "${rc}"
+check_contains "the rejection names codex claude kimi" "supports codex claude kimi" "${closed}"
+
+dry_kimi=$(XAI_API_KEY="${XAI_KEY}" "${KIMO}" launch kimi --provider xai --dry-run)
+check_contains "kimi xai dry-run argv" "kimi -m xai/grok-4.7" "${dry_kimi}"
 
 dry=$(QWENCLOUD_API_KEY="${QW_KEY}" "${KIMO}" launch claude --provider qwencloud --dry-run)
 check_contains "qwencloud chat wire" "anthropic -> chat (https://ap-southeast-1.maas.qwencloudapi.com/compatible-mode/v1)" "${dry}"

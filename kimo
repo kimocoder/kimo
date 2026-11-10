@@ -410,6 +410,7 @@ QWENCLOUD_DEFAULT_CTX="${KIMO_QWENCLOUD_CTX:-1000000}"
 XAI_BACKEND_URL="${KIMO_XAI_BASE_URL:-https://api.x.ai/v1}"
 XAI_DEFAULT_MODEL="${KIMO_XAI_MODEL:-grok-4.7}"
 XAI_DEFAULT_CTX="${KIMO_XAI_CTX:-500000}"
+XAI_CLIS="codex claude kimi"
 
 # Anthropic's OpenAI-compatible Responses surface. The base includes /v1
 # because Codex posts {base_url}/responses. This is not Claude Code's
@@ -1301,6 +1302,7 @@ command_needs_remote() {
                 "")
                     [[ "${model}" == codex/* || "${model}" == codex ]] && return 1
                     [[ "${model}" == vllm/* ]] && return 1
+                    [[ "${model}" == xai/* || "${model}" == grok/* ]] && return 1
                     if [[ "${cli}" == codex || "${cli}" == kimi ]] && ! ${explicit} \
                         && [[ -n "${CODEX_API_KEY:-}${CODEX_AUTH_TOKEN:-}" ]]; then
                         return 1
@@ -7048,6 +7050,13 @@ _resolve_grok_auth() {
     return 0
 }
 
+_grok_sync_kimi() (
+    mkdir -p "$(dirname "${KIMI_CONFIG_LOCK}")" || return 1
+    exec 9>>"${KIMI_CONFIG_LOCK}" || return 1
+    flock -w 15 9 || { echo "Error: Kimi config is busy; retry the xAI sync." >&2; return 1; }
+    _grok_helper sync "$@"
+)
+
 _grok_helper() {
     local helper
     if ! helper=$(_find_lib_helper kimo-grok.py "${KIMO_GROK_HELPER:-}"); then
@@ -8067,6 +8076,7 @@ cmd_launch() {
             codex/*|codex) cloud_provider="codex" ;;
             openai/*|openai) cloud_provider="openai" ;;
             vllm/*) cloud_provider="vllm" ;;
+            xai/*|grok/*) cloud_provider="xai" ;;
         esac
     fi
     if [[ -z "${cloud_provider}" && -z "${provider_selected}" && "${opt_model_explicit}" != true ]] \
@@ -8348,8 +8358,10 @@ cmd_launch() {
             return 1
         fi
     elif [[ "${cloud_provider}" == "qwencloud" || "${cloud_provider}" == "xai" || "${cloud_provider}" == "anthropic" || "${cloud_provider}" == "gemini" || "${cloud_provider}" == "kalidroid" ]]; then
-        if [[ "${provider}" != "codex" && "${provider}" != "claude" ]]; then
-            echo "${C_RED}Error: '--provider ${cloud_provider}' supports codex claude; '${provider}' has no ${cloud_provider} launch branch yet.${C_RESET}" >&2
+        local supported_clis="codex claude"
+        [[ "${cloud_provider}" == "xai" ]] && supported_clis="${XAI_CLIS:-codex claude kimi}"
+        if [[ " ${supported_clis} " != *" ${provider} "* ]]; then
+            echo "${C_RED}Error: '--provider ${cloud_provider}' supports ${supported_clis}; '${provider}' has no ${cloud_provider} launch branch yet.${C_RESET}" >&2
             echo "${C_DIM}    Those CLIs are wired for a self-hosted Ollama host. Drop --provider to route '${provider}' to Ollama.${C_RESET}" >&2
             return 1
         fi
@@ -8542,7 +8554,7 @@ cmd_launch() {
             return 1
         fi
         active_host="${provider_base}"
-        if ! ${opt_model_explicit} || [[ -z "${target_model}" || "${target_model}" == codex || "${target_model}" == claude ]]; then
+        if ! ${opt_model_explicit} || [[ -z "${target_model}" || "${target_model}" == codex || "${target_model}" == claude || "${target_model}" == kimi ]]; then
             resolved_model="${provider_model}"
         else
             resolved_model="${target_model}"
@@ -8580,7 +8592,7 @@ cmd_launch() {
                 _claude_use chat "${provider_base}" "${key_var}" \
                     "${opt_launch_ctx:-${provider_ctx}}" || return 1
             fi
-        else
+        elif [[ "${provider}" == codex ]]; then
             codex_mp_id="${cloud_provider}"
             codex_mp_name="${provider_name}"
             codex_mp_base="${provider_base}"
@@ -8985,7 +8997,7 @@ cmd_launch() {
     # never fall back to 'ollama run'. A dry run never execs the CLI, so it
     # reports the missing binary as a note instead of failing.
     local no_ollama_fallback=0
-    if openai_backend "${cloud_provider}" || [[ -n "${codex_mp_id}" || "${cloud_provider}" == "ollama-cloud" ]]; then
+    if openai_backend "${cloud_provider}" || [[ -n "${codex_mp_id}" || "${cloud_provider}" == "ollama-cloud" || ( "${cloud_provider}" == "xai" && "${provider}" == "kimi" ) ]]; then
         no_ollama_fallback=1
     fi
     if [[ "${cli_available}" -eq 0 && "${no_ollama_fallback}" -eq 1 && "${opt_dry_run}" != true ]]; then
@@ -9175,6 +9187,8 @@ cmd_launch() {
             else
                 dry_argv=(kimi)
             fi
+        elif [[ "${cloud_provider}" == "xai" && "${cli_cmd}" == "kimi" ]]; then
+            dry_argv=(kimi -m "xai/${resolved_model}")
         elif [[ -n "${codex_mp_id}" ]]; then
             dry_argv=("${codex_argv[@]}")
         fi
@@ -9294,6 +9308,9 @@ cmd_launch() {
             elif [[ "${cloud_provider}" == "ollama-cloud" ]]; then
                 echo "  evict  : n/a (hosted API, no VRAM to free)"
                 echo "  context: ${ollama_cloud_ctx} tokens"
+            elif [[ "${cloud_provider}" == "xai" && "${provider}" == "kimi" ]]; then
+                echo "  evict  : n/a (hosted API, no VRAM to free)"
+                echo "  context: ${opt_launch_ctx:-${provider_ctx}} tokens"
             elif hosted_provider "${cloud_provider}"; then
                 echo "  evict  : n/a (hosted API, no VRAM to free)"
                 if [[ "${cli_cmd}" == agy && "${cloud_provider}" == codex ]]; then
@@ -9348,6 +9365,8 @@ cmd_launch() {
                         fi
                     elif [[ "${cloud_provider}" == "vllm" ]]; then
                         echo "  ${C_DIM}(at launch kimi gets [providers.${vllm_pid}] plus served-model aliases when /v1/models answers; this dry run writes no config)${C_RESET}"
+                    elif [[ "${cloud_provider}" == "xai" ]]; then
+                        echo "  ${C_DIM}(Kimi's xai/ aliases are synced at launch; this dry run writes no config)${C_RESET}"
                     elif openai_backend "${cloud_provider}"; then
                         if [[ "${cli_cmd}" == agy ]]; then
                             echo "  ${C_DIM}(agy speaks Gemini. A live launch points it at a localhost shim that posts /responses; CODEX_AUTH_TOKEN stays in the shim and is not exported to agy.)${C_RESET}"
@@ -9648,6 +9667,59 @@ cmd_launch() {
                 _resolve_claude_auth || true
                 _resolve_gemini_auth || true
                 _resolve_grok_auth || true
+                if [[ "${cloud_provider}" == "xai" ]]; then
+                    # xAI Grok provider routes through config.toml: kimi needs a
+                    # [providers.xai] entry (base_url plus api_key_env naming
+                    # XAI_AUTH_TOKEN or XAI_API_KEY) and an alias for the
+                    # launched model (xai/<model>). The credential itself stays in the
+                    # environment, so nothing secret is written to disk.
+                    local sync_result="" synced_model="" synced_ctx=""
+                    local kimi_api_ctx="${opt_launch_ctx}"
+                    local -a kimi_sync_ctx=()
+                    if [[ -n "${kimi_api_ctx}" ]]; then
+                        kimi_sync_ctx=(--ctx "${kimi_api_ctx}")
+                    fi
+                    local target_alias="xai/${resolved_model}"
+                    sync_result=$(_grok_sync_kimi --json "${target_alias}" "${kimi_sync_ctx[@]}" 2>&1) || {
+                        echo "${C_YELLOW}[!] Warning: could not sync xAI Grok models into kimi config; falling back to KIMI_MODEL_* env channel${C_RESET}" >&2
+                        sync_result=""
+                    }
+                    if [[ -n "${sync_result}" ]]; then
+                        synced_model=$(echo "${sync_result}" | jq -r '.default_model // empty' 2>/dev/null)
+                        if [[ -n "${synced_model}" ]]; then
+                            resolved_model="${synced_model}"
+                        else
+                            resolved_model="${target_alias}"
+                        fi
+                        synced_ctx=$(echo "${sync_result}" | jq -r '.max_context_size // empty' 2>/dev/null)
+                        if [[ -n "${synced_ctx}" ]]; then
+                            echo "${C_DIM}[*] kimi context window: ${synced_ctx} tokens${C_RESET}" >&2
+                        fi
+                        echo "${C_DIM}[*] kimi on xai provider: ${resolved_model} via [providers.xai]${C_RESET}" >&2
+                        unset KIMI_MODEL_NAME KIMI_MODEL_API_KEY KIMI_MODEL_PROVIDER_TYPE \
+                            KIMI_MODEL_BASE_URL KIMI_MODEL_MAX_CONTEXT_SIZE KIMI_MODEL_CAPABILITIES \
+                            KIMI_MODEL_REASONING_KEY KIMI_MODEL_THINKING_EFFORT
+                        export KIMI_DISABLE_TELEMETRY="${KIMI_DISABLE_TELEMETRY:-1}"
+                        export KIMI_CODE_NO_AUTO_UPDATE="${KIMI_CODE_NO_AUTO_UPDATE:-1}"
+                        exec "${cli_cmd}" -m "${resolved_model}" "${cli_passthrough_args[@]}"
+                    fi
+                    # Fallback to KIMI_MODEL_* env channel if config sync failed (e.g. no tomlkit)
+                    unset KIMI_MODEL_NAME KIMI_MODEL_API_KEY KIMI_MODEL_PROVIDER_TYPE \
+                        KIMI_MODEL_BASE_URL KIMI_MODEL_MAX_CONTEXT_SIZE KIMI_MODEL_CAPABILITIES \
+                        KIMI_MODEL_REASONING_KEY KIMI_MODEL_THINKING_EFFORT
+                    export KIMI_DISABLE_TELEMETRY="${KIMI_DISABLE_TELEMETRY:-1}"
+                    export KIMI_CODE_NO_AUTO_UPDATE="${KIMI_CODE_NO_AUTO_UPDATE:-1}"
+                    export KIMI_MODEL_NAME="${resolved_model}"
+                    export KIMI_MODEL_PROVIDER_TYPE="openai"
+                    export KIMI_MODEL_BASE_URL="${provider_base}"
+                    export KIMI_MODEL_API_KEY="${!key_var}"
+                    export KIMI_MODEL_MAX_CONTEXT_SIZE="${opt_launch_ctx:-${provider_ctx}}"
+                    export KIMI_MODEL_CAPABILITIES="${KIMO_KIMI_CAPABILITIES:-thinking,tool_use}"
+                    export KIMI_MODEL_REASONING_KEY="${KIMO_KIMI_REASONING_KEY:-reasoning_content}"
+                    export KIMI_MODEL_THINKING_EFFORT="${KIMO_KIMI_EFFORT:-${OM_KIMI_EFFORT:-high}}"
+                    echo "${C_DIM}[*] kimi on xai '${resolved_model}' via ${provider_base} (context ${KIMI_MODEL_MAX_CONTEXT_SIZE})${C_RESET}" >&2
+                    exec "${cli_cmd}" "${cli_passthrough_args[@]}"
+                fi
                 if openai_backend "${cloud_provider}"; then
                     # Both OpenAI backends route through config.toml: kimi needs a
                     # [providers.<backend>] entry (base_url plus the NAME of the
@@ -14758,8 +14830,12 @@ def resolve_gemini_token():
     return None, None
 
 def resolve_grok_login():
+    for var in ("XAI_AUTH_TOKEN", "XAI_API_KEY", "GROK_AUTH_TOKEN"):
+        val = os.environ.get(var, "")
+        if val and val != "ollama":
+            return val, f"env:{var}"
     try:
-        gdir = os.environ.get("GROK_CONFIG_DIR") or os.path.expanduser("~/.grok")
+        gdir = os.environ.get("GROK_CONFIG_DIR") or os.environ.get("GROK_HOME") or os.path.expanduser("~/.grok")
         gpath = os.path.join(gdir, "auth.json")
         if os.path.exists(gpath):
             with open(gpath, "r", encoding="utf-8") as f:
@@ -14781,7 +14857,7 @@ def is_xai(prov, pid=""):
     if key.startswith("xai-"):
         return True
     env_name = prov.get("api_key_env") or ""
-    if env_name in ("XAI_API_KEY", "GROK_API_KEY"):
+    if env_name in ("XAI_API_KEY", "GROK_API_KEY", "XAI_AUTH_TOKEN"):
         return True
     return False
 
@@ -14844,7 +14920,7 @@ def resolve_key(prov):
             tok, src = resolve_gemini_token()
             if tok:
                 return tok, src
-        if env_name in ("XAI_API_KEY", "GROK_API_KEY") or is_xai(prov, pid):
+        if env_name in ("XAI_API_KEY", "GROK_API_KEY", "XAI_AUTH_TOKEN") or is_xai(prov, pid):
             tok, src = resolve_grok_login()
             if tok:
                 return tok, src

@@ -419,6 +419,19 @@ kimo gemini --stable-only                # Register stable models only
 kimo gemini --set-default gemini/gemini-2.5-flash
 ```
 
+## Grok / xAI Token Management & Model Sync (`grok`)
+
+`kimo grok` inspects Grok CLI authentication (`~/.grok/auth.json`), provides token export and auto-renewal, and syncs xAI models into Kimi Code (`~/.kimi-code/config.toml`):
+
+```bash
+kimo grok                                # Inspect Grok login session, account & expiration
+kimo grok --token                        # Output active bearer token or API key
+kimo grok --export                       # Output eval-able export for XAI_AUTH_TOKEN
+kimo grok --json                         # Structured JSON session status
+kimo grok sync                           # Sync xAI models (xai/grok-4.7, etc.) into Kimi config
+kimo grok --set-default xai/grok-4.7     # Sync and set default model in Kimi
+```
+
 ---
 
 ## Kimi Code Provider Management (`kimi provider`)
@@ -799,16 +812,18 @@ kimi rides its zero-footprint `KIMI_MODEL_*` env channel (wire type `openai`, re
 
 ### Codex Responses providers (`qwencloud`, `xai`, `anthropic`)
 
-`kimo launch codex --provider` can also target three more Responses endpoints. Codex CLI 0.164 accepts only `wire_api = "responses"` (it rejects `chat`). These providers launch **codex** and **claude**. Codex gets `-c` overlays (`wire_api=responses`). Claude Code speaks `/v1/messages`, so a live `launch claude` starts a localhost proxy that translates to Responses (an `xai-` key, OpenAI, the ChatGPT Codex backend) or Chat Completions (a `grok login` session, QwenCloud, Gemini, vLLM). A grok-login token is sent to `cli-chat-proxy.grok.com` with `X-XAI-Token-Auth: xai-grok-cli`; without that header the proxy answers 401 `x_xai_token_auth=none`. The same 401 with `x_xai_token_auth=xai-grok-cli` and `reason=no auth context` is an expired bearer. A stale `eyJ` left in `XAI_API_KEY` or `XAI_AUTH_TOKEN` is replaced by the live session in `~/.grok/auth.json`, and that session is refreshed from its `refresh_token` when it has expired. The upstream key stays in its environment variable; Claude receives only a per-launch token for the proxy. `--provider anthropic` launches Claude Code on `https://api.anthropic.com` directly. `KIMO_ANTHROPIC_BASE_URL` remains the Codex Responses origin and is not applied to Claude Code. `--dry-run` masks the key and does not start the proxy. Nothing is written to `~/.codex/config.toml` or placed in argv. `--oss` is not set, and a ChatGPT login is not required for the Responses providers. Codex's multi-agent tools, and the TUI's `codex_worktrees` MCP server, are sent as `{"type":"namespace"}`. These endpoints reject that variant with HTTP 422. Codex 0.164 also sends `external_web_access` on `web_search`, which xAI rejects with HTTP 400 (`Argument not supported: external_web_access`) before the model runs. The launch disables multi-agent and, through a localhost proxy, flattens remaining namespace tools and drops `external_web_access`, `indexed_web_access`, and `search_context_size`. Cached web search (`external_web_access: false`) is omitted, because these endpoints have no cached-only search. Live and indexed search stay, with `filters`, `user_location`, and `search_content_types` kept. The key still goes only to the upstream.
+`kimo launch codex --provider` can also target three more Responses endpoints. Codex CLI 0.164 accepts only `wire_api = "responses"` (it rejects `chat`). These providers launch **codex** and **claude**; `xai` (`grok`) also launches **kimi**. Codex gets `-c` overlays (`wire_api=responses`). Claude Code speaks `/v1/messages`, so a live `launch claude` starts a localhost proxy that translates to Responses (an `xai-` key, OpenAI, the ChatGPT Codex backend) or Chat Completions (a `grok login` session, QwenCloud, Gemini, vLLM). Kimi Code speaks OpenAI chat completions, so `launch kimi --provider xai` configures `[providers.xai]` and `xai/<model>` aliases in `~/.kimi-code/config.toml` (with `KIMI_MODEL_*` env fallback) using either an API key (`XAI_API_KEY`) or an OAuth session (`XAI_AUTH_TOKEN` from `~/.grok/auth.json`), defaulting to `xai/grok-4.7` with a 500,000 token context window (overridable via `--ctx` or `KIMO_XAI_CTX`). A grok-login token is sent to `cli-chat-proxy.grok.com` with `X-XAI-Token-Auth: xai-grok-cli`; without that header the proxy answers 401 `x_xai_token_auth=none`. The same 401 with `x_xai_token_auth=xai-grok-cli` and `reason=no auth context` is an expired bearer. A stale `eyJ` left in `XAI_API_KEY` or `XAI_AUTH_TOKEN` is replaced by the live session in `~/.grok/auth.json`, and that session is refreshed from its `refresh_token` when it has expired. The upstream key stays in its environment variable; Claude receives only a per-launch token for the proxy. `--provider anthropic` launches Claude Code on `https://api.anthropic.com` directly. `KIMO_ANTHROPIC_BASE_URL` remains the Codex Responses origin and is not applied to Claude Code. `--dry-run` masks the key and does not start the proxy. Nothing is written to `~/.codex/config.toml` or placed in argv. `--oss` is not set, and a ChatGPT login is not required for the Responses providers. Codex's multi-agent tools, and the TUI's `codex_worktrees` MCP server, are sent as `{"type":"namespace"}`. These endpoints reject that variant with HTTP 422. Codex 0.164 also sends `external_web_access` on `web_search`, which xAI rejects with HTTP 400 (`Argument not supported: external_web_access`) before the model runs. The launch disables multi-agent and, through a localhost proxy, flattens remaining namespace tools and drops `external_web_access`, `indexed_web_access`, and `search_context_size`. Cached web search (`external_web_access: false`) is omitted, because these endpoints have no cached-only search. Live and indexed search stay, with `filters`, `user_location`, and `search_content_types` kept. The key still goes only to the upstream.
 
 | Provider | Default endpoint | Credential | Default model | Context |
 | --- | --- | --- | --- | --- |
 | `qwencloud` | `https://ap-southeast-1.maas.qwencloudapi.com/compatible-mode/v1` | `QWENCLOUD_API_KEY`, else `DASHSCOPE_API_KEY`, else `MODELSTUDIO_API_KEY` | `qwen3.8-max` | 1,000,000 |
-| `xai` (`grok`) | `https://api.x.ai/v1` | `XAI_API_KEY` | `grok-4.7` | 500,000 |
+| `xai` (`grok`) | `https://api.x.ai/v1` | `XAI_API_KEY`, else `XAI_AUTH_TOKEN` (or `~/.grok/auth.json`) | `grok-4.7` | 500,000 |
 | `anthropic` | `https://api.anthropic.com/v1` | `ANTHROPIC_API_KEY`, else `ANTHROPIC_AUTH_TOKEN` | `claude-opus-5-5` | 1,000,000 |
 
 ```bash
 kimo launch claude --provider xai
+kimo launch kimi --provider xai                  # launch kimi with xAI token auth (grok-4.7)
+kimo launch kimi --provider grok --model grok-4  # grok alias with explicit model
 kimo launch claude --provider openai --model gpt-5.1
 kimo launch claude --provider codex
 kimo launch claude --provider anthropic          # official Messages API, no proxy

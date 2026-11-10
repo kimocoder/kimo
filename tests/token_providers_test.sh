@@ -178,6 +178,11 @@ check_contains "launch xai uses XAI_AUTH_TOKEN env_key" 'env_key=\"XAI_AUTH_TOKE
 check_contains "launch xai masks oauth secret" 'XAI_AUTH_TOKEN <kept: real value, xAI key>' "${dry_xai}"
 check_not_contains "dry-run never exposes raw token" "${MOCK_GROK_ACCESS}" "${dry_xai}"
 
+dry_kimi_xai=$("${KIMO}" launch kimi --provider xai --dry-run)
+check_contains "launch kimi xai argv" 'kimi -m xai/grok-4.7' "${dry_kimi_xai}"
+check_contains "launch kimi xai masks oauth secret" 'XAI_AUTH_TOKEN <kept: real value, xAI key>' "${dry_kimi_xai}"
+check_not_contains "dry-run never exposes raw token to kimi" "${MOCK_GROK_ACCESS}" "${dry_kimi_xai}"
+
 echo "[*] [5] A stale grok-login JWT must not hide the live auth.json session"
 # exp 1600000000 is 2020. The shell copies of this are what cli-chat-proxy 401s
 # as reason=no auth context. The file token is the one from section [3].
