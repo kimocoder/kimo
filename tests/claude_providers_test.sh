@@ -262,6 +262,31 @@ PY
 )"
 check "a resumed beam id is rewritten to the kalidroid model" "beam-rewrite-ok" "${beam_rewrite}"
 
+think_markup="$(python3 - "${PROXY}" <<'PY'
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("anthropic_proxy", sys.argv[1])
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+events = []
+streamed = mod.Builder("qwen3.8-27b-uncensored", lambda event, data: events.append(data))
+for piece in ("<th", "ink>reasoning</th", "ink>", " and 2 < 3"):
+    streamed.thinking(piece)
+streamed.finish()
+assert streamed.blocks[0]["thinking"] == "reasoning and 2 < 3", streamed.blocks
+emitted = "".join(
+    data["delta"]["thinking"]
+    for data in events
+    if data.get("type") == "content_block_delta" and data.get("delta", {}).get("type") == "thinking_delta"
+)
+assert emitted == "reasoning and 2 < 3", emitted
+plain = mod.Builder("qwen3.8-27b-uncensored")
+mod.apply_chat_message(plain, {"choices": [{"message": {"reasoning_content": "<think>reasoning</think>"}}]})
+assert plain.as_message()["content"][0]["thinking"] == "reasoning", plain.as_message()
+print("think-markup-ok")
+PY
+)"
+check "think markup is stripped across streamed and plain responses" "think-markup-ok" "${think_markup}"
+
 # Print the port a background server wrote to <file>, waiting up to 10s.
 # Prints nothing on timeout so the caller's check fails instead of set -e
 # aborting the run.

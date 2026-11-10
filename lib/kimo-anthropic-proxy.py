@@ -913,6 +913,7 @@ class Builder:
         self.input_tokens = 1
         self.output_tokens = 1
         self.msg_id = "msg_kimo"
+        self.thinking_carry = ""
 
     def note_usage(self, incoming: object, outgoing: object) -> None:
         if isinstance(incoming, int) and not isinstance(incoming, bool) and incoming > 0:
@@ -949,6 +950,8 @@ class Builder:
     def _close_open(self) -> None:
         if self.open_index is None:
             return
+        if self.blocks[self.open_index]["type"] == "thinking":
+            self._flush_thinking()
         self._send("content_block_stop", {"type": "content_block_stop", "index": self.open_index})
         self.open_index = None
 
@@ -979,8 +982,8 @@ class Builder:
             "delta": {"type": "text_delta", "text": piece},
         })
 
-    def thinking(self, piece: object) -> None:
-        if not isinstance(piece, str) or not piece:
+    def _write_thinking(self, piece: str) -> None:
+        if not piece:
             return
         block = self._open_text("thinking")
         block["thinking"] += piece
@@ -989,6 +992,24 @@ class Builder:
             "index": self.open_index,
             "delta": {"type": "thinking_delta", "thinking": piece},
         })
+
+    def _flush_thinking(self) -> None:
+        pending = self.thinking_carry
+        self.thinking_carry = ""
+        self._write_thinking(pending)
+
+    def thinking(self, piece: object) -> None:
+        if not isinstance(piece, str) or not piece:
+            return
+        clean = re.sub(r"</?think>", "", self.thinking_carry + piece, flags=re.IGNORECASE)
+        self.thinking_carry = ""
+        for length in range(min(len(clean), 6), 0, -1):
+            suffix = clean[-length:].lower()
+            if "<think>".startswith(suffix) or "</think>".startswith(suffix):
+                self.thinking_carry = clean[-length:]
+                clean = clean[:-length]
+                break
+        self._write_thinking(clean)
 
     def tool_delta(self, index: object, tool_id: object, name: object, arguments: object) -> None:
         self._message_start()
@@ -1042,6 +1063,7 @@ class Builder:
         self._send("message_stop", {"type": "message_stop"})
 
     def as_message(self) -> dict:
+        self._flush_thinking()
         content = []
         for block in self.blocks:
             if block["type"] == "text":
