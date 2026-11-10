@@ -9,9 +9,10 @@
 #   * the real ak_ key reaches the selected provider - the one deliberate
 #     exception to kimo's non-local credential scrub - and never appears in
 #     argv or in --dry-run output
-#   * claude gets the [1m] context suffix, CLAUDE_CODE_MAX_CONTEXT_TOKENS and
-#     the ANTHROPIC_DEFAULT_*_MODEL tier overrides; x-api-key stays unset so
-#     exactly one credential rides the request
+#   * claude gets the [1m] context suffix, CLAUDE_CODE_MAX_CONTEXT_TOKENS,
+#     CLAUDE_CODE_SUBAGENT_MODEL and the ANTHROPIC_DEFAULT_*_MODEL tier overrides;
+#     stale Codex subagent and family pins are stripped from ~/.claude/settings.json;
+#     x-api-key stays unset so exactly one credential rides the request
 #   * kimi: a validated key registers a named [providers.abliteration] (the key
 #     by env-var NAME only) plus an alias per served model, and launches on
 #     'abliteration/<id>'; when validation cannot complete (blocked network, no
@@ -52,9 +53,13 @@ cat > "${FAKE_DIR}/claude" <<'FAKE'
     printf 'CLAUDE_CODE_MAX_CONTEXT_TOKENS=%s\n' "${CLAUDE_CODE_MAX_CONTEXT_TOKENS-<unset>}"
     printf 'CLAUDE_CODE_AUTO_COMPACT_WINDOW=%s\n' "${CLAUDE_CODE_AUTO_COMPACT_WINDOW-<unset>}"
     printf 'CLAUDE_CODE_EFFORT_LEVEL=%s\n' "${CLAUDE_CODE_EFFORT_LEVEL-<unset>}"
+    printf 'ANTHROPIC_MODEL=%s\n' "${ANTHROPIC_MODEL-<unset>}"
     printf 'ANTHROPIC_DEFAULT_OPUS_MODEL=%s\n' "${ANTHROPIC_DEFAULT_OPUS_MODEL-<unset>}"
     printf 'ANTHROPIC_DEFAULT_SONNET_MODEL=%s\n' "${ANTHROPIC_DEFAULT_SONNET_MODEL-<unset>}"
     printf 'ANTHROPIC_DEFAULT_HAIKU_MODEL=%s\n' "${ANTHROPIC_DEFAULT_HAIKU_MODEL-<unset>}"
+    printf 'ANTHROPIC_DEFAULT_FABLE_MODEL=%s\n' "${ANTHROPIC_DEFAULT_FABLE_MODEL-<unset>}"
+    printf 'CLAUDE_CODE_SUBAGENT_MODEL=%s\n' "${CLAUDE_CODE_SUBAGENT_MODEL-<unset>}"
+    printf 'CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST=%s\n' "${CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST-<unset>}"
     printf 'OPENAI_BASE_URL=%s\n' "${OPENAI_BASE_URL-<unset>}"
     printf 'OPENAI_API_KEY=%s\n' "${OPENAI_API_KEY-<unset>}"
     printf 'OLLAMA_HOST=%s\n' "${OLLAMA_HOST-<unset>}"
@@ -122,11 +127,50 @@ else
     check "OPENAI_BASE_URL is the OpenAI surface" "${API}/v1" "$(env_val "${CAPTURE}" OPENAI_BASE_URL)"
     check "claude model id gets the 1M context suffix" "abliterated-model-large-v2[1m]" "$(flag_val "${CAPTURE}" --model)"
     check "CLAUDE_CODE_MAX_CONTEXT_TOKENS is the model window" "1000000" "$(env_val "${CAPTURE}" CLAUDE_CODE_MAX_CONTEXT_TOKENS)"
+    check "main model is the launched model" "abliterated-model-large-v2[1m]" "$(env_val "${CAPTURE}" ANTHROPIC_MODEL)"
     check "opus tier routed at the same model" "abliterated-model-large-v2[1m]" "$(env_val "${CAPTURE}" ANTHROPIC_DEFAULT_OPUS_MODEL)"
     check "sonnet tier routed at the same model" "abliterated-model-large-v2[1m]" "$(env_val "${CAPTURE}" ANTHROPIC_DEFAULT_SONNET_MODEL)"
     check "haiku tier routed at the same model" "abliterated-model-large-v2[1m]" "$(env_val "${CAPTURE}" ANTHROPIC_DEFAULT_HAIKU_MODEL)"
+    check "fable tier routed at the same model" "abliterated-model-large-v2[1m]" "$(env_val "${CAPTURE}" ANTHROPIC_DEFAULT_FABLE_MODEL)"
+    check "subagents use the launched model" "abliterated-model-large-v2[1m]" "$(env_val "${CAPTURE}" CLAUDE_CODE_SUBAGENT_MODEL)"
+    check "claude is marked provider-managed" "1" "$(env_val "${CAPTURE}" CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST)"
     check "no Ollama host is exported" "<unset>" "$(env_val "${CAPTURE}" OLLAMA_HOST)"
 fi
+
+echo "[*] claude: stale Codex subagent and family pins are unpinned and overridden"
+mkdir -p "${HOME}/.claude"
+cat > "${HOME}/.claude/settings.json" << 'EOF'
+{
+  "model": "opus",
+  "permissions": {"allow": ["Bash(echo ok)"]},
+  "env": {
+    "ANTHROPIC_DEFAULT_OPUS_MODEL": "gpt-6.1-sol",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL": "gpt-6.1-sol",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "gpt-6.1-sol",
+    "ANTHROPIC_DEFAULT_FABLE_MODEL": "gpt-6.1-sol",
+    "CLAUDE_CODE_SUBAGENT_MODEL": "gpt-6.1-sol",
+    "KEEP_ME": "yes"
+  }
+}
+EOF
+
+ANTHROPIC_DEFAULT_OPUS_MODEL="gpt-6.1-sol" \
+ANTHROPIC_DEFAULT_SONNET_MODEL="gpt-6.1-sol" \
+ANTHROPIC_DEFAULT_HAIKU_MODEL="gpt-6.1-sol" \
+ANTHROPIC_DEFAULT_FABLE_MODEL="gpt-6.1-sol" \
+CLAUDE_CODE_SUBAGENT_MODEL="gpt-6.1-sol" \
+launch claude --provider abliteration
+
+check "subagents use the launched model instead of codex" "abliterated-model-large-v2[1m]" "$(env_val "${CAPTURE}" CLAUDE_CODE_SUBAGENT_MODEL)"
+check "opus tier uses the launched model instead of codex" "abliterated-model-large-v2[1m]" "$(env_val "${CAPTURE}" ANTHROPIC_DEFAULT_OPUS_MODEL)"
+check "sonnet tier uses the launched model instead of codex" "abliterated-model-large-v2[1m]" "$(env_val "${CAPTURE}" ANTHROPIC_DEFAULT_SONNET_MODEL)"
+check "haiku tier uses the launched model instead of codex" "abliterated-model-large-v2[1m]" "$(env_val "${CAPTURE}" ANTHROPIC_DEFAULT_HAIKU_MODEL)"
+check "fable tier uses the launched model instead of codex" "abliterated-model-large-v2[1m]" "$(env_val "${CAPTURE}" ANTHROPIC_DEFAULT_FABLE_MODEL)"
+check "settings keep the user's model choice" "opus" "$(python3 -c 'import json; print(json.load(open("'"${HOME}"'/.claude/settings.json"))["model"])')"
+check "settings keep unrelated env" "yes" "$(python3 -c 'import json; print(json.load(open("'"${HOME}"'/.claude/settings.json"))["env"]["KEEP_ME"])')"
+check "settings drop the Codex subagent pin" "absent" "$(python3 -c 'import json; env=json.load(open("'"${HOME}"'/.claude/settings.json")).get("env", {}); print("absent" if "CLAUDE_CODE_SUBAGENT_MODEL" not in env else env["CLAUDE_CODE_SUBAGENT_MODEL"])')"
+check "settings drop the Codex opus pin" "absent" "$(python3 -c 'import json; env=json.load(open("'"${HOME}"'/.claude/settings.json")).get("env", {}); print("absent" if "ANTHROPIC_DEFAULT_OPUS_MODEL" not in env else env["ANTHROPIC_DEFAULT_OPUS_MODEL"])')"
+check "settings drop the Codex fable pin" "absent" "$(python3 -c 'import json; env=json.load(open("'"${HOME}"'/.claude/settings.json")).get("env", {}); print("absent" if "ANTHROPIC_DEFAULT_FABLE_MODEL" not in env else env["ANTHROPIC_DEFAULT_FABLE_MODEL"])')"
 
 echo "[*] claude: the image-capable model gets no 1M suffix"
 launch claude --provider abliteration --model base

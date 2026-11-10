@@ -8061,9 +8061,10 @@ cmd_launch() {
             exit 1
             ;;
     esac
-    # `launch claude` with no backend and no --host uses Ollama Cloud and beam.
-    # An explicit --provider or --host still selects that route.
-    if [[ -z "${cloud_provider}" && -z "${provider_selected}" && "${provider}" == claude && "${OPT_HOST_FROM_CLI}" != true ]]; then
+    # `launch claude` with no backend and no host selection uses Ollama Cloud and beam.
+    # An explicit --provider, --host, --remote or --local selects Ollama routing.
+    if [[ -z "${cloud_provider}" && -z "${provider_selected}" && "${provider}" == claude \
+        && "${OPT_HOST_FROM_CLI}" != true && "${OPT_REMOTE}" != true && "${OPT_LOCAL}" != true ]]; then
         cloud_provider="ollama-cloud"
     fi
 
@@ -9124,7 +9125,7 @@ cmd_launch() {
     # first-party routing (the session then shows "Claude Pro" and 404s a
     # hosted id). Process env only: a settings env block would outrank a
     # later plain `claude`. The USE_* flags are the same set ollama clears.
-    if [[ "${cloud_provider}" == "ollama-cloud" && "${cli_cmd}" == claude ]]; then
+    if [[ ( "${cloud_provider}" == "ollama-cloud" || "${cloud_provider}" == "abliteration" ) && "${cli_cmd}" == claude ]]; then
         export CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST=1
         unset CLAUDE_CODE_USE_BEDROCK CLAUDE_CODE_USE_VERTEX CLAUDE_CODE_USE_FOUNDRY \
             CLAUDE_CODE_USE_ANTHROPIC_AWS CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD \
@@ -9545,12 +9546,19 @@ cmd_launch() {
                     claude_model=$(abliteration_claude_model "${resolved_model}")
                     export CLAUDE_CODE_MAX_CONTEXT_TOKENS="${CLAUDE_CODE_MAX_CONTEXT_TOKENS:-${ablit_ctx}}"
                     export CLAUDE_CODE_AUTO_COMPACT_WINDOW="${CLAUDE_CODE_AUTO_COMPACT_WINDOW:-$((ablit_ctx / 2))}"
-                    # Route claude's internal tier requests (background haiku
-                    # calls, summarization) at the same model instead of letting
-                    # them fall back to real Anthropic ids this key cannot serve.
-                    export ANTHROPIC_DEFAULT_OPUS_MODEL="${ANTHROPIC_DEFAULT_OPUS_MODEL:-${claude_model}}"
-                    export ANTHROPIC_DEFAULT_SONNET_MODEL="${ANTHROPIC_DEFAULT_SONNET_MODEL:-${claude_model}}"
-                    export ANTHROPIC_DEFAULT_HAIKU_MODEL="${ANTHROPIC_DEFAULT_HAIKU_MODEL:-${claude_model}}"
+                    # Settings env outranks this process, so a Codex slug saved
+                    # there (e.g. gpt-6.1-sol) causes subagents and internal
+                    # tiers to be dispatched to Codex. Remove any stale pins
+                    # from settings.json and force all tier and subagent models
+                    # to the launched abliteration model.
+                    _claude_unpin_settings_models
+                    export ANTHROPIC_MODEL="${claude_model}"
+                    export ANTHROPIC_DEFAULT_OPUS_MODEL="${claude_model}"
+                    export ANTHROPIC_DEFAULT_SONNET_MODEL="${claude_model}"
+                    export ANTHROPIC_DEFAULT_HAIKU_MODEL="${claude_model}"
+                    export ANTHROPIC_DEFAULT_FABLE_MODEL="${claude_model}"
+                    export CLAUDE_CODE_SUBAGENT_MODEL="${claude_model}"
+                    export CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST=1
                     export CLAUDE_CODE_EFFORT_LEVEL="${CLAUDE_CODE_EFFORT_LEVEL:-high}"
                     echo "${C_DIM}[*] claude on abliteration.ai: ${claude_model} (context ${ablit_ctx})${C_RESET}"
                     exec "${cli_cmd}" --model "${claude_model}" "${cli_passthrough_args[@]}"
