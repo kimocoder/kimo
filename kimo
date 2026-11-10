@@ -9395,9 +9395,9 @@ cmd_launch() {
                     if [[ -n "${alibaba_inline_key}" ]]; then
                         export KIMO_ALIBABA_API_KEY="${alibaba_inline_key}"
                     fi
-                    if [[ "${dashscope_surface:-}" == freetier ]]; then
-                        export KIMO_CLAUDE_CATALOG_CTX="${claude_ctx}"
-                    fi
+                    # The proxy reports this window for an explicit --model that
+                    # is not already in its static catalog.
+                    export KIMO_CLAUDE_CATALOG_CTX="${claude_ctx}"
                     if ! claude_port=$(_kimo_anthropic_proxy_start "${claude_up_base}" "${claude_wire}" "${claude_key_var}" "${claude_token}" "${cloud_provider}" "${resolved_model}"); then
                         unset KIMO_ALIBABA_API_KEY KIMO_CLAUDE_CATALOG_CTX
                         echo "${C_RED}Error: could not start the local Anthropic messages proxy for ${cloud_provider}.${C_RESET}" >&2
@@ -9444,10 +9444,25 @@ cmd_launch() {
                         export ANTHROPIC_DEFAULT_FABLE_MODEL="${resolved_model}"
                         export CLAUDE_CODE_SUBAGENT_MODEL="${resolved_model}"
                     else
-                        export ANTHROPIC_DEFAULT_OPUS_MODEL="${ANTHROPIC_DEFAULT_OPUS_MODEL:-${claude_shown}}"
-                        export ANTHROPIC_DEFAULT_SONNET_MODEL="${ANTHROPIC_DEFAULT_SONNET_MODEL:-${claude_shown}}"
-                        export ANTHROPIC_DEFAULT_HAIKU_MODEL="${ANTHROPIC_DEFAULT_HAIKU_MODEL:-${claude_shown}}"
-                        export CLAUDE_CODE_SUBAGENT_MODEL="${CLAUDE_CODE_SUBAGENT_MODEL:-${claude_shown}}"
+                        # Force these, including a stale pin already in the
+                        # environment. Claude Code 2.1.321 resumes onto beam
+                        # (the first-party default, successor of Fable) unless
+                        # the fable pin is the launched model, and that pin
+                        # outranks the model stored in the transcript. A
+                        # settings env block outranks this process, so a pin
+                        # left there by an older launch has to be removed or
+                        # resume keeps beam, drops this provider, and /model
+                        # probes Anthropic with no credential.
+                        _claude_unpin_settings_models
+                        export ANTHROPIC_DEFAULT_OPUS_MODEL="${claude_shown}"
+                        export ANTHROPIC_DEFAULT_SONNET_MODEL="${claude_shown}"
+                        export ANTHROPIC_DEFAULT_HAIKU_MODEL="${claude_shown}"
+                        export ANTHROPIC_DEFAULT_FABLE_MODEL="${claude_shown}"
+                        export CLAUDE_CODE_SUBAGENT_MODEL="${claude_shown}"
+                        # Stops resume from switching the session back to
+                        # first-party routing (the status then shows beam and
+                        # the hosted provider is gone). Process env only.
+                        export CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST=1
                     fi
                     export CLAUDE_CODE_EFFORT_LEVEL="${CLAUDE_CODE_EFFORT_LEVEL:-high}"
                     if [[ "${claude_ctx}" =~ ^[0-9]+$ ]] && (( claude_ctx >= 2 )); then
@@ -12379,6 +12394,7 @@ _kimo() {
             kalidroid)
                 printf '%s\n' \
                     kalidroid/qwen3.8-27b qwen3.8-27b \
+                    kalidroid/qwen3.8-27b-uncensored qwen3.8-27b-uncensored \
                     kalidroid/kimi-k2.6 kimi-k2.6 \
                     kalidroid/kimi-k2.7-code kimi-k2.7-code \
                     kalidroid/kimi-k2.7-code-highspeed kimi-k2.7-code-highspeed \
@@ -12721,6 +12737,7 @@ _kimo_hosted_models() {
         kalidroid)
             printf '%s\n' \
                 kalidroid/qwen3.8-27b qwen3.8-27b \
+                kalidroid/qwen3.8-27b-uncensored qwen3.8-27b-uncensored \
                 kalidroid/kimi-k2.6 kimi-k2.6 \
                 kalidroid/kimi-k2.7-code kimi-k2.7-code \
                 kalidroid/kimi-k2.7-code-highspeed kimi-k2.7-code-highspeed \

@@ -161,6 +161,7 @@ cat > "${FAKE_BIN}/claude" <<'SH'
         ANTHROPIC_MODEL ANTHROPIC_DEFAULT_OPUS_MODEL ANTHROPIC_DEFAULT_HAIKU_MODEL \
         ANTHROPIC_DEFAULT_SONNET_MODEL ANTHROPIC_DEFAULT_FABLE_MODEL \
         CLAUDE_CODE_SUBAGENT_MODEL CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY \
+        CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST \
         XAI_API_KEY CLAUDE_CODE_MAX_CONTEXT_TOKENS; do
         printf '%s=%s\n' "${key}" "${!key-<unset>}"
     done
@@ -192,6 +193,74 @@ check "haiku tier is the codex slug" "gpt-6.1-sol" "$(env_val "${CAPTURE}" ANTHR
 check "fable tier is the codex slug" "gpt-6.1-sol" "$(env_val "${CAPTURE}" ANTHROPIC_DEFAULT_FABLE_MODEL)"
 check "gateway model discovery is enabled" "1" "$(env_val "${CAPTURE}" CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY)"
 check "codex launch base is loopback" "http://127.0.0.1:" "$(env_val "${CAPTURE}" ANTHROPIC_BASE_URL | cut -c1-17)"
+
+# Resume of a Claude Code 2.1.321 session sends beam unless the fable pin is
+# the launched model, and a stale pin must not win. /model then probes with
+# no Anthropic credential and reports that it could not resolve auth.
+rc=0
+PATH="${FAKE_BIN}:${PATH}" \
+    ANTHROPIC_DEFAULT_FABLE_MODEL="beam" \
+    ANTHROPIC_DEFAULT_OPUS_MODEL="claude-opus-5-5" \
+    KALIDROID_API_KEY="${KD_KEY}" \
+    "${KIMO}" launch claude --provider kalidroid --model qwen3.8-27b-uncensored >/dev/null || rc=$?
+check "live kalidroid launch execs claude" 0 "${rc}"
+check "live kalidroid model flag" "qwen3.8-27b-uncensored" "$(flag_val "${CAPTURE}" --model)"
+check "stale fable pin is the kalidroid model" "qwen3.8-27b-uncensored" "$(env_val "${CAPTURE}" ANTHROPIC_DEFAULT_FABLE_MODEL)"
+check "stale opus pin is the kalidroid model" "qwen3.8-27b-uncensored" "$(env_val "${CAPTURE}" ANTHROPIC_DEFAULT_OPUS_MODEL)"
+check "haiku tier is the kalidroid model" "qwen3.8-27b-uncensored" "$(env_val "${CAPTURE}" ANTHROPIC_DEFAULT_HAIKU_MODEL)"
+check "sonnet tier is the kalidroid model" "qwen3.8-27b-uncensored" "$(env_val "${CAPTURE}" ANTHROPIC_DEFAULT_SONNET_MODEL)"
+check "subagents stay on the kalidroid model" "qwen3.8-27b-uncensored" "$(env_val "${CAPTURE}" CLAUDE_CODE_SUBAGENT_MODEL)"
+check "resume does not switch back to first-party" "1" "$(env_val "${CAPTURE}" CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST)"
+check "kalidroid launch base is loopback" "http://127.0.0.1:" "$(env_val "${CAPTURE}" ANTHROPIC_BASE_URL | cut -c1-17)"
+check "kalidroid launch does not hand Claude the upstream key" "<unset>" "$(env_val "${CAPTURE}" ANTHROPIC_API_KEY)"
+picker_ok="$(python3 - "${HOME}/.claude/settings.json" <<'PY'
+import json, sys
+doc = json.load(open(sys.argv[1], encoding="utf-8"))
+options = doc["modelPicker"]["options"]
+models = [opt["model"] for opt in options]
+assert models[0] == "qwen3.8-27b-uncensored", models
+row = options[0]
+assert row["behavesAs"] == "claude-haiku-4-5", row
+assert row["kimo"] == "kimo:codex", row
+assert "qwen3.8-27b" in models, models
+assert "env" not in doc, doc.get("env")
+print("picker-ok")
+PY
+)"
+check "kalidroid picker offers the launched model without an auth probe" "picker-ok" "${picker_ok}"
+
+beam_rewrite="$(python3 - "${PROXY}" <<'PY'
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("anthropic_proxy", sys.argv[1])
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+assert mod.is_anthropic_model("beam")
+assert mod.is_anthropic_model("Fable 5.2")
+assert not mod.is_anthropic_model("qwen3.8-27b-uncensored")
+catalog = mod.build_catalog("kalidroid", "qwen3.8-27b-uncensored")
+slugs = [item["slug"] for item in catalog]
+assert slugs[0] != "beam"
+assert "qwen3.8-27b-uncensored" in slugs, slugs
+for asked in ("beam", "beam[1m]", "fable", "claude-fable-5-2", "opus"):
+    out = mod.to_chat(
+        {"model": asked, "messages": [{"role": "user", "content": "hi"}]},
+        "kalidroid",
+        "qwen3.8-27b-uncensored",
+        catalog,
+    )
+    assert out["model"] == "qwen3.8-27b-uncensored", (asked, out["model"])
+# The launched id itself must not be rewritten to the first catalog row.
+kept = mod.to_chat(
+    {"model": "qwen3.8-27b-uncensored", "messages": [{"role": "user", "content": "hi"}]},
+    "kalidroid",
+    "qwen3.8-27b-uncensored",
+    catalog,
+)
+assert kept["model"] == "qwen3.8-27b-uncensored", kept
+print("beam-rewrite-ok")
+PY
+)"
+check "a resumed beam id is rewritten to the kalidroid model" "beam-rewrite-ok" "${beam_rewrite}"
 
 # Print the port a background server wrote to <file>, waiting up to 10s.
 # Prints nothing on timeout so the caller's check fails instead of set -e

@@ -9,11 +9,12 @@ into either Chat Completions or the Responses API.
 
 `--wire messages` does not translate. Ollama Cloud already speaks Messages.
 Claude Code 2.1.321 still renames the model on resume: a session whose
-stored model is a first-party id (Fable, claude-fable-5-2) makes the next
-launch send `beam[1m]`. ollama.com does not serve that id, and the client
-reports `Model 'beam' not found` and stays on Fable. This wire strips the
-suffix, rewrites a resumed first-party id to the launched model, and echoes
-the id Claude asked for so its existence check still passes.
+stored model is a first-party id (Fable, claude-fable-5-2, or the current
+default "beam") makes the next launch send `beam` or `beam[1m]`. A host that
+does not serve that id reports the model missing, and the client then stays
+on beam. This wire strips the suffix, rewrites a resumed first-party id to
+the launched model, and echoes the id Claude asked for so its existence
+check still passes.
 
 The upstream credential is read from the environment variable named by
 --env-key. It is never taken from the client, never written to disk, and
@@ -87,6 +88,7 @@ PROVIDER_MODELS: dict[str, list[tuple[str, str, int, str]]] = {
     ],
     "kalidroid": [
         ("qwen3.8-27b", "Qwen 3.8 27B", 131072, "Kalidroid house model"),
+        ("qwen3.8-27b-uncensored", "Qwen 3.8 27B Uncensored", 131072, "Uncensored Qwen 3.8 27B via Kalidroid"),
         ("kimi-k2.6", "Kimi K2.6", 131072, "Kimi K2.6 via Kalidroid"),
         ("kimi-k2.7-code", "Kimi K2.7 Code", 131072, "Kimi K2.7 coding model via Kalidroid"),
         ("kimi-k2.7-code-highspeed", "Kimi K2.7 Code Highspeed", 131072, "Faster Kimi K2.7 code model via Kalidroid"),
@@ -179,12 +181,12 @@ def build_catalog(provider: str, active_model: str | None = None) -> list[dict]:
             add_item(slug, name, ctx, desc)
 
     clean_active = bare_model(active_model) if active_model else ""
-    stub_ctx = 272000
+    # Launch sets this to the window it told Claude. An id that is not already
+    # in the static catalog (an explicit --model) has to report that window,
+    # or /model assumes 200K and a resumed session compacts early.
+    stub_ctx = _positive_int(os.environ.get("KIMO_CLAUDE_CATALOG_CTX", ""), 272000)
     if provider == "alibaba":
         clean_active = _alibaba_wire_id(clean_active)
-        # Launch sets this so a free-tier window (default 500k) is what
-        # GET /v1/models reports. Other providers keep the 272k stub.
-        stub_ctx = _positive_int(os.environ.get("KIMO_CLAUDE_CATALOG_CTX", ""), 272000)
     if clean_active and clean_active != "claude" and clean_active not in seen:
         add_item(clean_active, clean_active, stub_ctx, f"{clean_active} active model")
 
@@ -238,28 +240,55 @@ def is_anthropic_model(model: str) -> bool:
     strips that prefix before asking.
     """
     lower = model.lower()
-    if lower in COMPAT_ALIASES or lower in {"fable", "best", "opusplan", "inherit"}:
+    # "beam" is the first-party id Claude Code 2.1.321 stores and sends on
+    # resume (the successor of Fable). It is not a Kalidroid or Codex slug.
+    if lower in COMPAT_ALIASES or lower in {"fable", "beam", "best", "opusplan", "inherit"}:
         return True
     if lower.startswith("claude-") or lower.startswith("anthropic/"):
         return True
-    if re.fullmatch(r"(opus|sonnet|haiku|fable)([-.][0-9]+)*", lower):
+    if re.fullmatch(r"(opus|sonnet|haiku|fable|beam)([-.][0-9]+)*", lower):
         return True
     # "Fable 5.2" is the picker label. The wire id is usually claude-fable-5-2,
     # but a resume can hand the label across with a space in it.
     folded = _norm_model(lower)
-    return re.fullmatch(r"(opus|sonnet|haiku|fable)[0-9]*", folded) is not None
+    return re.fullmatch(r"(opus|sonnet|haiku|fable|beam)[0-9]*", folded) is not None
+
+
+def _behaves_as(ctx: object) -> str:
+    """Native id Claude Code will accept for a model it does not know.
+
+    A modelPicker row without behavesAs is not offered. 1M uses the native
+    1M opus; anything smaller uses haiku (200K). The id sent to the proxy
+    stays the catalog slug. Resume may still ask for beam; the proxy rewrites
+    that, and the launch pins keep the selected model on the catalog slug.
+    """
+    try:
+        window = int(ctx)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        window = 0
+    if window >= 1_000_000:
+        return "claude-opus-4-8"
+    return "claude-haiku-4-5"
 
 
 def _populate_claude_settings(catalog: list[dict], provider: str, chosen_model: str = "") -> None:
-    """Add Codex slugs to the user-level /model picker.
+    """Add provider slugs to the user-level /model picker.
 
     modelPicker is read from user settings only; project and local settings
     are ignored, and writing them would also dirty a repo's .claude directory.
     availableModels is an allowlist that replaces the built-in lineup, so a
     previous launch's list is removed when every entry is one we would have
     written. The session model itself stays on --model / ANTHROPIC_MODEL:
-    persisting it here would stick a Codex slug on later plain `claude` runs,
+    persisting it here would stick a hosted slug on later plain `claude` runs,
     and a settings env block would outrank the launch environment.
+
+    Claude Code 2.1.321 does not offer a row for an id it does not know unless
+    behavesAs names a native model, and /model then probes the API. That probe
+    has no Anthropic credential on a kimo launch (the key stays in the proxy),
+    so it fails with "Could not resolve authentication method" and the client
+    keeps beam. behavesAs makes the row selectable without that probe.
+    Codex and OpenAI slugs are discovered through the gateway and stay without
+    behavesAs: adding it makes a resume send beam.
     """
     if not catalog:
         return
@@ -301,12 +330,15 @@ def _populate_claude_settings(catalog: list[dict], provider: str, chosen_model: 
             slug = item["slug"]
             if slug in seen:
                 continue
-            kept.append({
+            row = {
                 "model": slug,
                 "label": item.get("display_name") or slug,
                 "description": item.get("description") or f"{slug} via {provider or 'codex'}",
                 "kimo": KIMO_PICKER_MARK,
-            })
+            }
+            if provider not in ("codex", "openai", ""):
+                row["behavesAs"] = _behaves_as(item.get("context_window"))
+            kept.append(row)
             seen.add(slug)
         picker["options"] = kept
         picker.setdefault("replaceBuiltInOptions", False)
@@ -1604,7 +1636,11 @@ def main() -> int:
                 Proxy.codex_version = version
         except (OSError, json.JSONDecodeError):
             pass
-    if args.provider in ("codex", "openai"):
+    # ollama-cloud has its own catalog writer, and Alibaba free-tier launches
+    # must not install one. Hosted provider slugs otherwise have to be in the
+    # user picker before Claude starts, or /model probes the API and resume
+    # drops back to the first-party model.
+    if args.provider not in ("", "ollama-cloud", "alibaba") and catalog:
         _populate_claude_settings(catalog, args.provider, args.model)
     server = ThreadingHTTPServer(("127.0.0.1", 0), Proxy)
     port = server.server_address[1]
