@@ -49,6 +49,9 @@ def auth_token_file(home: Path) -> Path:
     p2 = gdir / "gemini-credentials.json"
     if p2.exists():
         return p2
+    p3 = gdir / "oauth_token.json"
+    if p3.exists():
+        return p3
     return p1
 
 
@@ -120,6 +123,14 @@ def token_state(home: Path) -> None:
         or os.environ.get("GOOGLE_API_KEY")
         or ""
     )
+    if env_key == "ollama":
+        env_key = ""
+
+    if env_key and (env_key.startswith("ya29.") or env_key.startswith("eyJ") or env_key.startswith("AQ")):
+        if not env_token:
+            env_token = env_key
+            env_key = ""
+
     file_token = str(tok_obj.get("access_token") or "")
 
     if env_token:
@@ -339,6 +350,198 @@ def status(home: Path, config: Path, as_json: bool) -> None:
     print(f"    Gemini Models : {', '.join(data['kimi']['gemini_models']) or '<none>'}")
 
 
+def prune_backups(config: Path, new_backup: Path) -> None:
+    parent = config.parent
+    prefix = f"{config.name}.before-gemini-"
+    existing = sorted(
+        [p for p in parent.iterdir() if p.name.startswith(prefix) and not p.is_symlink()],
+        key=lambda p: p.stat().st_mtime,
+        reverse=True
+    )
+    for old in existing[BACKUP_KEEP:]:
+        try:
+            old.unlink()
+        except OSError:
+            pass
+
+
+def get_working_token(home: Path) -> str:
+    tpath = auth_token_file(home)
+    doc = read_json(tpath)
+    tok_obj = doc.get("token") if isinstance(doc.get("token"), dict) else doc
+    exp = parse_expiry(tok_obj.get("expiry"))
+    if exp is not None and exp <= time.time() + EXPIRY_SKEW_SECONDS and tok_obj.get("refresh_token"):
+        if os.environ.get("KIMO_GEMINI_NO_REFRESH") != "1":
+            try:
+                refresh(home)
+                doc = read_json(tpath)
+                tok_obj = doc.get("token") if isinstance(doc.get("token"), dict) else doc
+            except Exception:
+                pass
+
+    file_token = str(tok_obj.get("access_token") or "")
+    env_auth = (
+        os.environ.get("GEMINI_AUTH_TOKEN")
+        or os.environ.get("GOOGLE_OAUTH_TOKEN")
+        or ""
+    )
+    env_key = (
+        os.environ.get("GEMINI_API_KEY")
+        or os.environ.get("GOOGLE_API_KEY")
+        or ""
+    )
+    if env_key == "ollama":
+        env_key = ""
+
+    if env_key and (env_key.startswith("ya29.") or env_key.startswith("eyJ") or env_key.startswith("AQ")):
+        if not env_auth:
+            env_auth = env_key
+
+    exp = parse_expiry(tok_obj.get("expiry"))
+    file_valid = exp is None or exp > time.time() + EXPIRY_SKEW_SECONDS
+
+    if env_auth:
+        if env_auth != file_token or file_valid:
+            return env_auth
+
+    if file_token and file_valid:
+        return file_token
+
+    if env_key:
+        return env_key
+
+    return env_auth or file_token or env_key
+
+
+def fetch_live_models(token: str, timeout: float = 6) -> list[tuple[str, str, int, int, bool]]:
+    if not token or token == "ollama":
+        return GEMINI_MODELS
+    base = os.environ.get("KIMO_GEMINI_BASE_URL") or "https://generativelanguage.googleapis.com"
+    base = base.removesuffix("/v1beta").removesuffix("/v1").removesuffix("/openai").rstrip("/")
+    url = f"{base}/v1beta/models?pageSize=1000"
+    headers = {"Accept": "application/json", "User-Agent": "kimo-gemini/1.0"}
+    if token.startswith("ya29.") or not token.startswith("AIza"):
+        headers["Authorization"] = f"Bearer {token}"
+    else:
+        headers["x-goog-api-key"] = token
+
+    req = urllib.request.Request(url, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:  # nosec B310
+            data = json.loads(resp.read().decode("utf-8"))
+        res = []
+        nonchat_keywords = ("embed", "aqa", "imagen", "veo", "lyria", "tts", "image", "banana", "native-audio", "live", "transcribe", "robotics", "computer-use", "deep-research", "learnlm")
+        for item in data.get("models", []):
+            name = item.get("name") or ""
+            slug = name.removeprefix("models/")
+            if not slug:
+                continue
+            methods = item.get("supportedGenerationMethods", [])
+            if "generateContent" not in methods:
+                continue
+            lower_slug = slug.lower()
+            if any(k in lower_slug for k in nonchat_keywords):
+                continue
+            display_name = item.get("displayName") or slug
+            ctx = item.get("inputTokenLimit") or 1048576
+            out = item.get("outputTokenLimit") or 8192
+            think = bool(item.get("thinking", False) or "thinking" in lower_slug or "2.5" in lower_slug)
+            res.append((slug, display_name, ctx, out, think))
+        if res:
+            return res
+    except Exception:
+        pass
+    return GEMINI_MODELS
+
+
+def sync(home: Path, config: Path, selected: str, as_json: bool, context_override: int | None = None) -> None:
+    import tomlkit
+    config.parent.mkdir(parents=True, exist_ok=True)
+    doc = read_config(config)
+
+    providers = doc.setdefault("providers", tomlkit.table())
+    models = doc.setdefault("models", tomlkit.table())
+
+    p = providers.setdefault("gemini", tomlkit.table())
+    p["type"] = "google-genai"
+    base = os.environ.get("KIMO_GEMINI_BASE_URL") or "https://generativelanguage.googleapis.com"
+    base = base.removesuffix("/v1beta").removesuffix("/v1").removesuffix("/openai").rstrip("/")
+    p["base_url"] = base
+
+    token = get_working_token(home)
+    if token.startswith("AIza"):
+        p["api_key_env"] = "GEMINI_API_KEY"
+    else:
+        p["api_key_env"] = "GEMINI_AUTH_TOKEN"
+    if "api_key" in p:
+        del p["api_key"]
+
+    available_models = fetch_live_models(token)
+
+    for slug, name, ctx, out, think in available_models:
+        alias = f"gemini/{slug}"
+        m = models.setdefault(alias, tomlkit.table())
+        m["provider"] = "gemini"
+        m["model"] = slug
+        disp = f"{name} (Gemini)" if not name.endswith("(Gemini)") else name
+        m["display_name"] = disp
+        m["max_context_size"] = ctx
+        m["max_output_size"] = out
+        caps = ["tool_use"]
+        if slug.lower().startswith("gemini"):
+            caps.extend(["image_in", "video_in"])
+        elif slug.lower().startswith("gemma") and not slug.lower().endswith("-1b"):
+            caps.append("image_in")
+        if think:
+            caps.append("thinking")
+        m["capabilities"] = caps
+
+    target = ""
+    if selected:
+        target = selected if selected.startswith("gemini/") else f"gemini/{selected.removeprefix('google/')}"
+        if target not in models:
+            slug = target.removeprefix("gemini/")
+            m = models.setdefault(target, tomlkit.table())
+            m["provider"] = "gemini"
+            m["model"] = slug
+            m["display_name"] = f"{slug} (Gemini)"
+            m["max_context_size"] = context_override or 1048576
+            m["max_output_size"] = 65536
+            m["capabilities"] = ["tool_use", "image_in", "video_in", "thinking"]
+        doc["default_model"] = target
+
+    if context_override is not None:
+        if target and target in models:
+            models[target]["max_context_size"] = context_override
+        else:
+            for k, m in models.items():
+                if k.startswith("gemini/"):
+                    m["max_context_size"] = context_override
+
+    # Backup
+    ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%S+0000")
+    backup = config.parent / f"{config.name}.before-gemini-{ts}"
+    if config.exists():
+        import shutil
+        shutil.copy2(config, backup)
+        prune_backups(config, backup)
+
+    config.write_text(tomlkit.dumps(doc), encoding="utf-8")
+    selected_ctx = models.get(target, {}).get("max_context_size") if target else (
+        context_override or (models.get(doc.get("default_model", ""), {}).get("max_context_size") or 1048576)
+    )
+    if as_json:
+        print(json.dumps({
+            "ok": True,
+            "provider": "gemini",
+            "models": len([k for k in models if k.startswith("gemini/")]),
+            "default_model": doc.get("default_model"),
+            "max_context_size": selected_ctx,
+        }))
+    else:
+        print(f"[+] Synchronized {len(available_models)} Gemini models into {config}")
+
+
 def default_model(home: Path, config: Path) -> str:
     try:
         doc = read_config(config)
@@ -359,34 +562,26 @@ def main():
     home = Path(os.environ.get("HOME") or Path.home())
     config = Path(os.environ.get("KIMI_CONFIG") or home / ".kimi-code" / "config.toml")
     as_json = "--json" in sys.argv[2:]
+    context_override = None
+    args = sys.argv[2:]
+    for i, a in enumerate(args):
+        if a == "--ctx" and i + 1 < len(args):
+            try:
+                context_override = int(args[i + 1])
+            except ValueError:
+                pass
+    positional = [a for i, a in enumerate(args) if a != "--json" and a != "--ctx" and (i == 0 or args[i - 1] != "--ctx")]
+    argument = positional[0] if positional else ""
 
     if action == "status":
         status(home, config, as_json)
     elif action == "token-state":
         token_state(home)
+    elif action == "refresh":
+        refresh(home)
     elif action == "token":
-        tpath = auth_token_file(home)
-        doc = read_json(tpath)
-        tok_obj = doc.get("token") if isinstance(doc.get("token"), dict) else doc
-        exp = parse_expiry(tok_obj.get("expiry"))
-        if exp is not None and exp <= time.time() + EXPIRY_SKEW_SECONDS and tok_obj.get("refresh_token"):
-            if os.environ.get("KIMO_GEMINI_NO_REFRESH") != "1":
-                try:
-                    refresh(home)
-                    doc = read_json(tpath)
-                    tok_obj = doc.get("token") if isinstance(doc.get("token"), dict) else doc
-                except Exception:
-                    pass
-        tok = (
-            os.environ.get("GEMINI_AUTH_TOKEN")
-            or os.environ.get("GOOGLE_OAUTH_TOKEN")
-            or str(tok_obj.get("access_token") or "")
-            or os.environ.get("GEMINI_API_KEY", "")
-            or os.environ.get("GOOGLE_API_KEY", "")
-        )
-        if tok == "ollama":
-            tok = ""
-        if not tok:
+        tok = get_working_token(home)
+        if not tok or tok == "ollama":
             print("Error: No Gemini token or API key found. Set GEMINI_API_KEY or sign in with 'agy'.", file=sys.stderr)
             sys.exit(1)
         if as_json:
@@ -394,36 +589,16 @@ def main():
         else:
             print(tok)
     elif action == "export":
-        tpath = auth_token_file(home)
-        doc = read_json(tpath)
-        tok_obj = doc.get("token") if isinstance(doc.get("token"), dict) else doc
-        exp = parse_expiry(tok_obj.get("expiry"))
-        if exp is not None and exp <= time.time() + EXPIRY_SKEW_SECONDS and tok_obj.get("refresh_token"):
-            if os.environ.get("KIMO_GEMINI_NO_REFRESH") != "1":
-                try:
-                    refresh(home)
-                    doc = read_json(tpath)
-                    tok_obj = doc.get("token") if isinstance(doc.get("token"), dict) else doc
-                except Exception:
-                    pass
-        tok = (
-            os.environ.get("GEMINI_AUTH_TOKEN")
-            or os.environ.get("GOOGLE_OAUTH_TOKEN")
-            or str(tok_obj.get("access_token") or "")
-            or os.environ.get("GEMINI_API_KEY", "")
-            or os.environ.get("GOOGLE_API_KEY", "")
-        )
-        if tok == "ollama":
-            tok = ""
-        if not tok:
+        tok = get_working_token(home)
+        if not tok or tok == "ollama":
             print("Error: No Gemini token or API key found. Set GEMINI_API_KEY or sign in with 'agy'.", file=sys.stderr)
             sys.exit(1)
         if tok.startswith("AIzaSy"):
             print(f"export GEMINI_API_KEY={tok}")
         else:
             print(f"export GEMINI_AUTH_TOKEN={tok}")
-    elif action == "refresh":
-        refresh(home)
+    elif action == "sync":
+        sync(home, config, argument, as_json, context_override=context_override)
     elif action == "default-model":
         print(default_model(home, config))
     else:

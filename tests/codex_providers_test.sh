@@ -156,6 +156,12 @@ check_not_contains "dry-run never prints the gemini key" "${GM_KEY}" "${dry}"
 dry=$(GEMINI_AUTH_TOKEN="${GM_TOK}" "${KIMO}" launch codex --provider gemini --model gemini/gemini-2.5-pro --dry-run)
 check_contains "AUTH_TOKEN is accepted for gemini" 'env_key=\"GEMINI_AUTH_TOKEN\"' "${dry}"
 check_contains "gemini/ prefix is stripped" "model  : gemini-2.5-pro" "${dry}"
+dry_kimi_gm=$(GEMINI_AUTH_TOKEN="${GM_TOK}" "${KIMO}" launch kimi --provider gemini --dry-run)
+check_contains "gemini kimi provider" "provider: gemini" "${dry_kimi_gm}"
+check_contains "gemini kimi model" "model  : gemini-2.5-flash" "${dry_kimi_gm}"
+check_contains "gemini kimi argv" "kimi -m gemini/gemini-2.5-flash" "${dry_kimi_gm}"
+check_contains "gemini kimi masks oauth secret" "GEMINI_AUTH_TOKEN <kept: real value, Gemini key>" "${dry_kimi_gm}"
+check_not_contains "dry-run never prints gemini oauth token" "${GM_TOK}" "${dry_kimi_gm}"
 rc=0
 err_gm_guard=$(GEMINI_API_KEY="${GM_KEY}" "${KIMO}" launch codex --provider gemini 2>&1) || rc=$?
 check "gemini without custom base fails official endpoint guard" 1 "${rc}"

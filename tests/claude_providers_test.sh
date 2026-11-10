@@ -74,6 +74,9 @@ check_contains "the rejection names codex claude kimi" "supports codex claude ki
 dry_kimi=$(XAI_API_KEY="${XAI_KEY}" "${KIMO}" launch kimi --provider xai --dry-run)
 check_contains "kimi xai dry-run argv" "kimi -m xai/grok-4.7" "${dry_kimi}"
 
+dry_kimi_gm=$(GEMINI_API_KEY="${GM_KEY}" "${KIMO}" launch kimi --provider gemini --dry-run)
+check_contains "kimi gemini dry-run argv" "kimi -m gemini/gemini-2.5-flash" "${dry_kimi_gm}"
+
 dry=$(QWENCLOUD_API_KEY="${QW_KEY}" "${KIMO}" launch claude --provider qwencloud --dry-run)
 check_contains "qwencloud chat wire" "anthropic -> chat (https://ap-southeast-1.maas.qwencloudapi.com/compatible-mode/v1)" "${dry}"
 argv="$(printf '%s\n' "${dry}" | sed -n 's/^  argv   : //p')"

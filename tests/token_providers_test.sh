@@ -183,6 +183,11 @@ check_contains "launch kimi xai argv" 'kimi -m xai/grok-4.7' "${dry_kimi_xai}"
 check_contains "launch kimi xai masks oauth secret" 'XAI_AUTH_TOKEN <kept: real value, xAI key>' "${dry_kimi_xai}"
 check_not_contains "dry-run never exposes raw token to kimi" "${MOCK_GROK_ACCESS}" "${dry_kimi_xai}"
 
+dry_kimi_gemini=$("${KIMO}" launch kimi --provider gemini --dry-run)
+check_contains "launch kimi gemini argv" 'kimi -m gemini/gemini-2.5-flash' "${dry_kimi_gemini}"
+check_contains "launch kimi gemini masks oauth secret" 'GEMINI_AUTH_TOKEN <kept: real value, Gemini key>' "${dry_kimi_gemini}"
+check_not_contains "dry-run never exposes raw token to kimi" "${MOCK_GEMINI_ACCESS}" "${dry_kimi_gemini}"
+
 echo "[*] [5] A stale grok-login JWT must not hide the live auth.json session"
 # exp 1600000000 is 2020. The shell copies of this are what cli-chat-proxy 401s
 # as reason=no auth context. The file token is the one from section [3].
@@ -313,6 +318,89 @@ check_contains "the offline error names the expiry" "expired" "${offline}"
 check "offline mode does not post the refresh token" 0 "$(wc -l < "${GROK_TOKEN_LOG}" | tr -d ' ')"
 check "offline mode keeps the stored access token" "${EXPIRED_GROK_JWT}" \
     "$(jq -r '.. | objects | .key? // empty' "${GROK_HOME}/auth.json" | head -1)"
+
+echo "[*] [7] An expired gemini session is refreshed before launch"
+EXPIRED_GEMINI_ACCESS="ya29.expired-gemini-token"
+FRESH_GEMINI_ACCESS="ya29.refreshed-gemini-token"
+cat > "${GEMINI_HOME}/antigravity-cli/antigravity-oauth-token" <<EOF
+{
+  "token": {
+    "access_token": "${EXPIRED_GEMINI_ACCESS}",
+    "refresh_token": "mock-gemini-refresh",
+    "token_type": "Bearer",
+    "expiry": "2020-09-13T12:26:40Z"
+  },
+  "id_token_email": "test-user@example.com",
+  "auth_method": "consumer"
+}
+EOF
+chmod 600 "${GEMINI_HOME}/antigravity-cli/antigravity-oauth-token"
+
+cat > "${HARNESS_ROOT}/gemini_token_endpoint.py" <<'PY'
+import sys
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs
+
+mode, port_file, log, fresh = sys.argv[1:5]
+
+
+class H(BaseHTTPRequestHandler):
+    def log_message(self, *_args):
+        return
+
+    def do_POST(self):
+        body = self.rfile.read(int(self.headers.get("Content-Length") or 0))
+        with open(log, "a", encoding="utf-8") as handle:
+            handle.write(body.decode() + "\n")
+        fields = parse_qs(body.decode())
+        if mode == "refuse" or fields.get("grant_type") != ["refresh_token"]:
+            status, reply = 400, b'{"error":"invalid_grant"}'
+        else:
+            status = 200
+            reply = (
+                '{"access_token":"' + fresh + '",'
+                '"refresh_token":"rotated-gemini-refresh",'
+                '"expires_in":3600,"token_type":"Bearer"}'
+            ).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(reply)))
+        self.end_headers()
+        self.wfile.write(reply)
+
+
+server = ThreadingHTTPServer(("127.0.0.1", 0), H)
+with open(port_file, "w", encoding="utf-8") as handle:
+    handle.write(str(server.server_address[1]))
+server.serve_forever()
+PY
+GEMINI_PORT_FILE="${HARNESS_ROOT}/gemini-token.port"
+GEMINI_TOKEN_LOG="${HARNESS_ROOT}/gemini-token.log"
+: >"${GEMINI_TOKEN_LOG}"
+rm -f "${GEMINI_PORT_FILE}"
+harness_spawn python3 "${HARNESS_ROOT}/gemini_token_endpoint.py" ok "${GEMINI_PORT_FILE}" "${GEMINI_TOKEN_LOG}" "${FRESH_GEMINI_ACCESS}"
+tries=0
+until [[ -s "${GEMINI_PORT_FILE}" ]]; do
+    ((tries++ < 100)) || { bad "gemini token endpoint did not start"; exit 1; }
+    sleep 0.05
+done
+GEMINI_TOKEN_URL="http://127.0.0.1:$(<"${GEMINI_PORT_FILE}")/token"
+
+rc=0
+renewed=$(GEMINI_API_KEY="" GEMINI_AUTH_TOKEN="${EXPIRED_GEMINI_ACCESS}" \
+    KIMO_GEMINI_TOKEN_URL="${GEMINI_TOKEN_URL}" \
+    "${KIMO}" launch codex --provider gemini --dry-run 2>&1) || rc=$?
+check "an expired gemini session still launches" 0 "${rc}"
+check_contains "the gemini renewal is announced" "renewing it from credentials" "${renewed}"
+check_contains "the renewed launch names the session env" "secret : GEMINI_AUTH_TOKEN " "${renewed}"
+check "antigravity-oauth-token holds the refreshed access token" "${FRESH_GEMINI_ACCESS}" \
+    "$(jq -r '.token.access_token // empty' "${GEMINI_HOME}/antigravity-cli/antigravity-oauth-token")"
+check "a rotated gemini refresh token is stored" "rotated-gemini-refresh" \
+    "$(jq -r '.token.refresh_token // empty' "${GEMINI_HOME}/antigravity-cli/antigravity-oauth-token")"
+check_contains "the refresh grant is what was posted" "grant_type=refresh_token" "$(cat "${GEMINI_TOKEN_LOG}")"
+check_not_contains "the refresh token is never printed" "mock-gemini-refresh" "${renewed}"
+check_not_contains "the refreshed access token is never printed" "${FRESH_GEMINI_ACCESS}" "${renewed}"
+check_not_contains "the expired access token is never printed" "${EXPIRED_GEMINI_ACCESS}" "${renewed}"
 
 echo
 harness_summary "token_providers"

@@ -417,6 +417,12 @@ kimo gemini --json                       # Structured JSON authentication and mo
 kimo gemini --verify --verify-prune      # Probe candidate models, prune failing, write config
 kimo gemini --stable-only                # Register stable models only
 kimo gemini --set-default gemini/gemini-2.5-flash
+
+# Launch CLIs with Gemini provider
+kimo launch kimi --provider gemini       # Syncs gemini/* models into Kimi and launches
+kimo launch kimi -m gemini/gemini-2.5-pro
+kimo launch claude --provider gemini
+kimo launch codex --provider gemini --dry-run
 ```
 
 ## Grok / xAI Token Management & Model Sync (`grok`)

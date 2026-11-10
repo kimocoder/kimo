@@ -158,8 +158,8 @@ _kimo_config_check() {
             ;;
         cloud_provider)
             case "${val}" in
-                ""|none|ollama|ollama-cloud|abliteration|codex|openai|dashscope|alibaba|qwencloud|xai|grok|anthropic|claude|gemini|kalidroid|Kalidroid|vllm) ;;
-                *) echo "expected one of: ollama, ollama-cloud, abliteration, codex, openai, dashscope, alibaba, qwencloud, xai (grok), anthropic, claude, gemini, kalidroid, vllm (got '${val}')"; return 1 ;;
+                ""|none|ollama|ollama-cloud|abliteration|codex|openai|dashscope|alibaba|qwencloud|xai|grok|anthropic|claude|gemini|google|kalidroid|Kalidroid|vllm) ;;
+                *) echo "expected one of: ollama, ollama-cloud, abliteration, codex, openai, dashscope, alibaba, qwencloud, xai (grok), anthropic, claude, gemini (google), kalidroid, vllm (got '${val}')"; return 1 ;;
             esac
             ;;
         web_max_results)
@@ -423,6 +423,7 @@ ANTHROPIC_CODEX_CTX="${KIMO_ANTHROPIC_CTX:-1000000}"
 GEMINI_CODEX_BASE_URL="${KIMO_GEMINI_BASE_URL:-https://generativelanguage.googleapis.com/v1beta/openai}"
 GEMINI_CODEX_MODEL="${KIMO_GEMINI_MODEL:-gemini-2.5-flash}"
 GEMINI_CODEX_CTX="${KIMO_GEMINI_CTX:-1000000}"
+GEMINI_CLIS="codex claude kimi"
 
 # Kalidroid dashboard. OpenAI-compatible Chat Completions under /v1.
 # Codex posts {base}/responses and this host does not serve that route, so a
@@ -6969,6 +6970,8 @@ _resolve_gemini_auth() {
     local token_file="${gdir}/antigravity-cli/antigravity-oauth-token"
     if [[ ! -f "${token_file}" && -f "${gdir}/gemini-credentials.json" ]]; then
         token_file="${gdir}/gemini-credentials.json"
+    elif [[ ! -f "${token_file}" && -f "${gdir}/oauth_token.json" ]]; then
+        token_file="${gdir}/oauth_token.json"
     fi
     local file_token=""
 
@@ -6976,6 +6979,13 @@ _resolve_gemini_auth() {
         file_token=$(jq -r '.token.access_token | select(type == "string")' "${token_file}" 2>/dev/null || true)
         if [[ -z "${file_token}" ]]; then
             file_token=$(jq -r '.access_token | select(type == "string")' "${token_file}" 2>/dev/null || true)
+        fi
+    fi
+    if [[ -z "${file_token}" && -f "${token_file}" ]]; then
+        local raw_tok
+        raw_tok=$(tr -d '[:space:]' < "${token_file}" 2>/dev/null || true)
+        if [[ "${raw_tok}" == ya29.* || "${raw_tok}" == eyJ* || "${raw_tok}" == AQ* ]]; then
+            file_token="${raw_tok}"
         fi
     fi
 
@@ -6991,7 +7001,15 @@ _resolve_gemini_auth() {
         return 0
     fi
 
-    # 3. If file_token is found, export as GEMINI_AUTH_TOKEN and GOOGLE_OAUTH_TOKEN
+    # 3. If an OAuth token format was passed in GEMINI_API_KEY or GOOGLE_API_KEY
+    local env_k="${GEMINI_API_KEY:-${GOOGLE_API_KEY:-}}"
+    if [[ "${env_k}" == ya29.* || "${env_k}" == eyJ* || "${env_k}" == AQ.* || "${env_k}" == AQ* ]]; then
+        export GEMINI_AUTH_TOKEN="${env_k}"
+        export GOOGLE_OAUTH_TOKEN="${env_k}"
+        return 0
+    fi
+
+    # 4. If file_token is found, export as GEMINI_AUTH_TOKEN and GOOGLE_OAUTH_TOKEN
     if [[ -n "${file_token}" ]]; then
         export GEMINI_AUTH_TOKEN="${file_token}"
         export GOOGLE_OAUTH_TOKEN="${file_token}"
@@ -7049,6 +7067,13 @@ _resolve_grok_auth() {
     fi
     return 0
 }
+
+_gemini_sync_kimi() (
+    mkdir -p "$(dirname "${KIMI_CONFIG_LOCK}")" || return 1
+    exec 9>>"${KIMI_CONFIG_LOCK}" || return 1
+    flock -w 15 9 || { echo "Error: Kimi config is busy; retry the Gemini sync." >&2; return 1; }
+    _gemini_helper sync "$@"
+)
 
 _grok_sync_kimi() (
     mkdir -p "$(dirname "${KIMI_CONFIG_LOCK}")" || return 1
@@ -8051,13 +8076,14 @@ cmd_launch() {
     # 'grok' names the xAI API here. 'launch grok' is the Grok Build CLI.
     [[ "${cloud_provider}" == "grok" ]] && cloud_provider="xai"
     [[ "${cloud_provider}" == "claude" ]] && cloud_provider="anthropic"
+    [[ "${cloud_provider}" == "google" ]] && cloud_provider="gemini"
     [[ "${cloud_provider,,}" == "kalidroid" ]] && cloud_provider="kalidroid"
     local provider_selected="${cloud_provider}"
     case "${cloud_provider}" in
         ""|none|ollama) cloud_provider="" ;;
         abliteration|codex|openai|dashscope|alibaba|qwencloud|xai|anthropic|gemini|kalidroid|vllm|ollama-cloud) ;;
         *)
-            echo "${C_RED}Error: unknown --provider '${cloud_provider}' (expected one of: ${KIMO_LAUNCH_PROVIDERS}; grok is an alias of xai, claude is an alias of anthropic).${C_RESET}" >&2
+            echo "${C_RED}Error: unknown --provider '${cloud_provider}' (expected one of: ${KIMO_LAUNCH_PROVIDERS}; grok is an alias of xai, claude is an alias of anthropic, google is an alias of gemini).${C_RESET}" >&2
             exit 1
             ;;
     esac
@@ -8078,6 +8104,7 @@ cmd_launch() {
             openai/*|openai) cloud_provider="openai" ;;
             vllm/*) cloud_provider="vllm" ;;
             xai/*|grok/*) cloud_provider="xai" ;;
+            gemini/*|google/*) cloud_provider="gemini" ;;
         esac
     fi
     if [[ -z "${cloud_provider}" && -z "${provider_selected}" && "${opt_model_explicit}" != true ]] \
@@ -8361,6 +8388,7 @@ cmd_launch() {
     elif [[ "${cloud_provider}" == "qwencloud" || "${cloud_provider}" == "xai" || "${cloud_provider}" == "anthropic" || "${cloud_provider}" == "gemini" || "${cloud_provider}" == "kalidroid" ]]; then
         local supported_clis="codex claude"
         [[ "${cloud_provider}" == "xai" ]] && supported_clis="${XAI_CLIS:-codex claude kimi}"
+        [[ "${cloud_provider}" == "gemini" ]] && supported_clis="${GEMINI_CLIS:-codex claude kimi}"
         if [[ " ${supported_clis} " != *" ${provider} "* ]]; then
             echo "${C_RED}Error: '--provider ${cloud_provider}' supports ${supported_clis}; '${provider}' has no ${cloud_provider} launch branch yet.${C_RESET}" >&2
             echo "${C_DIM}    Those CLIs are wired for a self-hosted Ollama host. Drop --provider to route '${provider}' to Ollama.${C_RESET}" >&2
@@ -8476,6 +8504,7 @@ cmd_launch() {
                 provider_ctx="${GEMINI_CODEX_CTX}"
                 provider_hint="Export GEMINI_AUTH_TOKEN, GEMINI_API_KEY, or sign in with 'agy'."
                 provider_base="${GEMINI_CODEX_BASE_URL}"
+                _ensure_gemini_token || return 1
                 if [[ -n "${GEMINI_AUTH_TOKEN:-}" ]]; then
                     key_var="GEMINI_AUTH_TOKEN"
                 elif [[ -n "${GEMINI_API_KEY:-}" ]]; then
@@ -8563,7 +8592,7 @@ cmd_launch() {
                 qwencloud) resolved_model="${resolved_model#qwencloud/}" ;;
                 xai) resolved_model="${resolved_model#xai/}"; resolved_model="${resolved_model#grok/}" ;;
                 anthropic) resolved_model="${resolved_model#anthropic/}"; resolved_model="${resolved_model#claude/}" ;;
-                gemini) resolved_model="${resolved_model#gemini/}" ;;
+                gemini) resolved_model="${resolved_model#gemini/}"; resolved_model="${resolved_model#google/}" ;;
                 kalidroid) resolved_model="${resolved_model#kalidroid/}" ;;
             esac
         fi
@@ -8998,7 +9027,7 @@ cmd_launch() {
     # never fall back to 'ollama run'. A dry run never execs the CLI, so it
     # reports the missing binary as a note instead of failing.
     local no_ollama_fallback=0
-    if openai_backend "${cloud_provider}" || [[ -n "${codex_mp_id}" || "${cloud_provider}" == "ollama-cloud" || ( "${cloud_provider}" == "xai" && "${provider}" == "kimi" ) ]]; then
+    if openai_backend "${cloud_provider}" || [[ -n "${codex_mp_id}" || "${cloud_provider}" == "ollama-cloud" || ( "${cloud_provider}" == "xai" && "${provider}" == "kimi" ) || ( "${cloud_provider}" == "gemini" && "${provider}" == "kimi" ) ]]; then
         no_ollama_fallback=1
     fi
     if [[ "${cli_available}" -eq 0 && "${no_ollama_fallback}" -eq 1 && "${opt_dry_run}" != true ]]; then
@@ -9190,6 +9219,8 @@ cmd_launch() {
             fi
         elif [[ "${cloud_provider}" == "xai" && "${cli_cmd}" == "kimi" ]]; then
             dry_argv=(kimi -m "xai/${resolved_model}")
+        elif [[ "${cloud_provider}" == "gemini" && "${cli_cmd}" == "kimi" ]]; then
+            dry_argv=(kimi -m "gemini/${resolved_model}")
         elif [[ -n "${codex_mp_id}" ]]; then
             dry_argv=("${codex_argv[@]}")
         fi
@@ -9309,7 +9340,7 @@ cmd_launch() {
             elif [[ "${cloud_provider}" == "ollama-cloud" ]]; then
                 echo "  evict  : n/a (hosted API, no VRAM to free)"
                 echo "  context: ${ollama_cloud_ctx} tokens"
-            elif [[ "${cloud_provider}" == "xai" && "${provider}" == "kimi" ]]; then
+            elif [[ ( "${cloud_provider}" == "xai" || "${cloud_provider}" == "gemini" ) && "${provider}" == "kimi" ]]; then
                 echo "  evict  : n/a (hosted API, no VRAM to free)"
                 echo "  context: ${opt_launch_ctx:-${provider_ctx}} tokens"
             elif hosted_provider "${cloud_provider}"; then
@@ -9366,8 +9397,8 @@ cmd_launch() {
                         fi
                     elif [[ "${cloud_provider}" == "vllm" ]]; then
                         echo "  ${C_DIM}(at launch kimi gets [providers.${vllm_pid}] plus served-model aliases when /v1/models answers; this dry run writes no config)${C_RESET}"
-                    elif [[ "${cloud_provider}" == "xai" ]]; then
-                        echo "  ${C_DIM}(Kimi's xai/ aliases are synced at launch; this dry run writes no config)${C_RESET}"
+                    elif [[ "${cloud_provider}" == "xai" || "${cloud_provider}" == "gemini" ]]; then
+                        echo "  ${C_DIM}(Kimi's ${cloud_provider}/ aliases are synced at launch; this dry run writes no config)${C_RESET}"
                     elif openai_backend "${cloud_provider}"; then
                         if [[ "${cli_cmd}" == agy ]]; then
                             echo "  ${C_DIM}(agy speaks Gemini. A live launch points it at a localhost shim that posts /responses; CODEX_AUTH_TOKEN stays in the shim and is not exported to agy.)${C_RESET}"
@@ -9675,6 +9706,62 @@ cmd_launch() {
                 _resolve_claude_auth || true
                 _resolve_gemini_auth || true
                 _resolve_grok_auth || true
+                if [[ "${cloud_provider}" == "gemini" ]]; then
+                    # Google Gemini provider routes through config.toml: kimi needs a
+                    # [providers.gemini] entry (google-genai type with api_key_env naming
+                    # GEMINI_AUTH_TOKEN or GEMINI_API_KEY) and an alias for the
+                    # launched model (gemini/<model>). The credential itself stays in the
+                    # environment, so nothing secret is written to disk.
+                    local sync_result="" synced_model="" synced_ctx=""
+                    local kimi_api_ctx="${opt_launch_ctx}"
+                    local -a kimi_sync_ctx=()
+                    if [[ -n "${kimi_api_ctx}" ]]; then
+                        kimi_sync_ctx=(--ctx "${kimi_api_ctx}")
+                    fi
+                    local target_alias="gemini/${resolved_model}"
+                    sync_result=$(_gemini_sync_kimi --json "${target_alias}" "${kimi_sync_ctx[@]}" 2>&1) || {
+                        echo "${C_YELLOW}[!] Warning: could not sync Gemini models into kimi config; falling back to KIMI_MODEL_* env channel${C_RESET}" >&2
+                        sync_result=""
+                    }
+                    if [[ -n "${sync_result}" ]]; then
+                        synced_model=$(echo "${sync_result}" | jq -r '.default_model // empty' 2>/dev/null)
+                        if [[ -n "${synced_model}" ]]; then
+                            resolved_model="${synced_model}"
+                        else
+                            resolved_model="${target_alias}"
+                        fi
+                        synced_ctx=$(echo "${sync_result}" | jq -r '.max_context_size // empty' 2>/dev/null)
+                        if [[ -n "${synced_ctx}" ]]; then
+                            echo "${C_DIM}[*] kimi context window: ${synced_ctx} tokens${C_RESET}" >&2
+                        fi
+                        echo "${C_DIM}[*] kimi on gemini provider: ${resolved_model} via [providers.gemini]${C_RESET}" >&2
+                        unset KIMI_MODEL_NAME KIMI_MODEL_API_KEY KIMI_MODEL_PROVIDER_TYPE \
+                            KIMI_MODEL_BASE_URL KIMI_MODEL_MAX_CONTEXT_SIZE KIMI_MODEL_CAPABILITIES \
+                            KIMI_MODEL_REASONING_KEY KIMI_MODEL_THINKING_EFFORT
+                        export KIMI_DISABLE_TELEMETRY="${KIMI_DISABLE_TELEMETRY:-1}"
+                        export KIMI_CODE_NO_AUTO_UPDATE="${KIMI_CODE_NO_AUTO_UPDATE:-1}"
+                        exec "${cli_cmd}" -m "${resolved_model}" "${cli_passthrough_args[@]}"
+                    fi
+                    # Fallback to KIMI_MODEL_* env channel if config sync failed (e.g. no tomlkit)
+                    unset KIMI_MODEL_NAME KIMI_MODEL_API_KEY KIMI_MODEL_PROVIDER_TYPE \
+                        KIMI_MODEL_BASE_URL KIMI_MODEL_MAX_CONTEXT_SIZE KIMI_MODEL_CAPABILITIES \
+                        KIMI_MODEL_REASONING_KEY KIMI_MODEL_THINKING_EFFORT
+                    export KIMI_DISABLE_TELEMETRY="${KIMI_DISABLE_TELEMETRY:-1}"
+                    export KIMI_CODE_NO_AUTO_UPDATE="${KIMI_CODE_NO_AUTO_UPDATE:-1}"
+                    export KIMI_MODEL_NAME="${resolved_model}"
+                    export KIMI_MODEL_PROVIDER_TYPE="google-genai"
+                    local gemini_genai_base="${provider_base%/openai}"
+                    gemini_genai_base="${gemini_genai_base%/v1beta}"
+                    gemini_genai_base="${gemini_genai_base%/v1}"
+                    export KIMI_MODEL_BASE_URL="${gemini_genai_base}"
+                    export KIMI_MODEL_API_KEY="${!key_var}"
+                    export KIMI_MODEL_MAX_CONTEXT_SIZE="${opt_launch_ctx:-${provider_ctx}}"
+                    export KIMI_MODEL_CAPABILITIES="${KIMO_KIMI_CAPABILITIES:-thinking,tool_use,image_in,video_in}"
+                    export KIMI_MODEL_REASONING_KEY="${KIMO_KIMI_REASONING_KEY:-reasoning_content}"
+                    export KIMI_MODEL_THINKING_EFFORT="${KIMO_KIMI_EFFORT:-${OM_KIMI_EFFORT:-high}}"
+                    echo "${C_DIM}[*] kimi on gemini '${resolved_model}' via ${provider_base} (context ${KIMI_MODEL_MAX_CONTEXT_SIZE})${C_RESET}" >&2
+                    exec "${cli_cmd}" "${cli_passthrough_args[@]}"
+                fi
                 if [[ "${cloud_provider}" == "xai" ]]; then
                     # xAI Grok provider routes through config.toml: kimi needs a
                     # [providers.xai] entry (base_url plus api_key_env naming
