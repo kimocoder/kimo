@@ -170,7 +170,19 @@ check "prune drops the earlier non-chat alias" False "$(toml '"live/whisper-1" i
 "${KIMO}" kimi provider sync live --include-nonchat >/dev/null 2>&1
 check "--include-nonchat keeps non-chat models" True "$(toml '"live/whisper-1" in doc["models"]')"
 
-echo "[4] CLI errors"
+echo "[4] Kalidroid preset sync"
+KIMI_CONFIG="${HARNESS_ROOT}/kalidroid/config.toml"
+mkdir -p "$(dirname "${KIMI_CONFIG}")"
+KD_TOKEN="kd_ai_fixture-provider-sync"
+out=$(KALIDROID_API_KEY="${KD_TOKEN}" KIMO_KALIDROID_BASE_URL="http://127.0.0.1:$(<"${PORTS}")/v1" \
+    "${KIMO}" kimi provider sync kalidroid --json 2>&1)
+check "Kalidroid preset sync succeeds" "ok" "$(jq -r '.results[] | select(.id == "kalidroid") | .status' <<<"${out}")"
+check_contains "Kalidroid provider is added on first sync" "[providers.kalidroid]" "$(cat "${KIMI_CONFIG}")"
+check "Kalidroid credential is referenced by name" "KALIDROID_API_KEY" "$(toml 'doc["providers"]["kalidroid"]["api_key_env"]')"
+check "Kalidroid catalogue populates Kimi aliases" True "$(toml '"kalidroid/chat-a" in doc["models"]')"
+check_not_contains "Kalidroid token is not written to config" "${KD_TOKEN}" "$(cat "${KIMI_CONFIG}")"
+
+echo "[5] CLI errors"
 for flag in --timeout --jobs; do
     rc=0
     out=$("${KIMO}" kimi provider sync "${flag}" 2>&1) || rc=$?

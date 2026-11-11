@@ -438,10 +438,16 @@ rc=0
 err_kd_fmt=$(KALIDROID_API_KEY="sk-not-kalidroid" "${KIMO}" launch codex --provider kalidroid --dry-run 2>&1) || rc=$?
 check "launch codex --provider kalidroid rejects a non-kd_ai key" 1 "${rc}"
 check_contains "error message requires kd_ai_ prefix" "expected 'kd_ai_...'" "${err_kd_fmt}"
-rc=0
-err_kd_kimi=$("${KIMO}" launch kimi --provider kalidroid --dry-run 2>&1) || rc=$?
-check "kimi has no kalidroid branch" 1 "${rc}"
-check_contains "the rejection names codex and claude" "supports codex claude" "${err_kd_kimi}"
+dry_kimi_kd=$(KALIDROID_API_KEY="${KD_KEY}" "${KIMO}" launch kimi --provider kalidroid --model qwen3.8-27b-uncensored --dry-run)
+check_contains "kimi kalidroid provider" "provider: kalidroid" "${dry_kimi_kd}"
+check_contains "kimi kalidroid host" "host   : ${KD_HOST}" "${dry_kimi_kd}"
+check_contains "kimi kalidroid model" "model  : qwen3.8-27b-uncensored" "${dry_kimi_kd}"
+check_contains "kimi kalidroid context" "context: 131072 tokens" "${dry_kimi_kd}"
+check_contains "kimi kalidroid uses a catalogue alias" "argv   : kimi -m kalidroid/qwen3.8-27b-uncensored" "${dry_kimi_kd}"
+check_contains "kimi kalidroid dry-run explains catalogue sync" "providers.kalidroid" "${dry_kimi_kd}"
+check_contains "kimi kalidroid masks the key" "secret : KALIDROID_API_KEY <kept: real value, Kalidroid key>" "${dry_kimi_kd}"
+check_not_contains "kimi kalidroid dry-run never prints the key" "${KD_KEY}" "${dry_kimi_kd}"
+check_not_contains "kimi kalidroid has no Ollama host" "OLLAMA_HOST=" "${dry_kimi_kd}"
 
 echo
 harness_summary "codex_providers"

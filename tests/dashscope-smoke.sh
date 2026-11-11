@@ -141,11 +141,10 @@ check "config accepts dashscope" dashscope "$("${KIMO}" config get cloud_provide
 dry=$(DASHSCOPE_API_KEY="${KEY}" "${KIMO}" launch kimi --dry-run)
 check_contains "the configured backend is used" "provider: dashscope" "${dry}"
 "${KIMO}" config unset cloud_provider >/dev/null
-forced=$(DASHSCOPE_API_KEY="${KEY}" "${KIMO}" launch kimi --provider ollama --dry-run)
-check_contains "explicit Ollama wins over credentials and config" "provider: ollama" "${forced}"
-DASHSCOPE_API_KEY="${KEY}" "${KIMO}" --host http://remote.kimo-test.invalid:9 \
-    launch kimi --provider ollama --model test-local >/dev/null 2>&1
-check "remote Ollama clears DASHSCOPE_API_KEY" "<unset>" "$(env_val "${CAPTURE}" DASHSCOPE_API_KEY)"
+rc=0
+forced=$(DASHSCOPE_API_KEY="${KEY}" "${KIMO}" launch kimi --provider ollama --dry-run 2>&1) || rc=$?
+check "Kimi rejects an explicit Ollama override" 1 "${rc}"
+check_contains "the override rejection names Kalidroid" "kalidroid" "${forced}"
 
 echo "[*] [6] No Ollama probing on the hosted path"
 cat > "${FAKE_BIN}/curl" <<'SH'

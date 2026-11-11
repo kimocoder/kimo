@@ -27,10 +27,12 @@
   - **Google Antigravity CLI** (`agy`)
   - **Cyberstrike AI Pentesting CLI** (`cyberstrike`)
   - **Hermes / OpenClaw**
+- **Kalidroid (default for Kimi)**: `kimo launch kimi` uses `KALIDROID_API_KEY` and Kalidroid's OpenAI-compatible API. A validated launch fetches `/models`, registers `[providers.kalidroid]` with the credential referenced by environment-variable name, and populates Kimi's picker with every served chat model as `kalidroid/<id>`. Old Ollama/vLLM aliases are removed from Kimi's active config, while Ollama Cloud and unrelated providers are preserved. Ollama and vLLM are no longer Kimi launch backends.
 - **Hosted Cloud Provider**: `launch --provider abliteration` routes `claude` and `kimi` at the [abliteration.ai](https://docs.abliteration.ai) Anthropic-/OpenAI-compatible API instead of a self-hosted Ollama daemon — no host probing, no model eviction, and the API key stays in the environment only. For `kimi`, a validated key registers a named `[providers.abliteration]` (credential by env-var reference) plus every model the API serves.
 - **DashScope (Alibaba Model Studio)**: `launch --provider dashscope` routes `kimi`, `claude`, `codex` and `agy` at Model Studio — the key's class picks the surface (`sk-ws-`/`sk-` → pay-as-you-go intl, `sk-sp-` → token-plan); kimi rides a zero-footprint env channel, claude the Anthropic-compatible `/apps/anthropic` endpoint, codex the Responses wire, and agy the loopback Gemini shim in its OpenAI-compatible mode (Model Studio exposes no Gemini endpoint). With no env key kimi falls back to the freetier-managed `alibaba/` aliases.
 - **Alibaba Free Tier**: `launch --provider alibaba` explicitly targets the freetier-managed `[providers.alibaba]` configuration in Kimi Code CLI with a default context size of 500,000 tokens (preventing continuous context auto-compaction loops with DeepSeek models).
-- **vLLM (self-hosted OpenAI server)**: `launch --provider vllm` routes `kimi` and `claude` at a local or remote vLLM server (default `http://127.0.0.1:8000/v1`). Without a configured base it also probes `http://127.0.0.1:18000/v1` (a common `ssh -L` forward), the configured remote host, the GPU box at `192.168.1.104` on ports 8000 and 18000, and `KIMO_VLLM_BASE_URLS`, and without `--model` it lists `GET /v1/models` and launches the first chat model, skipping embedding/reranker ids. It is not an Ollama daemon: no `/api/tags`, no VRAM eviction, no tune registry. A reachable `GET /v1/models` registers `[providers.vllm]` (or `vllm-<host>`) and one alias per served model. `VLLM_API_KEY` is stored by env-var name only. When that variable is unset, kimo reads `$KIMO_VLLM_API_KEY_FILE`, or `$HOME/vllm/api.key` for a loopback server, or `~/vllm/api.key` of the account that is listening with `vllm` (root's own home has no key). The file must be mode `0600`, not a symlink, and not other-writable. The `/v1/models` probe bypasses `http_proxy` and `all_proxy`. With no key the placeholder is `EMPTY`. A 401 from the default port with no key does not hide a later candidate. Unrelated credentials are still scrubbed when the server is not on this machine.
+- **ModelScope**: `launch --provider modelscope` routes `kimi` at ModelScope's OpenAI-compatible inference API (`api-inference.modelscope.cn/v1`) using the access token from modelscope.cn in `MODELSCOPE_API_KEY` — a validated launch registers a named `[providers.modelscope]` (credential by env-var reference) plus an alias for every served model, so kimi's model picker shows `modelscope` instead of `__kimi_env__`. A `--model` may be the wire id, a `modelscope/` alias, or an Ollama-style tag (`deepseek-v4.1-flash-1017` resolves to `deepseek-ai/DeepSeek-V4.1-Flash-1017`).
+- **vLLM (Claude only)**: `launch claude --provider vllm` routes Claude through the localhost Messages proxy to a self-hosted OpenAI-compatible server. Kimi no longer accepts this backend; use Kalidroid instead.
 
 ---
 
@@ -77,11 +79,12 @@ make check
 | `make test-codex-auth` | Isolated Codex native command forwarding, cloud/Ollama precedence, credentials, and Kimi model sync with backups |
 | `make test-cursor` | Headless smoke test of the `cursor` launch branch: asserts the argv/env kimo passes (`--model`, `CURSOR_MODEL`, `CURSOR_API_ENDPOINT`/`CURSOR_API_BASE_URL`/`CURSOR_LOCAL_AGENT_BASE_URL` host routing, override handling) and the `cursor` → `cursor-agent` binary fallback. Add `LIVE=1` for an opt-in live `-p` turn against a reachable Ollama host (`KIMO_SMOKE_HOST`/`KIMO_SMOKE_MODEL` override) |
 | `make test-grok` | Headless smoke test of the `grok` launch branch: asserts the argv/env kimo passes (`--model`, `GROK_MODELS_BASE_URL` host routing, forced `XAI_API_KEY` scrub for all hosts, exit-code propagation) and the `--ctx` config.toml `context_window` patch/revert lifecycle. Add `LIVE=1` for an opt-in live `-p` turn against a reachable Ollama host (`KIMO_SMOKE_HOST`/`KIMO_SMOKE_MODEL` override) |
-| `make test-thinking-tools` | Checks the thinking/tools capability handling: `_kimi_model_spec` unit checks (capability mapping `thinking`/`tools`/`vision` → `thinking`/`tool_use`/`image_in`, probe-failure fallback to `tool_use`, override precedence, ctx precedence flag > runtime > architecture) plus launch-branch integration (kimi env channel exports thinking vars only for thinking models, scrubs stale inherited effort on non-thinking models, honours `KIMO_KIMI_EFFORT`/`KIMO_KIMI_REASONING_KEY`/`KIMO_KIMI_CAPABILITIES`) |
+| `make test-thinking-tools` | Checks shared model-spec capability mapping (`thinking`/`tools`/`vision`), thinking metadata, probe-failure fallback, and context/override precedence. Kimi/Kalidroid launch integration is covered by `make test-kimi` |
 | `make test-gemini` | Headless smoke test of `kimo gemini` model sync into Kimi Code: asserts `/v1beta/models` parsing, non-chat filtering, `--stable-only`/`--all` flags, token limits mapping, thinking capability, valid TOML generation, idempotency, and backup creation |
 | `make test-abliteration` | Headless smoke test of the abliteration.ai cloud provider (`launch --provider abliteration`): base-URL routing for both API surfaces, the forwarded key never reaching argv, console or config, Claude's `[1m]` context suffix and tier overrides, kimi's validated `[providers.abliteration]` config path (served-catalogue registration, `api_key_env` reference, `ABLIT_KEY` normalization, 401 abort) and its zero-footprint env-channel fallback, per-model capabilities/effort ceilings, provider precedence (flag > env > config), and the absence of any Ollama probing |
 | `make test-dashscope` | Headless smoke test of the DashScope cloud provider (`launch --provider dashscope`): intl compatible-mode routing, default/explicit/`--ctx` model selection, `DASHSCOPE_API_KEY` with `MODELSTUDIO_API_KEY` fallback, placeholder and missing-key rejection, kimi's zero-footprint `KIMI_MODEL_*` env channel (wire type, base URL, context, reasoning key), provider precedence, remote-host key scrubbing, the absence of any Ollama probing, and agy's Gemini→OpenAI shim turn (a real translated request reaches `/chat/completions` with the key as a bearer token, while agy's own environment never sees that key) |
-| `make test-vllm` | Headless smoke test of `launch kimi --provider vllm`: base-URL normalization, fallback endpoint discovery, served-model listing and auto-selection, catalogue registration from `/v1/models`, `EMPTY` vs `VLLM_API_KEY` by name, context capping, thinking-id detection, env-channel fallback, remote credential scrubbing, and no Ollama probe or `ollama run` fallback |
+| `make test-modelscope` | Headless smoke test of the ModelScope cloud provider (`launch --provider modelscope`): token checks (`MODELSCOPE_API_KEY`/`MODELSCOPE_TOKEN`, settings fallback, placeholder rejection), dry-run routing report, live catalogue registration into kimi's config (`api_key_env` reference, alias per served chat model, `default_model` pinning, Ollama-style tag resolution), 401 abort, `__kimi_env__` env-channel fallback on an unreachable host, and `modelscope/` alias handling on the DashScope free tier |
+| `make test-vllm` | Verifies Kimi rejects `--provider vllm` and `vllm/` model aliases, with Kalidroid named as the replacement |
 | `make test-quota` | Headless smoke test of unified quota & usage dashboard (`kimo quota`) |
 | `make test-tunnel` | Headless smoke test of remote Ollama SSH tunnel management (`kimo tunnel`) |
 | `make test-config-validate` | Headless smoke test of persistent configuration validation (`kimo config validate`) |
@@ -502,7 +505,7 @@ kimo web fetch https://docs.ollama.com
 kimo web url https://news.ycombinator.com
 
 # Launch Kimi Code CLI with automatic WebBridge skill injection (-W)
-kimo launch kimi -W --model kalidroid-27b:latest
+kimo launch kimi -W --model qwen3.8-27b-uncensored
 ```
 
 ---
@@ -751,7 +754,7 @@ kimo completion zsh > ~/.zsh/completion/_kimo
 
 ## External CLI Hub (`launch`)
 
-`kimo launch` wraps popular coding and conversational CLIs to redirect traffic to your target Ollama instance:
+`kimo launch` wraps popular coding and conversational CLIs and routes them to a selected hosted provider or Ollama instance. Kimi defaults to Kalidroid:
 
 ```bash
 # Launch Claude Code on remote model. A real ANTHROPIC_API_KEY/AUTH_TOKEN is
@@ -759,10 +762,11 @@ kimo completion zsh > ~/.zsh/completion/_kimo
 # so the secret never leaves this box.
 kimo --remote launch claude --model nemotron3:33b
 
-# Launch Kimi Code CLI with thinking model support. Registers the target host's
-# whole model catalogue as aliases in ~/.kimi-code/config.toml, so kimi's
-# /model picker lists every model - not just the one launched here.
-kimo --remote launch kimi --model kalidroid-27b:latest
+# Launch Kimi Code on Kalidroid (the Kimi default). The validated /models
+# catalogue populates kalidroid/* aliases in ~/.kimi-code/config.toml;
+# only KALIDROID_API_KEY's name is stored, never the token itself.
+export KALIDROID_API_KEY=kd_ai_...
+kimo launch kimi --model qwen3.8-27b-uncensored
 
 # Launch Grok Build TUI with tuned context
 kimo --remote launch grok --model kalidroid-27b:latest
@@ -836,9 +840,14 @@ kimo launch claude --provider anthropic          # official Messages API, no pro
 kimo launch claude --provider qwencloud --dry-run
 ```
 
-`kalidroid` is that dashboard's OpenAI-compatible Chat Completions API (`POST {base}/chat/completions`). `launch claude --provider kalidroid` translates Anthropic Messages onto that wire. Codex only speaks Responses, and this host does not serve `{base}/responses`, so a live `launch codex --provider kalidroid` stops unless `KIMO_KALIDROID_BASE_URL` names a Responses gateway. `--dry-run` still prints the Responses overlays and masks `KALIDROID_API_KEY`. `Kalidroid` is accepted as the same name. A `kalidroid/` prefix on `--model` is stripped. `KIMO_KALIDROID_MODEL` (default `qwen3.8-27b`) and `KIMO_KALIDROID_CTX` (default 131072) override the preset. The catalogue also lists `kimi-k2.6`, `kimi-k2.7-code`, `kimi-k2.7-code-highspeed`, `kimi-k3` and `kimi-k3.1-pro`.
+`kalidroid` is that dashboard's OpenAI-compatible Chat Completions API (`POST {base}/chat/completions`) and Kimi's default backend. A validated Kimi launch fetches `{base}/models` with `KALIDROID_API_KEY`, registers `[providers.kalidroid]` using `api_key_env = "KALIDROID_API_KEY"`, and creates a `kalidroid/<id>` alias for every served chat model. This replaces old Ollama/vLLM providers and aliases in Kimi's active config while preserving Ollama Cloud and unrelated providers. The token never reaches argv or config. If the catalogue is unreachable, Kimi falls back to the zero-footprint `KIMI_MODEL_*` channel; a 401/403 aborts without changing config. `kimo kimi provider sync kalidroid` can also refresh the catalogue directly.
+
+`launch claude --provider kalidroid` translates Anthropic Messages onto the same wire. Codex only speaks Responses, and this host does not serve `{base}/responses`, so a live `launch codex --provider kalidroid` stops unless `KIMO_KALIDROID_BASE_URL` names a Responses gateway. `--dry-run` masks the credential. `Kalidroid` is accepted as the same name, and a `kalidroid/` prefix on `--model` is stripped. `KIMO_KALIDROID_MODEL` (default `qwen3.8-27b`) and `KIMO_KALIDROID_CTX` (default 131072) override the preset.
 
 ```bash
+export KALIDROID_API_KEY=kd_ai_...
+kimo launch kimi --model qwen3.8-27b-uncensored
+kimo kimi provider sync kalidroid
 kimo launch claude --provider kalidroid
 kimo launch claude --provider kalidroid --model kimi-k2.7-code --dry-run
 ```

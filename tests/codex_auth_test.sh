@@ -189,12 +189,12 @@ check "no mangled codex/openai/ alias" "False" \
 
 echo "[*] [4] kimo launch kimi and codex routing"
 
-# Test 4.1: Launch kimi with CODEX_API_KEY auto-routes to codex/gpt-6.1-sol
-kimi_dry=$(CODEX_API_KEY="sk-proj-test-env-key-999" "${KIMO}" launch kimi --dry-run)
-check_contains "kimi launch routes to provider codex" "provider: codex" "${kimi_dry}"
-check_contains "kimi launch model resolves to codex/gpt-6.1-sol" "model  : codex/gpt-6.1-sol" "${kimi_dry}"
-check_contains "kimi launch argv launches kimi with -m" "argv   : kimi -m codex/gpt-6.1-sol" "${kimi_dry}"
-check_contains "kimi launch dry-run keeps codex auth secrets" "secret : CODEX_AUTH_TOKEN <kept: real value, codex token/key>" "${kimi_dry}"
+# Ambient Codex credentials do not override Kimi's Kalidroid default.
+kimi_dry=$(CODEX_API_KEY="sk-proj-test-env-key-999" KALIDROID_API_KEY="kd_ai_fixture-default" "${KIMO}" launch kimi --dry-run)
+check_contains "ambient Codex key keeps Kimi on Kalidroid" "provider: kalidroid" "${kimi_dry}"
+check_contains "Kimi uses the Kalidroid default model" "model  : qwen3.8-27b" "${kimi_dry}"
+check_contains "Kimi argv uses a Kalidroid alias" "argv   : kimi -m kalidroid/qwen3.8-27b" "${kimi_dry}"
+check_contains "Kimi dry-run masks the Kalidroid key" "secret : KALIDROID_API_KEY <kept: real value, Kalidroid key>" "${kimi_dry}"
 
 # Test 4.2: Launch kimi with --provider codex
 kimi_prov_dry=$("${KIMO}" launch kimi --provider codex --dry-run)
@@ -592,8 +592,8 @@ check "kimo's own placeholder is not sent to OpenAI" 1 "${rc}"
 NO_OAUTH="${HARNESS_ROOT}/platform-only"
 mkdir -p "${NO_OAUTH}"
 cp "${CODEX_DIR}/models_cache.json" "${NO_OAUTH}/"
-dry=$(CODEX_HOME="${NO_OAUTH}" OPENAI_API_KEY="${PLATFORM_KEY}" "${KIMO}" launch kimi --dry-run)
-check_contains "a lone platform key auto-selects the platform backend" "provider: openai" "${dry}"
+dry=$(CODEX_HOME="${NO_OAUTH}" OPENAI_API_KEY="${PLATFORM_KEY}" KALIDROID_API_KEY="kd_ai_fixture-default" "${KIMO}" launch kimi --dry-run)
+check_contains "an ambient platform key does not override Kalidroid" "provider: kalidroid" "${dry}"
 
 rc=0
 claude_openai=$(OPENAI_API_KEY="${PLATFORM_KEY}" "${KIMO}" launch claude --provider openai --dry-run 2>/dev/null) || rc=$?
@@ -615,11 +615,11 @@ check_contains "the configured backend is used" "provider: openai" "${dry}"
 rc=0
 unknown=$("${KIMO}" launch kimi --provider not-a-backend --dry-run 2>&1) || rc=$?
 check "an unknown backend is rejected" 1 "${rc}"
-check_contains "the rejection lists every backend" "ollama ollama-cloud abliteration codex openai dashscope alibaba qwencloud xai anthropic claude gemini kalidroid vllm" "${unknown}"
+check_contains "the rejection lists every backend" "ollama ollama-cloud abliteration codex openai dashscope alibaba modelscope qwencloud xai anthropic claude gemini kalidroid vllm" "${unknown}"
 rc=0
 missing=$("${KIMO}" launch kimi --provider 2>&1) || rc=$?
 check "a missing backend argument is rejected" 1 "${rc}"
-check_contains "the missing-argument error lists every backend" "ollama, ollama-cloud, abliteration, codex, openai, dashscope, alibaba, qwencloud, xai, anthropic, claude, gemini, kalidroid, vllm" "${missing}"
+check_contains "the missing-argument error lists every backend" "ollama, ollama-cloud, abliteration, codex, openai, dashscope, alibaba, modelscope, qwencloud, xai, anthropic, claude, gemini, kalidroid, vllm" "${missing}"
 
 # An explicitly requested model needs no cached catalog, so a box that has never
 # run the Codex CLI can still use the platform backend.
@@ -655,7 +655,7 @@ check_contains "Bash completion includes Codex native commands" 'exec review res
 # Both completion scripts are emitted from quoted heredocs, so they cannot expand
 # KIMO_LAUNCH_PROVIDERS; assert they still offer exactly what launch accepts.
 providers=$(sed -n 's/^KIMO_LAUNCH_PROVIDERS="\(.*\)"$/\1/p' "${KIMO}")
-check "the accepted backends are declared once" "ollama ollama-cloud abliteration codex openai dashscope alibaba qwencloud xai anthropic claude gemini kalidroid vllm" "${providers}"
+check "the accepted backends are declared once" "ollama ollama-cloud abliteration codex openai dashscope alibaba modelscope qwencloud xai anthropic claude gemini kalidroid vllm" "${providers}"
 check_contains "Bash completion offers every backend" "${providers}" "${bash_completion}"
 check_contains "Zsh completion offers every backend" "${providers}" "$("${KIMO}" completion zsh)"
 check_contains "Zsh completion includes Codex bridge" '--sync[Synchronize Codex provider' "$("${KIMO}" completion zsh)"
@@ -665,7 +665,14 @@ comp_codex=$(CODEX_HOME="${HOME}/.codex" bash -c "source '${comp_script}'; COMP_
 check_contains "completion offers codex catalog models with --provider codex" "codex/gpt-6.1-sol" "${comp_codex}"
 check_not_contains "completion hides hidden catalog models" "codex/hidden-model" "${comp_codex}"
 comp_plain=$(CODEX_HOME="${HOME}/.codex" bash -c "source '${comp_script}'; COMP_WORDS=(kimo launch kimi -m ''); COMP_CWORD=4; _kimo; printf '%s\n' \"\${COMPREPLY[@]}\"")
-check_not_contains "no hosted aliases without --provider" "codex/gpt-6.1-sol" "${comp_plain}"
+check_not_contains "Kimi default completion omits Codex aliases" "codex/gpt-6.1-sol" "${comp_plain}"
+check_contains "Kimi default completion offers Kalidroid" "kalidroid/qwen3.8-27b" "${comp_plain}"
+check_not_contains "Kimi default completion omits Ollama tags" "shared:latest" "${comp_plain}"
+comp_kimi_providers=$(bash -c "source '${comp_script}'; COMP_WORDS=(kimo launch kimi --provider ''); COMP_CWORD=4; _kimo; printf '%s\n' \"\${COMPREPLY[@]}\"")
+check_contains "Kimi provider completion offers Kalidroid" "kalidroid" "${comp_kimi_providers}"
+check_contains "Kimi provider completion retains Ollama Cloud" "ollama-cloud" "${comp_kimi_providers}"
+check "Kimi provider completion omits Ollama" "no" "$(grep -qx ollama <<<"${comp_kimi_providers}" && echo yes || echo no)"
+check "Kimi provider completion omits vLLM" "no" "$(grep -qx vllm <<<"${comp_kimi_providers}" && echo yes || echo no)"
 check_contains "zsh completion embeds the hosted model helper" "_kimo_hosted_models" "$("${KIMO}" completion zsh)"
 
 echo
