@@ -586,7 +586,12 @@ def bare_slug(model: str) -> str:
 
 
 def model_window(home: Path, model: str) -> int:
-    """Context window Codex records for a slug, else the Claude launch default."""
+    """Context window Codex records for a slug, else 0 for the caller's default.
+
+    A slug the catalog does not carry must stay distinguishable from one the
+    catalog reports as 272000, so launch defaults (KIMO_OPENAI_CTX /
+    KIMO_CODEX_CTX) still apply.
+    """
     slug = bare_slug(model)
     for item in catalog(home):
         if item.get("slug") != slug:
@@ -594,7 +599,7 @@ def model_window(home: Path, model: str) -> int:
         raw = item.get("context_window") or item.get("max_context_window") or 0
         if isinstance(raw, int) and not isinstance(raw, bool) and raw > 0:
             return raw
-    return 272000
+    return 0
 
 
 def populate_claude(home: Path, active_model: str = "") -> None:

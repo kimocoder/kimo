@@ -1760,18 +1760,19 @@ _claude_take_catalog_model() {
     printf '%s\n' "${slug}"
 }
 
-# Context window Claude should assume for a Codex catalog slug. An unrecognized
-# id is 200K unless CLAUDE_CODE_MAX_CONTEXT_TOKENS says otherwise, and a resumed
-# transcript that is already past 200K then fails compaction. Prints a positive
-# integer. Args: <slug>
+# Context window Claude should assume for a hosted provider slug. An
+# unrecognized id is the caller's fallback (200K on both OpenAI backends)
+# unless CLAUDE_CODE_MAX_CONTEXT_TOKENS says otherwise, and a resumed
+# transcript that is already past it then fails compaction. Prints a positive
+# integer. Args: <slug> [fallback]
 _claude_catalog_ctx() {
-    local ctx=""
+    local ctx="" fallback="${2:-${CODEX_CLAUDE_CTX}}"
     ctx=$(_codex_helper model-window "$1" 2>/dev/null || true)
     if [[ "${ctx}" =~ ^[1-9][0-9]*$ ]]; then
         printf '%s\n' "${ctx}"
         return 0
     fi
-    printf '%s\n' "${CODEX_CLAUDE_CTX}"
+    printf '%s\n' "${fallback}"
 }
 
 # Claude Code merges the env block in the user settings file on top of the
@@ -8489,7 +8490,7 @@ cmd_launch() {
             elif [[ "${provider}" == claude ]]; then
                 resolved_model=$(_claude_take_catalog_model openai "${opt_model_explicit}" "${target_model}" "${DEFAULT_MODELS[claude]:-}") || return 1
                 _claude_use responses "${active_host%/}/v1" OPENAI_API_KEY \
-                    "${opt_launch_ctx:-$(_claude_catalog_ctx "${resolved_model}")}" || return 1
+                    "${opt_launch_ctx:-$(_claude_catalog_ctx "${resolved_model}" "${OPENAI_CLAUDE_CTX}")}" || return 1
             else
                 _codex_warn_chatgpt_login
                 if ! ${opt_model_explicit} && [[ "${target_model}" != openai/* ]]; then

@@ -135,6 +135,9 @@ check_not_contains "dry-run never prints the openai key" "${OPENAI_KEY}" "${dry}
 dry=$(OPENAI_API_KEY="${OPENAI_KEY}" "${KIMO}" launch claude --provider openai --model openai/gpt-explicit --dry-run)
 check_contains "openai/ prefix is stripped" "model  : gpt-explicit" "${dry}"
 
+dry_ctx=$(KIMO_OPENAI_CTX=310000 OPENAI_API_KEY="${OPENAI_KEY}" "${KIMO}" launch claude --provider openai --model openai/gpt-explicit --dry-run)
+check_contains "openai honors KIMO_OPENAI_CTX for an unknown slug" "context: 310000 tokens" "${dry_ctx}"
+
 dry=$(CODEX_AUTH_TOKEN="${CODEX_TOKEN}" "${KIMO}" launch claude --provider codex --model codex/gpt-6.1-sol --dry-run)
 check_contains "codex provider" "provider: codex" "${dry}"
 check_contains "codex responses wire" "anthropic -> responses (https://chatgpt.com/backend-api/codex)" "${dry}"
