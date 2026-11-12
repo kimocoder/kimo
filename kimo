@@ -12964,7 +12964,7 @@ _kimo() {
                     grep -oE "^\[models\.\"${p}/[^\"]+\"\]" "${cfg}" 2>/dev/null | sed -E 's/^\[models\."([^"]+)"\]$/\1/'
                 } | sort -u
                 ;;
-            dashscope)
+            dashscope|alibaba)
                 printf '%s\n' \
                     dashscope/qwen3.8-max qwen3.8-max \
                     dashscope/qwen3.8-flash qwen3.8-flash \
@@ -12973,7 +12973,8 @@ _kimo() {
                     dashscope/qwen3-coder-turbo qwen3-coder-turbo \
                     dashscope/qwen-plus qwen-plus \
                     dashscope/qwen-turbo qwen-turbo \
-                    dashscope/qwen-max qwen-max
+                    dashscope/qwen-max qwen-max \
+                    dashscope/deepseek-v4.1-flash-1017 deepseek-v4.1-flash-1017
                 ;;
             qwencloud)
                 printf '%s\n' \
@@ -13319,7 +13320,7 @@ _kimo_hosted_models() {
                 grep -oE "^\[models\.\"${p}/[^\"]+\"\]" "${cfg}" 2>/dev/null | sed -E 's/^\[models\."([^"]+)"\]$/\1/'
             } | sort -u
             ;;
-        dashscope)
+        dashscope|alibaba)
             printf '%s\n' \
                 dashscope/qwen3.8-max qwen3.8-max \
                 dashscope/qwen3.8-flash qwen3.8-flash \
@@ -13328,7 +13329,8 @@ _kimo_hosted_models() {
                 dashscope/qwen3-coder-turbo qwen3-coder-turbo \
                 dashscope/qwen-plus qwen-plus \
                 dashscope/qwen-turbo qwen-turbo \
-                dashscope/qwen-max qwen-max
+                dashscope/qwen-max qwen-max \
+                dashscope/deepseek-v4.1-flash-1017 deepseek-v4.1-flash-1017
             ;;
         qwencloud)
             printf '%s\n' \

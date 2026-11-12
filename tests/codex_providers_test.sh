@@ -340,6 +340,7 @@ check "proxy /models returns valid json" "true" "$(python3 -c 'import json,sys; 
 check_contains "proxy /models includes default model" "qwen3.8-max" "${models_resp}"
 check_contains "proxy /models includes explicit extra model" "custom-test-model" "${models_resp}"
 check_contains "proxy /v1/models with query serves catalog" "qwen3.8-max" "${v1_models_resp}"
+check_contains "proxy /v1/models serves the dashscope deepseek model" "deepseek-v4.1-flash-1017" "${v1_models_resp}"
 
 echo "[*] [10] Shell completions populate available models for CLI"
 COMP_SCRIPT="${HARNESS_ROOT}/comp_test.bash"
@@ -347,6 +348,11 @@ COMP_SCRIPT="${HARNESS_ROOT}/comp_test.bash"
 comp_ds=$(bash -c "source '${COMP_SCRIPT}'; COMP_WORDS=(kimo launch codex --provider dashscope -m ''); COMP_CWORD=6; _kimo; printf '%s\n' \"\${COMPREPLY[@]}\"")
 check_contains "completion offers dashscope models with prefix" "dashscope/qwen3.8-max" "${comp_ds}"
 check_contains "completion offers dashscope models bare" "qwen3.8-max" "${comp_ds}"
+check_contains "completion offers dashscope deepseek models with prefix" "dashscope/deepseek-v4.1-flash-1017" "${comp_ds}"
+check_contains "completion offers dashscope deepseek models bare" "deepseek-v4.1-flash-1017" "${comp_ds}"
+
+comp_ali=$(bash -c "source '${COMP_SCRIPT}'; COMP_WORDS=(kimo launch codex --provider alibaba -m ''); COMP_CWORD=6; _kimo; printf '%s\n' \"\${COMPREPLY[@]}\"")
+check_contains "completion treats alibaba as a dashscope alias" "dashscope/deepseek-v4.1-flash-1017" "${comp_ali}"
 
 comp_qw=$(bash -c "source '${COMP_SCRIPT}'; COMP_WORDS=(kimo launch codex --provider qwencloud -m ''); COMP_CWORD=6; _kimo; printf '%s\n' \"\${COMPREPLY[@]}\"")
 check_contains "completion offers qwencloud models" "qwencloud/qwen3.8-max" "${comp_qw}"
