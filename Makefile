@@ -1,6 +1,6 @@
 # Makefile for kimo (Unified Local & Remote Model Management & External CLI Hub)
 
-PREFIX  ?= /usr/local
+PREFIX  ?= /usr
 BINDIR  ?= $(PREFIX)/bin
 SHAREDIR ?= $(PREFIX)/share/kimo
 DESTDIR ?=
@@ -84,7 +84,7 @@ help:
 	@echo "  make help                  Display this help message"
 	@echo ""
 	@echo "Variables:"
-	@echo "  PREFIX   Installation directory prefix (default: /usr/local)"
+	@echo "  PREFIX   Installation directory prefix (default: /usr)"
 	@echo "  BINDIR   Binary destination directory (default: \$$(PREFIX)/bin)"
 	@echo "  SHAREDIR Shared assets directory (default: \$$(PREFIX)/share/kimo)"
 	@echo "  DESTDIR  Staging directory prefix for packaging"
