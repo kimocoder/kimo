@@ -117,8 +117,89 @@ check_contains "gemini --export exports GEMINI_AUTH_TOKEN" "export GEMINI_AUTH_T
 json_out=$("${KIMO}" gemini --json)
 check_contains "gemini --json reports valid token" '"token_valid": true' "${json_out}"
 check_contains "gemini --json reports email" '"email": "test-user@example.com"' "${json_out}"
+check_not_contains "gemini status no longer reports API-key variables" 'GEMINI_API_KEY' "${json_out}"
 
-sync_out=$("${KIMO}" gemini sync 2>&1)
+apikey_state=$(env -u GEMINI_AUTH_TOKEN -u GOOGLE_OAUTH_TOKEN \
+    GEMINI_HOME="${TMP_DIR}/empty_gemini_home" GEMINI_API_KEY="AIzaSyLegacyKey" GOOGLE_API_KEY="" \
+    python3 "${ROOT_DIR}/lib/kimo-gemini.py" token-state)
+check "an API key alone is not Gemini authentication" "missing none no" "${apikey_state}"
+rc=0
+apikey_out=$(env -u GEMINI_AUTH_TOKEN -u GOOGLE_OAUTH_TOKEN \
+    GEMINI_HOME="${TMP_DIR}/empty_gemini_home" GEMINI_API_KEY="AIzaSyLegacyKey" GOOGLE_API_KEY="" \
+    "${KIMO}" gemini --token 2>&1) || rc=$?
+check "gemini --token rejects API-key-only input" 1 "${rc}"
+check_contains "the token error names bearer authentication" "GEMINI_AUTH_TOKEN" "${apikey_out}"
+
+rc=0
+helper_noauth_out=$(env -u GEMINI_AUTH_TOKEN -u GOOGLE_OAUTH_TOKEN -u GEMINI_API_KEY -u GOOGLE_API_KEY \
+    GEMINI_HOME="${TMP_DIR}/empty_gemini_home" KIMI_CONFIG="${TMP_DIR}/noauth-kimi.toml" \
+    python3 "${ROOT_DIR}/lib/kimo-gemini.py" sync 2>&1) || rc=$?
+check "helper sync refuses to write static models without a token" 1 "${rc}"
+check "helper no-token sync leaves Kimi config absent" "false" "$([[ -e "${TMP_DIR}/noauth-kimi.toml" ]] && echo true || echo false)"
+check_contains "helper no-token sync names GEMINI_AUTH_TOKEN" "GEMINI_AUTH_TOKEN" "${helper_noauth_out}"
+
+helper_http=$(python3 - "${ROOT_DIR}/lib/kimo-gemini.py" <<'PY'
+import importlib.util
+import json
+import os
+import sys
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+spec = importlib.util.spec_from_file_location("kimo_gemini", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+
+class Handler(BaseHTTPRequestHandler):
+    reject = False
+    authorization = None
+
+    def log_message(self, *_args):
+        return
+
+    def do_GET(self):
+        type(self).authorization = self.headers.get("Authorization")
+        status = 401 if type(self).reject else 200
+        payload = ({"error": {"message": "denied"}} if type(self).reject else {
+            "models": [{"name": "models/gemini-test", "displayName": "Gemini Test",
+                        "inputTokenLimit": 1000, "outputTokenLimit": 100,
+                        "supportedGenerationMethods": ["generateContent"]}]
+        })
+        body = json.dumps(payload).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+thread = threading.Thread(target=server.serve_forever, daemon=True)
+thread.start()
+try:
+    os.environ["KIMO_GEMINI_BASE_URL"] = f"http://127.0.0.1:{server.server_address[1]}"
+    rows = module.fetch_live_models("fixture-oauth-token")
+    assert rows[0][0] == "gemini-test"
+    assert Handler.authorization == "Bearer fixture-oauth-token"
+    Handler.reject = True
+    try:
+        module.fetch_live_models("fixture-oauth-token")
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("401 unexpectedly returned the static model fallback")
+finally:
+    server.shutdown()
+    server.server_close()
+    thread.join()
+print("bearer-only-ok")
+PY
+)
+check "helper uses bearer auth and propagates catalog rejection" "bearer-only-ok" "${helper_http}"
+
+cat > "${TMP_DIR}/gemini-models.json" <<'JSON'
+{"models":[{"name":"models/gemini-2.5-flash","displayName":"Gemini 2.5 Flash","inputTokenLimit":1048576,"outputTokenLimit":65536,"supportedGenerationMethods":["generateContent"],"thinking":true}]}
+JSON
+sync_out=$("${KIMO}" gemini sync --from-json "${TMP_DIR}/gemini-models.json" 2>&1)
 check_contains "gemini sync configures provider" "wrote" "${sync_out}"
 cfg_content=$(cat "${KIMI_CONFIG}")
 check_contains "sync wrote gemini provider" "[providers.gemini]" "${cfg_content}"
@@ -157,6 +238,17 @@ cfg_content=$(cat "${KIMI_CONFIG}")
 check_contains "sync wrote xai provider" "[providers.xai]" "${cfg_content}"
 check_contains "sync wrote api_key_env for oauth" 'api_key_env = "XAI_AUTH_TOKEN"' "${cfg_content}"
 check_contains "sync registered grok 4.7" 'grok-4.7' "${cfg_content}"
+
+echo "[*] [3b] GROK_AUTH_TOKEN alias and local-only grok command"
+ALIAS_TOKEN="eyJhbGciOiJFUzI1NiJ9.eyJzdWIiOiJhbGlhcyIsImV4cCI6MTg5MzQ1NjAwMH0.alias-sig"
+alias_out=$(env -u XAI_AUTH_TOKEN -u XAI_API_KEY GROK_HOME="${TMP_DIR}/no_grok_home" \
+    GROK_AUTH_TOKEN="${ALIAS_TOKEN}" KIMO_GROK_NO_REFRESH=1 "${KIMO}" --remote grok --token 2>&1 || true)
+check "GROK_AUTH_TOKEN is accepted as XAI_AUTH_TOKEN" "${ALIAS_TOKEN}" "${alias_out}"
+completion_out=$("${KIMO}" completion bash)
+check_contains "bash completion offers the grok command" "grok grok-sync xai" "${completion_out}"
+check_contains "bash completion handles grok options" "grok|grok-sync|xai|xai-sync|kimi-grok|kimi-xai)" "${completion_out}"
+zsh_out=$("${KIMO}" completion zsh)
+check_contains "zsh completion describes grok" "'grok:xAI Grok OAuth token" "${zsh_out}"
 
 echo "[*] [4] Launch codex provider auto-resolution with OAuth tokens"
 unset ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN CLAUDE_CODE_OAUTH_TOKEN \

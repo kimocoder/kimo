@@ -101,9 +101,11 @@ PROVIDER_MODELS: dict[str, list[tuple[str, str, int, str]]] = {
         ("qwen3.6-flash", "Qwen 3.6 Flash", 1000000, "Lightweight Qwen model"),
         ("qwen3-coder-plus", "Qwen 3 Coder Plus", 1000000, "Specialized coding model"),
         ("qwen3-coder-turbo", "Qwen 3 Coder Turbo", 1000000, "Fast coding model"),
+        ("deepseek-4.1-pro", "DeepSeek 4.1 Pro", 500000, "Frontier DeepSeek reasoning model"),
         ("deepseek-v4.1-flash-1017", "DeepSeek V4.1 Flash", 500000, "Fast DeepSeek reasoning model"),
     ],
     "qwencloud": [
+        ("qwen4-max-preview", "Qwen 4 Max Preview", 1000000, "Preview Qwen 4 model"),
         ("qwen3.8-max", "Qwen 3.8 Max", 1000000, "Frontier Qwen model"),
         ("qwen3.8-flash", "Qwen 3.8 Flash", 1000000, "Ultra-fast Qwen model"),
         ("qwen3.6-flash", "Qwen 3.6 Flash", 1000000, "Lightweight Qwen model"),
@@ -1556,8 +1558,6 @@ class Proxy(BaseHTTPRequestHandler):
         }
         if secret and secret != "EMPTY":
             headers["Authorization"] = f"Bearer {secret}"
-            if secret.startswith("AIzaSy"):
-                headers["x-goog-api-key"] = secret
         if self.provider == "xai" or (parts.hostname or "").endswith("grok.com"):
             headers["X-Grok-Client-Version"] = "1.0.70"
         # Without X-XAI-Token-Auth the CLI proxy reports

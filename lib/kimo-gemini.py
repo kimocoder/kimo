@@ -118,19 +118,6 @@ def token_state(home: Path) -> None:
         or os.environ.get("GOOGLE_OAUTH_TOKEN")
         or ""
     )
-    env_key = (
-        os.environ.get("GEMINI_API_KEY")
-        or os.environ.get("GOOGLE_API_KEY")
-        or ""
-    )
-    if env_key == "ollama":
-        env_key = ""
-
-    if env_key and (env_key.startswith("ya29.") or env_key.startswith("eyJ") or env_key.startswith("AQ")):
-        if not env_token:
-            env_token = env_key
-            env_key = ""
-
     file_token = str(tok_obj.get("access_token") or "")
 
     if env_token:
@@ -147,10 +134,6 @@ def token_state(home: Path) -> None:
             print(f"valid file {refreshable}")
             return
         print(f"expired file {refreshable}")
-        return
-
-    if env_key and env_key != "ollama":
-        print(f"apikey env {refreshable}")
         return
 
     print(f"missing none {refreshable}")
@@ -192,7 +175,7 @@ def _refresh_locked(home: Path, timeout: float) -> None:
     tok_obj = doc.get("token") if isinstance(doc.get("token"), dict) else doc
     refresh_token = tok_obj.get("refresh_token")
     if not isinstance(refresh_token, str) or not refresh_token:
-        raise ValueError(f"No refresh_token in {tpath}; sign in with 'agy' or provide GEMINI_API_KEY.")
+        raise ValueError(f"No refresh_token in {tpath}; sign in with 'agy' or set GEMINI_AUTH_TOKEN.")
 
     url = os.environ.get("KIMO_GEMINI_TOKEN_URL") or GEMINI_TOKEN_URL
     parts = urllib.parse.urlsplit(url)
@@ -271,14 +254,6 @@ def status(home: Path, config: Path, as_json: bool) -> None:
         or os.environ.get("GOOGLE_OAUTH_TOKEN")
         or str(tok_obj.get("access_token") or "")
     )
-    api_key = (
-        os.environ.get("GEMINI_API_KEY")
-        or os.environ.get("GOOGLE_API_KEY")
-        or ""
-    )
-    if api_key == "ollama":
-        api_key = ""
-
     exp = parse_expiry(tok_obj.get("expiry"))
     try:
         expires = datetime.datetime.fromtimestamp(exp, datetime.timezone.utc).isoformat() if exp else (tok_obj.get("expiry") or "Unknown")
@@ -294,12 +269,12 @@ def status(home: Path, config: Path, as_json: bool) -> None:
     registered = cfg_doc.get("models", {})
     env = {
         key: "<set>" if os.environ.get(key) else "<unset>"
-        for key in ("GEMINI_AUTH_TOKEN", "GOOGLE_OAUTH_TOKEN", "GEMINI_API_KEY", "GOOGLE_API_KEY")
+        for key in ("GEMINI_AUTH_TOKEN", "GOOGLE_OAUTH_TOKEN")
     }
 
     email = doc.get("id_token_email") or tok_obj.get("email")
-    auth_method = doc.get("auth_method") or ("api_key" if api_key else None)
-    token_valid = (exp > time.time()) if exp is not None else (bool(token) or bool(api_key))
+    auth_method = doc.get("auth_method")
+    token_valid = (exp > time.time()) if exp is not None else bool(token)
 
     data = {
         "gemini_home": str(gdir),
@@ -307,7 +282,7 @@ def status(home: Path, config: Path, as_json: bool) -> None:
         "auth_file_exists": tpath.exists(),
         "email": email,
         "auth_method": auth_method,
-        "token_present": bool(token) or bool(api_key),
+        "token_present": bool(token),
         "token_valid": token_valid,
         "token_exp": exp,
         "token_exp_iso": expires,
@@ -333,14 +308,12 @@ def status(home: Path, config: Path, as_json: bool) -> None:
     state = "Active" if token_valid else ("Expired" if exp is not None else "Unknown expiry")
     if token:
         print(f"  OAuth Token : <set> - {state} ({expires})")
-    elif api_key:
-        print(f"  API Key     : <set> ({api_key[:10]}...)")
     else:
         print("  Session     : <none>")
     print(f"  Refresh Token : {'Present' if data['refreshable'] else 'Absent'}")
     if state == "Expired" and data["refreshable"]:
         print("                  'kimo gemini --token' renews it automatically.")
-    print("  Native authentication: run 'agy' or set GEMINI_API_KEY")
+    print("  Native authentication: run 'agy' or set GEMINI_AUTH_TOKEN")
     for key, val in env.items():
         print(f"    {key} : {val}")
     print(f"  Kimi Config : {config}")
@@ -385,18 +358,6 @@ def get_working_token(home: Path) -> str:
         or os.environ.get("GOOGLE_OAUTH_TOKEN")
         or ""
     )
-    env_key = (
-        os.environ.get("GEMINI_API_KEY")
-        or os.environ.get("GOOGLE_API_KEY")
-        or ""
-    )
-    if env_key == "ollama":
-        env_key = ""
-
-    if env_key and (env_key.startswith("ya29.") or env_key.startswith("eyJ") or env_key.startswith("AQ")):
-        if not env_auth:
-            env_auth = env_key
-
     exp = parse_expiry(tok_obj.get("expiry"))
     file_valid = exp is None or exp > time.time() + EXPIRY_SKEW_SECONDS
 
@@ -407,51 +368,57 @@ def get_working_token(home: Path) -> str:
     if file_token and file_valid:
         return file_token
 
-    if env_key:
-        return env_key
-
-    return env_auth or file_token or env_key
+    return env_auth or file_token
 
 
 def fetch_live_models(token: str, timeout: float = 6) -> list[tuple[str, str, int, int, bool]]:
     if not token or token == "ollama":
-        return GEMINI_MODELS
+        raise ValueError("Gemini model discovery requires an OAuth token in GEMINI_AUTH_TOKEN.")
     base = os.environ.get("KIMO_GEMINI_BASE_URL") or "https://generativelanguage.googleapis.com"
     base = base.removesuffix("/v1beta").removesuffix("/v1").removesuffix("/openai").rstrip("/")
     url = f"{base}/v1beta/models?pageSize=1000"
-    headers = {"Accept": "application/json", "User-Agent": "kimo-gemini/1.0"}
-    if token.startswith("ya29.") or not token.startswith("AIza"):
-        headers["Authorization"] = f"Bearer {token}"
-    else:
-        headers["x-goog-api-key"] = token
+    headers = {
+        "Accept": "application/json",
+        "User-Agent": "kimo-gemini/1.0",
+        "Authorization": f"Bearer {token}",
+    }
 
     req = urllib.request.Request(url, headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:  # nosec B310
             data = json.loads(resp.read().decode("utf-8"))
-        res = []
-        nonchat_keywords = ("embed", "aqa", "imagen", "veo", "lyria", "tts", "image", "banana", "native-audio", "live", "transcribe", "robotics", "computer-use", "deep-research", "learnlm")
-        for item in data.get("models", []):
-            name = item.get("name") or ""
-            slug = name.removeprefix("models/")
-            if not slug:
-                continue
-            methods = item.get("supportedGenerationMethods", [])
-            if "generateContent" not in methods:
-                continue
-            lower_slug = slug.lower()
-            if any(k in lower_slug for k in nonchat_keywords):
-                continue
-            display_name = item.get("displayName") or slug
-            ctx = item.get("inputTokenLimit") or 1048576
-            out = item.get("outputTokenLimit") or 8192
-            think = bool(item.get("thinking", False) or "thinking" in lower_slug or "2.5" in lower_slug)
-            res.append((slug, display_name, ctx, out, think))
-        if res:
-            return res
-    except Exception:
-        pass
-    return GEMINI_MODELS
+    except urllib.error.HTTPError as error:
+        raise ValueError(f"Gemini model discovery was refused (HTTP {error.code}).") from None
+    except (urllib.error.URLError, TimeoutError, OSError) as error:
+        raise ValueError(f"Gemini model discovery failed: {error}") from None
+    except (UnicodeError, ValueError) as error:
+        raise ValueError(f"Gemini model discovery returned malformed JSON: {error}") from None
+
+    if not isinstance(data, dict) or not isinstance(data.get("models"), list):
+        raise ValueError("Gemini model discovery returned no models array.")
+    res = []
+    nonchat_keywords = ("embed", "aqa", "imagen", "veo", "lyria", "tts", "image", "banana", "native-audio", "live", "transcribe", "robotics", "computer-use", "deep-research", "learnlm")
+    for item in data["models"]:
+        if not isinstance(item, dict):
+            continue
+        name = item.get("name") or ""
+        slug = name.removeprefix("models/")
+        if not slug:
+            continue
+        methods = item.get("supportedGenerationMethods", [])
+        if "generateContent" not in methods:
+            continue
+        lower_slug = slug.lower()
+        if any(k in lower_slug for k in nonchat_keywords):
+            continue
+        display_name = item.get("displayName") or slug
+        ctx = item.get("inputTokenLimit") or 1048576
+        out = item.get("outputTokenLimit") or 8192
+        think = bool(item.get("thinking", False) or "thinking" in lower_slug or "2.5" in lower_slug)
+        res.append((slug, display_name, ctx, out, think))
+    if not res:
+        raise ValueError("Gemini model discovery returned no chat-capable models.")
+    return res
 
 
 def sync(home: Path, config: Path, selected: str, as_json: bool, context_override: int | None = None) -> None:
@@ -469,10 +436,7 @@ def sync(home: Path, config: Path, selected: str, as_json: bool, context_overrid
     p["base_url"] = base
 
     token = get_working_token(home)
-    if token.startswith("AIza"):
-        p["api_key_env"] = "GEMINI_API_KEY"
-    else:
-        p["api_key_env"] = "GEMINI_AUTH_TOKEN"
+    p["api_key_env"] = "GEMINI_AUTH_TOKEN"
     if "api_key" in p:
         del p["api_key"]
 
@@ -582,7 +546,7 @@ def main():
     elif action == "token":
         tok = get_working_token(home)
         if not tok or tok == "ollama":
-            print("Error: No Gemini token or API key found. Set GEMINI_API_KEY or sign in with 'agy'.", file=sys.stderr)
+            print("Error: No Gemini OAuth token found. Set GEMINI_AUTH_TOKEN or sign in with 'agy'.", file=sys.stderr)
             sys.exit(1)
         if as_json:
             print(json.dumps({"token": tok}))
@@ -591,12 +555,9 @@ def main():
     elif action == "export":
         tok = get_working_token(home)
         if not tok or tok == "ollama":
-            print("Error: No Gemini token or API key found. Set GEMINI_API_KEY or sign in with 'agy'.", file=sys.stderr)
+            print("Error: No Gemini OAuth token found. Set GEMINI_AUTH_TOKEN or sign in with 'agy'.", file=sys.stderr)
             sys.exit(1)
-        if tok.startswith("AIzaSy"):
-            print(f"export GEMINI_API_KEY={tok}")
-        else:
-            print(f"export GEMINI_AUTH_TOKEN={tok}")
+        print(f"export GEMINI_AUTH_TOKEN={tok}")
     elif action == "sync":
         sync(home, config, argument, as_json, context_override=context_override)
     elif action == "default-model":

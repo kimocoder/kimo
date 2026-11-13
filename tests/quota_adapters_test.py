@@ -751,7 +751,7 @@ class AdapterTests(unittest.TestCase):
         self.assertEqual(self.dashboard.provider("openrouter")["remaining_usd"], 0)
 
     def test_gemini_paginates_without_inventing_account_rate_limits(self):
-        os.environ["KIMO_QUOTA_GEMINI_KEY"] = "fixture-gemini"
+        os.environ["KIMO_QUOTA_GEMINI_TOKEN"] = "fixture-gemini"
         self.http_mock.side_effect = [
             {"models": [{"name": "models/gemini-pro", "inputTokenLimit": 1000000}], "nextPageToken": "a b"},
             {"models": [{"name": "models/gemini-flash", "outputTokenLimit": 1000}]}]
@@ -761,6 +761,7 @@ class AdapterTests(unittest.TestCase):
         self.assertEqual(data["quota_status"], "unavailable")
         self.assertIn("a%20b", self.http_mock.call_args.args[0])
         self.assertNotIn("fixture-gemini", self.http_mock.call_args.args[0])
+        self.assertEqual(self.http_mock.call_args.args[2], {"Authorization": "Bearer fixture-gemini"})
 
     def test_gemini_oauth_token_from_file_falls_back_when_scope_insufficient(self):
         self.file(".gemini/antigravity-cli/antigravity-oauth-token", {
@@ -789,8 +790,17 @@ class AdapterTests(unittest.TestCase):
         self.assertFalse(data["key_present"])
         self.http_mock.assert_not_called()
 
+    def test_gemini_api_keys_are_not_authentication(self):
+        os.environ["GEMINI_API_KEY"] = "AIzaSyLegacyKey"
+        os.environ["GOOGLE_API_KEY"] = "AIzaSyLegacyGoogleKey"
+        os.environ["GOOGLE_GENERATIVE_AI_API_KEY"] = "AIzaSyLegacyGenerativeKey"
+        data = self.dashboard.provider("gemini")
+        self.assertEqual(data["status"], "unconfigured")
+        self.assertFalse(data["key_present"])
+        self.http_mock.assert_not_called()
+
     def test_cumulative_timeout_stops_pagination(self):
-        os.environ["KIMO_QUOTA_GEMINI_KEY"] = "fixture-gemini"
+        os.environ["KIMO_QUOTA_GEMINI_TOKEN"] = "fixture-gemini"
         self.args.timeout = .01
         def slow_page(*args):
             time.sleep(.02)

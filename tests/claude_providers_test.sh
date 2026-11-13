@@ -20,7 +20,7 @@ XAI_KEY="xai-fixture-key"
 OPENAI_KEY="sk-fixture-openai-key"
 ANT_KEY="sk-ant-fixture-key"
 QW_KEY="sk-qwen-fixture-key"
-GM_KEY="AIzaSyFixtureGeminiKey0123456789"
+GM_TOKEN="ya29.fixture-gemini-token"
 CODEX_TOKEN="codex-oauth-fixture"
 
 echo "[*] [1] Dry-run routing"
@@ -74,7 +74,7 @@ check_contains "the rejection names codex claude kimi" "supports codex claude ki
 dry_kimi=$(XAI_API_KEY="${XAI_KEY}" "${KIMO}" launch kimi --provider xai --dry-run)
 check_contains "kimi xai dry-run argv" "kimi -m xai/grok-4.7" "${dry_kimi}"
 
-dry_kimi_gm=$(GEMINI_API_KEY="${GM_KEY}" "${KIMO}" launch kimi --provider gemini --dry-run)
+dry_kimi_gm=$(GEMINI_AUTH_TOKEN="${GM_TOKEN}" "${KIMO}" launch kimi --provider gemini --dry-run)
 check_contains "kimi gemini dry-run argv" "kimi -m gemini/gemini-2.5-flash" "${dry_kimi_gm}"
 
 dry=$(QWENCLOUD_API_KEY="${QW_KEY}" "${KIMO}" launch claude --provider qwencloud --dry-run)
@@ -98,7 +98,7 @@ dry=$(ANTHROPIC_API_KEY="${ANT_KEY}" "${KIMO}" launch claude --provider claude -
 check_contains "provider claude aliases anthropic" "provider: anthropic" "${dry}"
 check_contains "anthropic/ prefix is stripped" "model  : claude-sonnet-5-5" "${dry}"
 
-dry=$(GEMINI_API_KEY="${GM_KEY}" "${KIMO}" launch claude --provider gemini --dry-run)
+dry=$(GEMINI_AUTH_TOKEN="${GM_TOKEN}" "${KIMO}" launch claude --provider gemini --dry-run)
 check_contains "gemini chat wire" "anthropic -> chat (https://generativelanguage.googleapis.com/v1beta/openai)" "${dry}"
 check_contains "gemini default model" "model  : gemini-2.5-flash" "${dry}"
 check_not_contains "gemini does not hit the Codex Responses guard" "does not support the OpenAI Responses API" "${dry}"
@@ -119,7 +119,7 @@ check_contains "kalidroid/ prefix is stripped for claude" "model  : kimi-k3" "${
 
 rc=0
 # A live codex launch still refuses the official Gemini host. Claude must not.
-err_gm=$(GEMINI_API_KEY="${GM_KEY}" "${KIMO}" launch codex --provider gemini 2>&1) || rc=$?
+err_gm=$(GEMINI_AUTH_TOKEN="${GM_TOKEN}" "${KIMO}" launch codex --provider gemini 2>&1) || rc=$?
 check "codex gemini guard is unchanged" 1 "${rc}"
 check_contains "the codex guard still names Responses" "does not support the OpenAI Responses API" "${err_gm}"
 

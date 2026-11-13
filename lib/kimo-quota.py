@@ -746,7 +746,7 @@ def refresh_gemini_token(tpath: Path, doc: dict, remaining, force=False):
     tok_obj = doc.get("token") if isinstance(doc.get("token"), dict) else doc
     refresh_token = tok_obj.get("refresh_token")
     if not isinstance(refresh_token, str) or not refresh_token:
-        raise QuotaError("auth_required", f"No refresh_token in {tpath}; sign in with 'agy' or provide GEMINI_API_KEY.")
+        raise QuotaError("auth_required", f"No refresh_token in {tpath}; sign in with 'agy' or set GEMINI_AUTH_TOKEN.")
     exp = parse_expiry(tok_obj.get("expiry"))
     now = time.time()
     if not force and exp is not None and exp > now + 60:
@@ -882,24 +882,15 @@ class Dashboard:
         return result
 
     def gemini(self):
-        key = os.environ.get("KIMO_QUOTA_GEMINI_KEY", "")
-        auth_kind = "api_key"
+        key = os.environ.get("KIMO_QUOTA_GEMINI_TOKEN", "")
+        auth_kind = "oauth_env"
         refreshed = False
         allow_refresh = not getattr(self.args, "no_refresh", False)
 
         if not key:
-            key = (
-                os.environ.get("GEMINI_AUTH_TOKEN")
-                or os.environ.get("GOOGLE_OAUTH_TOKEN")
-                or os.environ.get("GEMINI_API_KEY")
-                or os.environ.get("GOOGLE_API_KEY")
-                or os.environ.get("GOOGLE_GENERATIVE_AI_API_KEY")
-                or ""
-            )
+            key = os.environ.get("GEMINI_AUTH_TOKEN") or os.environ.get("GOOGLE_OAUTH_TOKEN") or ""
             if key == "ollama":
                 key = ""
-            if key:
-                auth_kind = "oauth_env" if (key.startswith("ya29.") or not key.startswith("AIza")) else "api_key_env"
 
         if not key:
             tpath = gemini_auth_file(self.home)
@@ -930,8 +921,7 @@ class Dashboard:
             result["auth"] = {"kind": auth_kind, "refreshed": True}
 
         self.online()
-        is_oauth = key.startswith("ya29.") or (auth_kind in ("oauth", "oauth_env") and not key.startswith("AIza"))
-        headers = {"Authorization": f"Bearer {key}"} if is_oauth else {"x-goog-api-key": key}
+        headers = {"Authorization": f"Bearer {key}"}
 
         page = ""
         for _ in range(20):
@@ -941,7 +931,7 @@ class Dashboard:
             try:
                 payload = fetch_json(url, self.remaining_time(), headers)
             except QuotaError as error:
-                if is_oauth and error.status in ("auth_required", "unavailable", "offline"):
+                if error.status in ("auth_required", "unavailable", "offline"):
                     for m_name, m_disp, m_inp, m_out, m_think in GEMINI_MODELS:
                         if self.matches(m_name):
                             result["models"].append({

@@ -116,6 +116,9 @@ dry=$(KIMO_QWENCLOUD_BASE_URL=https://example.invalid/v1 DASHSCOPE_API_KEY="${SP
 check_contains "explicit base URL wins over the plan host" "host   : https://example.invalid/v1" "${dry}"
 dry=$(QWENCLOUD_API_KEY="${QW_KEY}" "${KIMO}" launch codex --provider qwencloud --model qwencloud/qwen3-coder-plus --dry-run)
 check_contains "qwencloud/ prefix is stripped" "model  : qwen3-coder-plus" "${dry}"
+dry=$(DASHSCOPE_API_KEY="${QW_KEY}" "${KIMO}" launch codex --provider qwen --model qwen4-max-preview --dry-run)
+expect_responses "qwen alias" qwencloud "${QW_HOST}" qwen4-max-preview DASHSCOPE_API_KEY 1000000 "${dry}"
+check_not_contains "qwen alias never prints the credential" "${QW_KEY}" "${dry}"
 
 echo "[*] [3] xAI Grok"
 dry=$(XAI_API_KEY="${XAI_KEY}" "${KIMO}" launch codex --provider xai --dry-run)
@@ -149,10 +152,10 @@ dry=$(ANTHROPIC_API_KEY="${ANT_KEY}" "${KIMO}" launch codex --provider claude --
 check_contains "claude is an alias of anthropic" "provider: anthropic" "${dry}"
 
 echo "[*] [4.5] Gemini on Codex"
-dry=$(GEMINI_API_KEY="${GM_KEY}" "${KIMO}" launch codex --provider gemini --dry-run)
-expect_responses "gemini" gemini "${GM_HOST}" gemini-2.5-flash GEMINI_API_KEY 1000000 "${dry}"
-check_contains "gemini key is masked" "secret : GEMINI_API_KEY <kept: real value, Gemini key>" "${dry}"
-check_not_contains "dry-run never prints the gemini key" "${GM_KEY}" "${dry}"
+dry=$(GEMINI_AUTH_TOKEN="${GM_TOK}" "${KIMO}" launch codex --provider gemini --dry-run)
+expect_responses "gemini" gemini "${GM_HOST}" gemini-2.5-flash GEMINI_AUTH_TOKEN 1000000 "${dry}"
+check_contains "gemini bearer token is masked" "secret : GEMINI_AUTH_TOKEN <kept: real value, Gemini key>" "${dry}"
+check_not_contains "dry-run never prints the gemini token" "${GM_TOK}" "${dry}"
 dry=$(GEMINI_AUTH_TOKEN="${GM_TOK}" "${KIMO}" launch codex --provider gemini --model gemini/gemini-2.5-pro --dry-run)
 check_contains "AUTH_TOKEN is accepted for gemini" 'env_key=\"GEMINI_AUTH_TOKEN\"' "${dry}"
 check_contains "gemini/ prefix is stripped" "model  : gemini-2.5-pro" "${dry}"
@@ -163,7 +166,7 @@ check_contains "gemini kimi argv" "kimi -m gemini/gemini-2.5-flash" "${dry_kimi_
 check_contains "gemini kimi masks oauth secret" "GEMINI_AUTH_TOKEN <kept: real value, Gemini key>" "${dry_kimi_gm}"
 check_not_contains "dry-run never prints gemini oauth token" "${GM_TOK}" "${dry_kimi_gm}"
 rc=0
-err_gm_guard=$(GEMINI_API_KEY="${GM_KEY}" "${KIMO}" launch codex --provider gemini 2>&1) || rc=$?
+err_gm_guard=$(GEMINI_AUTH_TOKEN="${GM_TOK}" "${KIMO}" launch codex --provider gemini 2>&1) || rc=$?
 check "gemini without custom base fails official endpoint guard" 1 "${rc}"
 check_contains "guard mentions lack of responses API" "does not support the OpenAI Responses API" "${err_gm_guard}"
 
@@ -341,6 +344,7 @@ check_contains "proxy /models includes default model" "qwen3.8-max" "${models_re
 check_contains "proxy /models includes explicit extra model" "custom-test-model" "${models_resp}"
 check_contains "proxy /v1/models with query serves catalog" "qwen3.8-max" "${v1_models_resp}"
 check_contains "proxy /v1/models serves the dashscope deepseek model" "deepseek-v4.1-flash-1017" "${v1_models_resp}"
+check_contains "proxy /v1/models serves the dashscope deepseek pro model" "deepseek-4.1-pro" "${v1_models_resp}"
 
 echo "[*] [10] Shell completions populate available models for CLI"
 COMP_SCRIPT="${HARNESS_ROOT}/comp_test.bash"
@@ -350,12 +354,37 @@ check_contains "completion offers dashscope models with prefix" "dashscope/qwen3
 check_contains "completion offers dashscope models bare" "qwen3.8-max" "${comp_ds}"
 check_contains "completion offers dashscope deepseek models with prefix" "dashscope/deepseek-v4.1-flash-1017" "${comp_ds}"
 check_contains "completion offers dashscope deepseek models bare" "deepseek-v4.1-flash-1017" "${comp_ds}"
+check_contains "completion offers dashscope deepseek pro with prefix" "dashscope/deepseek-4.1-pro" "${comp_ds}"
+check_contains "completion offers dashscope deepseek pro bare" "deepseek-4.1-pro" "${comp_ds}"
+
+comp_kimi=$(bash -c "source '${COMP_SCRIPT}'; COMP_WORDS=(kimo launch kimi --provider dashscope -m ''); COMP_CWORD=6; _kimo; printf '%s\n' \"\${COMPREPLY[@]}\"")
+check_contains "kimi completion offers the dashscope deepseek pro model" "dashscope/deepseek-4.1-pro" "${comp_kimi}"
+check_contains "kimi completion offers the dashscope deepseek flash model" "dashscope/deepseek-v4.1-flash-1017" "${comp_kimi}"
 
 comp_ali=$(bash -c "source '${COMP_SCRIPT}'; COMP_WORDS=(kimo launch codex --provider alibaba -m ''); COMP_CWORD=6; _kimo; printf '%s\n' \"\${COMPREPLY[@]}\"")
 check_contains "completion treats alibaba as a dashscope alias" "dashscope/deepseek-v4.1-flash-1017" "${comp_ali}"
+check_contains "completion treats alibaba as a dashscope alias for deepseek pro" "dashscope/deepseek-4.1-pro" "${comp_ali}"
+
+catalog_pro=$(python3 - "${ROOT_DIR}/lib/kimo-anthropic-proxy.py" <<'PY'
+import importlib.util
+import sys
+
+spec = importlib.util.spec_from_file_location("anthropic_proxy", sys.argv[1])
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+slugs = {row["slug"] for row in mod.build_catalog("dashscope")}
+for want in ("deepseek-4.1-pro", "deepseek-v4.1-flash-1017"):
+    assert want in slugs, (want, sorted(slugs))
+print("catalog-ok")
+PY
+)
+check "the Claude proxy catalogue carries both DeepSeek models" "catalog-ok" "${catalog_pro}"
 
 comp_qw=$(bash -c "source '${COMP_SCRIPT}'; COMP_WORDS=(kimo launch codex --provider qwencloud -m ''); COMP_CWORD=6; _kimo; printf '%s\n' \"\${COMPREPLY[@]}\"")
 check_contains "completion offers qwencloud models" "qwencloud/qwen3.8-max" "${comp_qw}"
+check_contains "completion offers qwen4-max-preview" "qwencloud/qwen4-max-preview" "${comp_qw}"
+comp_qwen_provider=$(bash -c "source '${COMP_SCRIPT}'; COMP_WORDS=(kimo launch kimi --provider q); COMP_CWORD=4; _kimo; printf '%s\n' \"\${COMPREPLY[@]}\"")
+check_contains "provider completion offers qwen alias" "qwen" "${comp_qwen_provider}"
 
 comp_xai=$(bash -c "source '${COMP_SCRIPT}'; COMP_WORDS=(kimo launch codex --provider xai -m ''); COMP_CWORD=6; _kimo; printf '%s\n' \"\${COMPREPLY[@]}\"")
 check_contains "completion offers xai models" "xai/grok-4.7" "${comp_xai}"
@@ -427,14 +456,20 @@ check "launch codex --provider qwencloud rejects non-sk key" 1 "${rc}"
 check_contains "error message requires sk- prefix" "expected QwenCloud API key format" "${err_qw_fmt}"
 
 rc=0
-err_gm_sp=$(GEMINI_API_KEY="${SP_KEY}" "${KIMO}" launch codex --provider gemini --dry-run 2>&1) || rc=$?
+err_gm_sp=$(GEMINI_AUTH_TOKEN="${SP_KEY}" "${KIMO}" launch codex --provider gemini --dry-run 2>&1) || rc=$?
 check "launch codex --provider gemini rejects sk-sp key" 1 "${rc}"
 check_contains "error message identifies DashScope token-plan key" "Alibaba DashScope token-plan key" "${err_gm_sp}"
 
 rc=0
-err_gm_fmt=$(GEMINI_API_KEY="bad-gm-key" "${KIMO}" launch codex --provider gemini --dry-run 2>&1) || rc=$?
-check "launch codex --provider gemini rejects invalid format" 1 "${rc}"
-check_contains "error message requires AIzaSy or ya29 prefix" "expected Gemini credential format" "${err_gm_fmt}"
+err_gm_fmt=$(GEMINI_AUTH_TOKEN="bad-gm-token" "${KIMO}" launch codex --provider gemini --dry-run 2>&1) || rc=$?
+check "launch codex --provider gemini rejects invalid token format" 1 "${rc}"
+check_contains "error message requires an OAuth token prefix" "expected Gemini OAuth token format" "${err_gm_fmt}"
+
+rc=0
+err_gm_key=$(env -u GEMINI_AUTH_TOKEN -u GOOGLE_OAUTH_TOKEN GEMINI_API_KEY="${GM_KEY}" \
+    "${KIMO}" launch codex --provider gemini --dry-run 2>&1) || rc=$?
+check "launch codex --provider gemini rejects API-key-only auth" 1 "${rc}"
+check_contains "API-key rejection names GEMINI_AUTH_TOKEN" "GEMINI_AUTH_TOKEN" "${err_gm_key}"
 
 rc=0
 err_kd_missing=$("${KIMO}" launch codex --provider kalidroid --dry-run 2>&1) || rc=$?

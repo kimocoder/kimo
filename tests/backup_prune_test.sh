@@ -38,7 +38,7 @@ for kind in gemini freetier; do
     cfg="${WORK}/${kind}-kimi.toml"
     seed "${cfg}" "${kind}"
     if [[ "${kind}" == gemini ]]; then
-        args=(gemini --config "${cfg}" --from-json "${GEMINI_FIXTURE}" --api-key "AIzaSyTestMockKey123")
+        args=(gemini --config "${cfg}" --from-json "${GEMINI_FIXTURE}")
     else
         args=(freetier --config "${cfg}" --from-json "${FREETIER_FIXTURE}" --api-key "sk-test-key")
     fi
@@ -47,7 +47,7 @@ for kind in gemini freetier; do
     check "${kind} --dry-run neither backs up nor prunes" "7" "$(count "${cfg}" "${kind}")"
 
     rc=0
-    out=$("${KIMO}" "${args[@]}" 2>&1) || rc=$?
+    out=$(GEMINI_AUTH_TOKEN="ya29.fixture-backup-token" "${KIMO}" "${args[@]}" 2>&1) || rc=$?
     check "${kind} write succeeds" "0" "${rc}"
     [[ "${rc}" -eq 0 ]] || echo "    ${out//$'\n'/$'\n'    }"
     check "${kind} keeps exactly 5 backups" "5" "$(count "${cfg}" "${kind}")"

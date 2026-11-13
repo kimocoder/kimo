@@ -109,6 +109,7 @@ install:
 	@install -m 644 lib/kimo-stream.py $(DESTDIR)$(SHAREDIR)/kimo-stream.py
 	@install -m 755 lib/kimo-responses-proxy.py $(DESTDIR)$(SHAREDIR)/kimo-responses-proxy.py
 	@install -m 755 lib/kimo-anthropic-proxy.py $(DESTDIR)$(SHAREDIR)/kimo-anthropic-proxy.py
+	@install -m 755 lib/kimo-chat-proxy.py $(DESTDIR)$(SHAREDIR)/kimo-chat-proxy.py
 
 uninstall: uninstall-completion
 	@echo "[*] Removing $(SCRIPT) from $(DESTDIR)$(BINDIR)..."
@@ -123,6 +124,7 @@ uninstall: uninstall-completion
 	@rm -f $(DESTDIR)$(SHAREDIR)/kimo-stream.py
 	@rm -f $(DESTDIR)$(SHAREDIR)/kimo-responses-proxy.py
 	@rm -f $(DESTDIR)$(SHAREDIR)/kimo-anthropic-proxy.py
+	@rm -f $(DESTDIR)$(SHAREDIR)/kimo-chat-proxy.py
 	@rmdir $(DESTDIR)$(SHAREDIR) 2>/dev/null || true
 	@echo "[✓] $(SCRIPT) and assets removed from $(DESTDIR)$(PREFIX)"
 

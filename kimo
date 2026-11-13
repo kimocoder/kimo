@@ -158,8 +158,8 @@ _kimo_config_check() {
             ;;
         cloud_provider)
             case "${val}" in
-                ""|none|ollama|ollama-cloud|abliteration|codex|openai|dashscope|alibaba|modelscope|qwencloud|xai|grok|anthropic|claude|gemini|google|kalidroid|Kalidroid|vllm) ;;
-                *) echo "expected one of: ollama, ollama-cloud, abliteration, codex, openai, dashscope, alibaba, modelscope, qwencloud, xai (grok), anthropic, claude, gemini (google), kalidroid, vllm (got '${val}')"; return 1 ;;
+                ""|none|ollama|ollama-cloud|abliteration|codex|openai|dashscope|alibaba|modelscope|qwencloud|qwen|xai|grok|anthropic|claude|gemini|google|kalidroid|Kalidroid|vllm) ;;
+                *) echo "expected one of: ollama, ollama-cloud, abliteration, codex, openai, dashscope, alibaba, modelscope, qwencloud, qwen, xai (grok), anthropic, claude, gemini (google), kalidroid, vllm (got '${val}')"; return 1 ;;
             esac
             ;;
         web_max_results)
@@ -502,10 +502,7 @@ elif provider == "gemini":
             models_url = clean_base + "/v1beta/models"
         else:
             models_url = clean_base + "/models"
-        if key.startswith("AIzaSy"):
-            headers = {"x-goog-api-key": key}
-        else:
-            headers = {"Authorization": f"Bearer {key}"}
+        headers = {"Authorization": f"Bearer {key}"}
     else:
         models_url = base_url + "/models"
         headers = {"Authorization": f"Bearer {key}"}
@@ -602,6 +599,38 @@ _kimo_anthropic_proxy_start() {
     [[ -n "${model}" ]] && proxy_cmd+=(--model "${model}")
     [[ -n "${env_key}" ]] && proxy_cmd+=(--env-key "${env_key}")
     KIMO_ANTHROPIC_PROXY_CLIENT="${client_token}" "${proxy_cmd[@]}" >/dev/null 2>&1 &
+    waited=0
+    while (( waited < 50 )); do
+        if [[ -s "${port_file}" ]]; then
+            port=$(tr -cd '0-9' <"${port_file}")
+            rm -f "${port_file}"
+            if [[ -n "${port}" ]]; then
+                printf '%s\n' "${port}"
+                return 0
+            fi
+            return 1
+        fi
+        sleep 0.1
+        waited=$((waited + 1))
+    done
+    rm -f "${port_file}"
+    return 1
+}
+
+# Start the loopback OpenAI chat relay and print its port. It moves reasoning
+# that a host sends inline in `content` (a Qwen3-style template opens the think
+# block in the prompt) onto `reasoning_content`, which is what Kimi decodes.
+# The proxy exits when this process's pid disappears, which remains true after
+# exec replaces the shell with Kimi.
+_kimo_chat_proxy_start() {
+    local upstream="$1" helper port_file port waited
+    if ! helper=$(_find_lib_helper kimo-chat-proxy.py "${KIMO_CHAT_PROXY:-}"); then
+        echo "${C_RED}Error: kimo-chat-proxy.py was not found next to kimo.${C_RESET}" >&2
+        return 1
+    fi
+    port_file=$(mktemp "${TMPDIR:-/tmp}/kimo-chat-port.XXXXXX")
+    python3 "${helper}" --upstream "${upstream}" --port-file "${port_file}" \
+        --exit-with-pid "$$" >/dev/null 2>&1 &
     waited=0
     while (( waited < 50 )); do
         if [[ -s "${port_file}" ]]; then
@@ -901,7 +930,7 @@ PY
 
 # Backend names 'launch --provider' accepts, in the order they are offered by
 # completion and listed in errors. 'none' and '' are synonyms for ollama.
-KIMO_LAUNCH_PROVIDERS="ollama ollama-cloud abliteration codex openai dashscope alibaba modelscope qwencloud xai anthropic claude gemini kalidroid vllm"
+KIMO_LAUNCH_PROVIDERS="ollama ollama-cloud abliteration codex openai dashscope alibaba modelscope qwencloud qwen xai anthropic claude gemini kalidroid vllm"
 
 # True when <name> is a hosted inference API rather than a self-hosted Ollama
 # daemon: no host probing, no /api/tags resolution, no VRAM eviction, no tune
@@ -911,7 +940,7 @@ KIMO_LAUNCH_PROVIDERS="ollama ollama-cloud abliteration codex openai dashscope a
 # so unrelated credentials are still scrubbed. Its own key stays in VLLM_API_KEY.
 hosted_provider() {
     case "${1:-}" in
-        abliteration|codex|openai|dashscope|alibaba|modelscope|qwencloud|xai|anthropic|claude|gemini|kalidroid|ollama-cloud) return 0 ;;
+        abliteration|codex|openai|dashscope|alibaba|modelscope|qwencloud|qwen|xai|anthropic|claude|gemini|kalidroid|ollama-cloud) return 0 ;;
         *) return 1 ;;
     esac
 }
@@ -1089,6 +1118,9 @@ ${C_YELLOW}Examples:${C_RESET}
   ${0##*/} gemini --verify --verify-prune             # Add every usable Gemini model to Kimi (kimi -m gemini/<id>)
   ${0##*/} codex                                      # Inspect Codex OAuth session, expiration & accounts
   ${0##*/} codex --sync                               # Sync [providers.codex] and models into Kimi config
+  ${0##*/} grok                                       # Inspect xAI Grok login token (auth.json), expiry & account
+  ${0##*/} grok --export                              # eval-able XAI_AUTH_TOKEN (renewed from refresh_token if stale)
+  ${0##*/} grok --sync                                # Sync [providers.xai] and Grok models into Kimi config
 
   ${C_DIM}# Cluster & Multi-Host Management:${C_RESET}
   ${0##*/} check                                      # Health & latency probe for all endpoints
@@ -1352,7 +1384,7 @@ command_needs_remote() {
             done
             [[ "${cli}" == kimi ]] && return 1
             case "${backend}" in
-                codex|openai|abliteration|dashscope|alibaba|modelscope|qwencloud|xai|grok|anthropic|claude|gemini|kalidroid|Kalidroid|vllm) return 1 ;;
+                codex|openai|abliteration|dashscope|alibaba|modelscope|qwencloud|qwen|xai|grok|anthropic|claude|gemini|kalidroid|Kalidroid|vllm) return 1 ;;
                 "")
                     [[ "${model}" == codex/* || "${model}" == codex ]] && return 1
                     [[ "${model}" == vllm/* ]] && return 1
@@ -1365,7 +1397,7 @@ command_needs_remote() {
                     ;;
             esac
             return 0 ;;
-        version|help|-h|--help|completion|config|cfg|quota|quotas|quote|web|claude|claude-sync|kimi-claude|gemini|gemini-sync|kimi-gemini|codex|codex-sync|kimi-codex|kimi-provider|kimi-providers|provider|providers|freetier|free-tier|kimi-sync|install|setup|update|upgrade|rotate-token|rotate|logs|log|scan|discover|init) return 1 ;;
+        version|help|-h|--help|completion|config|cfg|quota|quotas|quote|web|claude|claude-sync|kimi-claude|gemini|gemini-sync|kimi-gemini|codex|codex-sync|kimi-codex|grok|grok-sync|xai|xai-sync|kimi-grok|kimi-xai|kimi-provider|kimi-providers|provider|providers|freetier|free-tier|kimi-sync|install|setup|update|upgrade|rotate-token|rotate|logs|log|scan|discover|init) return 1 ;;
         *) return 0 ;;
     esac
 }
@@ -2101,6 +2133,137 @@ PY
     printf '%s\n%s\n' "${alias}" "${ms_ctx}"
 )
 
+# Register QwenCloud's validated chat catalogue in Kimi. The provider stores
+# only the selected credential's environment name. Prints alias and context.
+# argv: want base_url ctx_override effort models_json key_env
+qwencloud_sync_kimi() (
+    local want="$1" qw_base="$2" ctx_override="$3" effort="$4" models_json="$5" key_env="$6"
+    local out="" alias="" specs="" qw_ctx="" rc=0
+    out=$(python3 - "${want}" "${ctx_override}" "${effort}" "${models_json}" <<'PY'
+import json
+import re
+import sys
+
+want, ctx_raw, effort, raw = sys.argv[1:]
+ctx_override = int(ctx_raw) if ctx_raw.isdigit() else 0
+try:
+    data = json.loads(raw)
+except ValueError:
+    sys.exit(1)
+ids = [m.get("id") for m in data.get("data", []) if isinstance(m.get("id"), str) and m["id"]]
+nonchat = re.compile(r"audio|asr|embed|rerank|moderation|whisper|tts|transcribe|image|imagine|video|wan\d", re.I)
+ids = sorted({mid for mid in ids if not nonchat.search(mid)})
+resolved = next((mid for mid in ids if mid.lower() == want.lower()), "")
+if not resolved:
+    sys.exit(1)
+specs = []
+for mid in ids:
+    thinking = bool(re.search(r"qwen|deepseek|glm", mid, re.I))
+    spec = {
+        "alias": "qwencloud/" + mid,
+        "model": mid,
+        "ctx": ctx_override if mid == resolved and ctx_override else 1000000,
+        "caps": "thinking,tool_use" if thinking else "tool_use",
+        "display_name": mid + " (qwencloud)",
+        "max_output_size": 65536,
+    }
+    if thinking:
+        spec["rkey"] = "reasoning_content"
+        spec["efforts"] = "low,medium,high,xhigh,max"
+        spec["deff"] = effort or "high"
+        spec["off"] = "low"
+    specs.append(spec)
+ctx = next(s["ctx"] for s in specs if s["model"] == resolved)
+print(json.dumps({"alias": "qwencloud/" + resolved, "specs": specs, "ctx": ctx}))
+PY
+    ) || return 1
+    alias=$(jq -r '.alias // empty' <<<"${out}") || alias=""
+    specs=$(jq -c '.specs // empty' <<<"${out}") || specs=""
+    qw_ctx=$(jq -r '.ctx // empty' <<<"${out}") || qw_ctx=""
+    [[ -n "${alias}" && -n "${specs}" && "${specs}" != "[]" ]] || return 1
+
+    ensure_private_dir "${KIMO_RUNTIME_DIR}" 2>/dev/null || true
+    mkdir -p "$(dirname "${KIMI_CONFIG_LOCK}")" "$(dirname "${KIMI_CONFIG}")" || return 1
+    if command -v flock >/dev/null 2>&1; then
+        exec 9>>"${KIMI_CONFIG_LOCK}" || return 1
+        flock -w 15 9 || { echo "Error: Kimi config is busy; retry the QwenCloud sync." >&2; return 1; }
+    fi
+    _kimi_write_models "${KIMI_CONFIG}" "qwencloud" "${qw_base}" "${specs}" "${alias}" "${key_env}" || rc=$?
+    if ((rc != 0)); then
+        _kimi_config_error "${rc}"
+        return 1
+    fi
+    printf '%s\n%s\n' "${alias}" "${qw_ctx}"
+)
+
+# Effort names a Kalidroid model accepts. Qwen3.8's chat template allows only
+# low/medium/xhigh and raises on high and max; every other served model keeps
+# the full graded range. Mirrors vllm_reasoning_efforts().
+kalidroid_model_efforts() {
+    local id="${1,,}"
+    if [[ "${id}" == *qwen3.8* || "${id}" == *qwen3-8* || "${id}" == *qwen-3.8* ]]; then
+        printf 'low,medium,xhigh'
+        return
+    fi
+    printf 'low,medium,high,xhigh,max'
+}
+
+# Map a requested effort onto the set <model> accepts. Qwen3.8 rejects "high"
+# and "max"; that legacy default becomes medium, max becomes its ceiling xhigh.
+kalidroid_fit_effort() {
+    local id="$1" effort="${2:-high}" allowed
+    allowed=$(kalidroid_model_efforts "${id}")
+    if [[ ",${allowed}," == *",${effort},"* ]]; then
+        printf '%s' "${effort}"
+        return
+    fi
+    if [[ "${allowed}" == "low,medium,xhigh" ]]; then
+        if [[ "${effort}" == "max" ]]; then
+            printf 'xhigh'
+        else
+            printf 'medium'
+        fi
+        return
+    fi
+    printf 'high'
+}
+
+# Fit Kimi's persisted [thinking].effort to <allowed> when it is outside that
+# set. The KIMI_MODEL_* env channel cannot declare support_efforts, and Kimi
+# gives the global level precedence over KIMI_MODEL_THINKING_EFFORT, so an
+# incompatible persisted level is the only thing that can still be corrected
+# on the no-catalogue fallback. Best-effort: a missing tomlkit, unreadable or
+# invalid config leaves the file untouched.
+kimi_fit_thinking_effort() {
+    local config="$1" allowed="$2" deff="$3"
+    [[ -f "${config}" ]] || return 0
+    python3 - "${config}" "${allowed}" "${deff}" <<'PY' 2>/dev/null || true
+import sys
+
+try:
+    import tomlkit
+except ImportError:
+    sys.exit(0)
+
+path, allowed_raw, deff = sys.argv[1:]
+allowed = [c for c in allowed_raw.split(",") if c]
+try:
+    with open(path, "r", encoding="utf-8") as fh:
+        doc = tomlkit.parse(fh.read())
+except Exception:
+    sys.exit(0)
+
+thinking = doc.get("thinking")
+if thinking is None or not hasattr(thinking, "get") or thinking.get("enabled") is False:
+    sys.exit(0)
+current = thinking.get("effort")
+if allowed and isinstance(current, str) and current not in allowed:
+    thinking["effort"] = deff or allowed[0]
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(tomlkit.dumps(doc))
+PY
+}
+
 # Register Kalidroid's validated live catalogue in Kimi. The provider stores
 # only the credential's environment-variable name, never the token itself.
 kalidroid_sync_kimi() (
@@ -2121,6 +2284,30 @@ if resolved not in ids:
     sys.exit(1)
 nonchat = re.compile(r"embed|rerank|moderation|whisper|tts|transcribe|dall-e|imagen|image|"
                      r"imagine|video|veo|sora|lyria|native-audio|realtime|aqa|babbage|davinci", re.I)
+
+def qwen38(mid):
+    # Qwen3.8's chat template accepts only low/medium/xhigh; high and max
+    # raise a 400 ("Unexpected reasoning effort ..."). Verified against the
+    # served template, and mirrors vllm_reasoning_efforts().
+    return re.search(r"qwen3\.8|qwen3-8|qwen-3\.8", mid, re.I) is not None
+
+def efforts_for(mid):
+    return "low,medium,xhigh" if qwen38(mid) else "low,medium,high,xhigh,max"
+
+def fit_effort(mid, want):
+    # Keep a requested level the model accepts; otherwise pick the closest
+    # one it does (high and unknown levels become medium, max becomes xhigh).
+    if not qwen38(mid):
+        return want or "high"
+    if want in ("low", "medium", "xhigh"):
+        return want
+    return "xhigh" if want == "max" else "medium"
+
+def off_effort_for(mid):
+    # "none" is a real off on the served OpenAI surface; low only asks for a
+    # shorter trace and keeps reasoning on.
+    return "none" if qwen38(mid) else "low"
+
 specs = []
 target_ctx = 0
 for item in data.get("data", []):
@@ -2139,9 +2326,9 @@ for item in data.get("data", []):
         "model": mid,
         "ctx": ctx,
         "caps": "thinking,tool_use",
-        "efforts": "low,medium,high,xhigh,max",
-        "deff": effort or "high",
-        "off": "low",
+        "efforts": efforts_for(mid),
+        "deff": fit_effort(mid, effort),
+        "off": off_effort_for(mid),
         "rkey": "reasoning_content",
         "display_name": item.get("display_name") or mid + " (kalidroid)",
         "max_output_size": 32768,
@@ -7262,15 +7449,7 @@ _resolve_gemini_auth() {
         return 0
     fi
 
-    # 3. If an OAuth token format was passed in GEMINI_API_KEY or GOOGLE_API_KEY
-    local env_k="${GEMINI_API_KEY:-${GOOGLE_API_KEY:-}}"
-    if [[ "${env_k}" == ya29.* || "${env_k}" == eyJ* || "${env_k}" == AQ.* || "${env_k}" == AQ* ]]; then
-        export GEMINI_AUTH_TOKEN="${env_k}"
-        export GOOGLE_OAUTH_TOKEN="${env_k}"
-        return 0
-    fi
-
-    # 4. If file_token is found, export as GEMINI_AUTH_TOKEN and GOOGLE_OAUTH_TOKEN
+    # 3. If file_token is found, export as GEMINI_AUTH_TOKEN and GOOGLE_OAUTH_TOKEN
     if [[ -n "${file_token}" ]]; then
         export GEMINI_AUTH_TOKEN="${file_token}"
         export GOOGLE_OAUTH_TOKEN="${file_token}"
@@ -7293,11 +7472,11 @@ _ensure_gemini_token() {
         _resolve_gemini_auth
         read -r state source refreshable < <(_gemini_helper token-state 2>/dev/null) || return 1
     fi
-    if [[ "${state}" == valid || "${state}" == apikey ]]; then
+    if [[ "${state}" == valid ]]; then
         return 0
     fi
-    echo "${C_RED}Error: no usable Gemini OAuth token or API key (${state}).${C_RESET}" >&2
-    echo "${C_DIM}    Sign in with 'agy', or export GEMINI_AUTH_TOKEN (or GEMINI_API_KEY).${C_RESET}" >&2
+    echo "${C_RED}Error: no usable Gemini OAuth token (${state}).${C_RESET}" >&2
+    echo "${C_DIM}    Sign in with 'agy', or export GEMINI_AUTH_TOKEN / GOOGLE_OAUTH_TOKEN.${C_RESET}" >&2
     return 1
 }
 
@@ -7312,6 +7491,12 @@ _resolve_grok_auth() {
 
     # 1. If XAI_AUTH_TOKEN is already explicitly set and non-empty, keep it.
     if [[ -n "${XAI_AUTH_TOKEN:-}" ]]; then
+        return 0
+    fi
+
+    # 1b. GROK_AUTH_TOKEN is accepted as an alias for XAI_AUTH_TOKEN.
+    if [[ -n "${GROK_AUTH_TOKEN:-}" ]]; then
+        export XAI_AUTH_TOKEN="${GROK_AUTH_TOKEN}"
         return 0
     fi
 
@@ -7566,6 +7751,20 @@ for spec in specs:
     _set(mdl, "off_effort", spec.get("off"))
     _set(mdl, "reasoning_key", spec.get("rkey"))
     _set(mdl, "display_name", spec.get("display_name"))
+
+# Kimi gives [thinking].effort precedence over a model's default_effort, and
+# prompt mode does not re-validate the persisted level against
+# support_efforts. A stale "high" therefore reaches a Qwen3.8 template that
+# rejects it (HTTP 400 "Unexpected reasoning effort high"). Fit the launched
+# model when the persisted level is outside the set it declares.
+thinking = doc.get("thinking")
+if default_alias and thinking is not None and hasattr(thinking, "get") \
+        and thinking.get("enabled") is not False:
+    target = next((s for s in specs if s.get("alias") == default_alias), None)
+    allowed = [c for c in (target.get("efforts") or "").split(",") if c] if target else []
+    current = thinking.get("effort")
+    if allowed and isinstance(current, str) and current not in allowed:
+        thinking["effort"] = target.get("deff") or allowed[0]
 
 # Configure loop_control defaults so kimi auto-compaction does not block
 # prematurely on a large 131k context window with default 50k reserve.
@@ -8015,11 +8214,13 @@ ${C_YELLOW}Codex Responses providers (--provider qwencloud | xai | anthropic | g
   upstream request.
 
   ${C_CYAN}qwencloud${C_RESET}  ${QWENCLOUD_BACKEND_URL}
-          Pay-as-you-go QwenCloud. \$QWENCLOUD_API_KEY, else \$DASHSCOPE_API_KEY,
-          else \$MODELSTUDIO_API_KEY. An sk-sp- key uses ${QWENCLOUD_PLAN_URL}
-          unless \$KIMO_QWENCLOUD_BASE_URL is set. \$KIMO_QWENCLOUD_REGION picks
-          the pay-as-you-go region (default ${QWENCLOUD_REGION}). Default model
-          ${QWENCLOUD_DEFAULT_MODEL}, context ${QWENCLOUD_DEFAULT_CTX}.
+          Pay-as-you-go QwenCloud ('--provider qwen' is the same backend).
+          \$QWENCLOUD_API_KEY, else \$DASHSCOPE_API_KEY, else \$MODELSTUDIO_API_KEY.
+          An sk-sp- key uses ${QWENCLOUD_PLAN_URL} unless \$KIMO_QWENCLOUD_BASE_URL
+          is set. \$KIMO_QWENCLOUD_REGION picks the pay-as-you-go region (default
+          ${QWENCLOUD_REGION}). Default model ${QWENCLOUD_DEFAULT_MODEL}, context
+          ${QWENCLOUD_DEFAULT_CTX}. A validated kimi launch registers every served
+          chat model as qwencloud/<id> and stores only the credential env name.
   ${C_CYAN}xai${C_RESET}       ${XAI_BACKEND_URL}
           xAI Grok (\$XAI_API_KEY). '--provider grok' is the same backend.
           Default model ${XAI_DEFAULT_MODEL}, context ${XAI_DEFAULT_CTX}.
@@ -8042,6 +8243,9 @@ ${C_YELLOW}Cloud Provider: Kalidroid (--provider kalidroid):${C_RESET}
   [providers.kalidroid] plus every served chat model as kalidroid/<id>, replacing
   old Ollama/vLLM aliases but preserving Ollama Cloud. If the catalogue cannot
   be fetched, kimi falls back to its zero-footprint KIMI_MODEL_* env channel.
+  The launched model runs through a loopback chat relay that moves reasoning
+  sent inline in content (Qwen3-style template-opened thinking) onto
+  reasoning_content; the catalogue aliases stay on the direct host.
   claude speaks /v1/messages, so a live launch starts the localhost proxy and
   posts Chat Completions upstream. Without -m the model is
   ${KALIDROID_DEFAULT_MODEL} (context ${KALIDROID_DEFAULT_CTX}; --ctx,
@@ -8073,12 +8277,16 @@ ${C_YELLOW}CLI Integration Mechanics:${C_RESET}
                 (--ctx, tune --ctx) becomes that model's context_window in config.toml, restored on exit.
   ${C_BOLD}kimi${C_RESET}         Kimi Code defaults to Kalidroid. A validated launch registers the live
                 /models catalogue as kalidroid/<id> aliases in ~/.kimi-code/config.toml
-                and launches with -m <alias>. Only KALIDROID_API_KEY's name is stored.
+                and launches the served model through a loopback chat relay, so
+                reasoning a host sends inline in content reaches Kimi as
+                reasoning_content. Only KALIDROID_API_KEY's name is stored.
                 Old Ollama/vLLM aliases are removed; Ollama Cloud is preserved.
                 --ctx sets the selected model's max_context_size. With --provider
                 codex/openai the window comes from the Codex catalog, clamped to its
                 ceiling. Other hosted providers keep their existing alias/env routes.
-                Thinking models declare support_efforts low..max so /effort works.
+                Thinking models declare support_efforts so /effort works. Qwen3.8
+                gets low/medium/xhigh (its template rejects high and max); a
+                persisted [thinking].effort outside that set is fitted first.
   ${C_BOLD}claude${C_RESET}       Directs Claude Code to the target host via ANTHROPIC_BASE_URL. A real
                 ANTHROPIC_API_KEY/AUTH_TOKEN is forwarded only to a plain local daemon;
                 remote/LAN/tunnel hosts get a placeholder ('ollama') so the secret never
@@ -8146,13 +8354,14 @@ ${C_YELLOW}Environment Overrides:${C_RESET}
   KIMO_DASHSCOPE_PLAN_BASE_URL  Override the token-plan surface origin
   KIMO_DASHSCOPE_CLAUDE_HAIKU / _SONNET / _OPUS  Claude tier mapping on Model Studio
   KIMO_DASHSCOPE_CLAUDE_MAX_CONTEXT  Claude context tokens on Model Studio
-  QWENCLOUD_API_KEY           QwenCloud sk- key; '--provider qwencloud' (DASHSCOPE_API_KEY too)
+  QWENCLOUD_API_KEY           QwenCloud sk- key; '--provider qwencloud' / 'qwen' (DASHSCOPE_API_KEY too)
   KIMO_QWENCLOUD_BASE_URL     Override the QwenCloud compatible-mode origin
   KIMO_QWENCLOUD_PLAN_BASE_URL  Override the QwenCloud token-plan origin
   KIMO_QWENCLOUD_REGION       QwenCloud pay-as-you-go region (default ap-southeast-1)
   KIMO_QWENCLOUD_MODEL        Default model for '--provider qwencloud' (default qwen3.8-max)
   KIMO_QWENCLOUD_CTX          Default context window for that provider, in tokens
   XAI_API_KEY                 xAI key; the credential for '--provider xai' (alias grok)
+  XAI_AUTH_TOKEN              xAI Grok login (OAuth) token; GROK_AUTH_TOKEN is an alias. Else read from ~/.grok/auth.json
   KIMO_XAI_BASE_URL           Override the xAI origin (default https://api.x.ai/v1)
   KIMO_XAI_MODEL              Default model for '--provider xai' (default grok-4.7)
   KIMO_XAI_CTX                Default context window for xAI, in tokens
@@ -8169,6 +8378,8 @@ ${C_YELLOW}Environment Overrides:${C_RESET}
   KIMO_KIMI_EFFORTS         Supported thinking efforts list (e.g. low,medium,high,max)
   KIMO_KIMI_CAPABILITIES    Override detected model capabilities (e.g. tool_use,thinking)
   KIMO_KIMI_REASONING_KEY   Wire parameter name for thinking budget (default: reasoning)
+  KIMO_CHAT_PROXY           Override the loopback chat relay helper path
+                            (default: lib/kimo-chat-proxy.py beside kimo)
   KIMO_LAUNCH_EVICT         Default for unloading other host models: ask | always | never (default: ask)
   QWEN_CODE_API_TIMEOUT_MS  Per-request timeout for 'launch qwen' (default: 600000 ms)
   KIMO_RUNTIME_DIR          Private per-user directory for claims and locks
@@ -8366,6 +8577,7 @@ cmd_launch() {
     [[ "${cloud_provider}" == "grok" ]] && cloud_provider="xai"
     [[ "${cloud_provider}" == "claude" ]] && cloud_provider="anthropic"
     [[ "${cloud_provider}" == "google" ]] && cloud_provider="gemini"
+    [[ "${cloud_provider}" == "qwen" ]] && cloud_provider="qwencloud"
     [[ "${cloud_provider}" == "model-scope" ]] && cloud_provider="modelscope"
     [[ "${cloud_provider,,}" == "kalidroid" ]] && cloud_provider="kalidroid"
     local provider_selected="${cloud_provider}"
@@ -8373,7 +8585,7 @@ cmd_launch() {
         ""|none|ollama) cloud_provider="" ;;
         abliteration|codex|openai|dashscope|alibaba|modelscope|qwencloud|xai|anthropic|gemini|kalidroid|vllm|ollama-cloud) ;;
         *)
-            echo "${C_RED}Error: unknown --provider '${cloud_provider}' (expected one of: ${KIMO_LAUNCH_PROVIDERS}; grok is an alias of xai, claude is an alias of anthropic, google is an alias of gemini).${C_RESET}" >&2
+            echo "${C_RED}Error: unknown --provider '${cloud_provider}' (expected one of: ${KIMO_LAUNCH_PROVIDERS}; grok is an alias of xai, claude is an alias of anthropic, google is an alias of gemini, qwen is an alias of qwencloud).${C_RESET}" >&2
             exit 1
             ;;
     esac
@@ -8395,6 +8607,7 @@ cmd_launch() {
             xai/*|grok/*) cloud_provider="xai" ;;
             gemini/*|google/*) cloud_provider="gemini" ;;
             modelscope/*) cloud_provider="modelscope" ;;
+            qwencloud/*|qwen/*) cloud_provider="qwencloud" ;;
             kalidroid/*) cloud_provider="kalidroid" ;;
         esac
     fi
@@ -8715,6 +8928,7 @@ cmd_launch() {
         fi
     elif [[ "${cloud_provider}" == "qwencloud" || "${cloud_provider}" == "xai" || "${cloud_provider}" == "anthropic" || "${cloud_provider}" == "gemini" || "${cloud_provider}" == "kalidroid" ]]; then
         local supported_clis="codex claude"
+        [[ "${cloud_provider}" == "qwencloud" ]] && supported_clis="codex claude kimi"
         [[ "${cloud_provider}" == "xai" ]] && supported_clis="${XAI_CLIS:-codex claude kimi}"
         [[ "${cloud_provider}" == "gemini" ]] && supported_clis="${GEMINI_CLIS:-codex claude kimi}"
         [[ "${cloud_provider}" == "kalidroid" ]] && supported_clis="${KALIDROID_CLIS}"
@@ -8831,36 +9045,21 @@ cmd_launch() {
                 provider_name="Gemini"
                 provider_model="${GEMINI_CODEX_MODEL}"
                 provider_ctx="${GEMINI_CODEX_CTX}"
-                provider_hint="Export GEMINI_AUTH_TOKEN, GEMINI_API_KEY, or sign in with 'agy'."
+                provider_hint="Export GEMINI_AUTH_TOKEN / GOOGLE_OAUTH_TOKEN, or sign in with 'agy'."
                 provider_base="${GEMINI_CODEX_BASE_URL}"
                 _ensure_gemini_token || return 1
-                if [[ -n "${GEMINI_AUTH_TOKEN:-}" ]]; then
-                    key_var="GEMINI_AUTH_TOKEN"
-                elif [[ -n "${GEMINI_API_KEY:-}" ]]; then
-                    key_var="GEMINI_API_KEY"
-                elif [[ -n "${GOOGLE_API_KEY:-}" ]]; then
-                    key_var="GOOGLE_API_KEY"
-                elif [[ -n "${GOOGLE_OAUTH_TOKEN:-}" ]]; then
-                    key_var="GOOGLE_OAUTH_TOKEN"
-                else
-                    _resolve_gemini_auth
-                    if ! key_var=$(_hosted_key_var GEMINI_AUTH_TOKEN GOOGLE_OAUTH_TOKEN GEMINI_API_KEY GOOGLE_API_KEY); then
-                        echo "${C_RED}Error: '--provider gemini' needs a Gemini API key or OAuth token, and none was found.${C_RESET}" >&2
-                        echo "${C_DIM}    ${provider_hint}${C_RESET}" >&2
-                        return 1
-                    fi
+                if ! key_var=$(_hosted_key_var GEMINI_AUTH_TOKEN GOOGLE_OAUTH_TOKEN); then
+                    echo "${C_RED}Error: '--provider gemini' needs a Gemini OAuth token, and none was found.${C_RESET}" >&2
+                    echo "${C_DIM}    ${provider_hint}${C_RESET}" >&2
+                    return 1
                 fi
                 local gm_val="${!key_var}"
                 if [[ "${gm_val}" == sk-sp-* ]]; then
-                    echo "${C_RED}Error: ${key_var} appears to be an Alibaba DashScope token-plan key ('sk-sp-...'), not a Gemini credential.${C_RESET}" >&2
+                    echo "${C_RED}Error: ${key_var} appears to be an Alibaba DashScope token-plan key ('sk-sp-...'), not a Gemini OAuth token.${C_RESET}" >&2
                     echo "${C_DIM}    To use DashScope, run: ${0##*/} launch codex --provider dashscope${C_RESET}" >&2
                     return 1
-                elif [[ "${gm_val}" == sk-* || "${gm_val}" == xai-* ]]; then
-                    echo "${C_RED}Error: ${key_var} does not match expected Gemini credential format.${C_RESET}" >&2
-                    echo "${C_DIM}    Gemini API keys start with 'AIzaSy' and OAuth tokens start with 'ya29.'.${C_RESET}" >&2
-                    return 1
-                elif [[ "${gm_val}" != AIzaSy* && "${gm_val}" != ya29* && "${gm_val}" != eyJ* && "${gm_val}" != AQ.* && "${gm_val}" != AQ* ]]; then
-                    echo "${C_RED}Error: ${key_var} does not match expected Gemini credential format (expected 'AIzaSy...', 'ya29...', or 'AQ...').${C_RESET}" >&2
+                elif [[ "${gm_val}" != ya29* && "${gm_val}" != eyJ* && "${gm_val}" != AQ.* && "${gm_val}" != AQ* ]]; then
+                    echo "${C_RED}Error: ${key_var} does not match expected Gemini OAuth token format (expected 'ya29...', 'eyJ...', or 'AQ...').${C_RESET}" >&2
                     echo "${C_DIM}    ${provider_hint}${C_RESET}" >&2
                     return 1
                 fi
@@ -8918,7 +9117,7 @@ cmd_launch() {
         else
             resolved_model="${target_model}"
             case "${cloud_provider}" in
-                qwencloud) resolved_model="${resolved_model#qwencloud/}" ;;
+                qwencloud) resolved_model="${resolved_model#qwencloud/}"; resolved_model="${resolved_model#qwen/}" ;;
                 xai) resolved_model="${resolved_model#xai/}"; resolved_model="${resolved_model#grok/}" ;;
                 anthropic) resolved_model="${resolved_model#anthropic/}"; resolved_model="${resolved_model#claude/}" ;;
                 gemini) resolved_model="${resolved_model#gemini/}"; resolved_model="${resolved_model#google/}" ;;
@@ -9550,6 +9749,8 @@ cmd_launch() {
             fi
         elif [[ "${cloud_provider}" == "xai" && "${cli_cmd}" == "kimi" ]]; then
             dry_argv=(kimi -m "xai/${resolved_model}")
+        elif [[ "${cloud_provider}" == "qwencloud" && "${cli_cmd}" == "kimi" ]]; then
+            dry_argv=(kimi -m "qwencloud/${resolved_model}")
         elif [[ "${cloud_provider}" == "gemini" && "${cli_cmd}" == "kimi" ]]; then
             dry_argv=(kimi -m "gemini/${resolved_model}")
         elif [[ "${cloud_provider}" == "kalidroid" && "${cli_cmd}" == "kimi" ]]; then
@@ -9600,9 +9801,9 @@ cmd_launch() {
         [[ "${cloud_provider}" == "qwencloud" ]] && secret_names+=(QWENCLOUD_API_KEY DASHSCOPE_API_KEY MODELSTUDIO_API_KEY)
         [[ "${cloud_provider}" == "ollama-cloud" ]] && secret_names+=(OLLAMA_API_KEY)
         [[ "${cloud_provider}" == "ollama-cloud" && "${cli_cmd}" == claude ]] && env_names+=(CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST)
-        [[ "${cloud_provider}" == "xai" ]] && secret_names+=(XAI_API_KEY XAI_AUTH_TOKEN)
+        [[ "${cloud_provider}" == "xai" ]] && secret_names+=(XAI_API_KEY XAI_AUTH_TOKEN GROK_AUTH_TOKEN)
         [[ "${cloud_provider}" == "anthropic" || "${cloud_provider}" == "claude" ]] && secret_names+=(CLAUDE_CODE_OAUTH_TOKEN)
-        [[ "${cloud_provider}" == "gemini" ]] && secret_names+=(GEMINI_AUTH_TOKEN GOOGLE_OAUTH_TOKEN GEMINI_API_KEY GOOGLE_API_KEY)
+        [[ "${cloud_provider}" == "gemini" ]] && secret_names+=(GEMINI_AUTH_TOKEN GOOGLE_OAUTH_TOKEN)
         [[ "${cloud_provider}" == "kalidroid" ]] && secret_names+=(KALIDROID_API_KEY)
         [[ "${cloud_provider}" == "vllm" ]] && secret_names+=(VLLM_API_KEY)
         if openai_backend "${cloud_provider}"; then
@@ -10051,7 +10252,7 @@ cmd_launch() {
                 if [[ "${cloud_provider}" == "gemini" ]]; then
                     # Google Gemini provider routes through config.toml: kimi needs a
                     # [providers.gemini] entry (google-genai type with api_key_env naming
-                    # GEMINI_AUTH_TOKEN or GEMINI_API_KEY) and an alias for the
+                    # GEMINI_AUTH_TOKEN) and an alias for the
                     # launched model (gemini/<model>). The credential itself stays in the
                     # environment, so nothing secret is written to disk.
                     local sync_result="" synced_model="" synced_ctx=""
@@ -10102,6 +10303,53 @@ cmd_launch() {
                     export KIMI_MODEL_REASONING_KEY="${KIMO_KIMI_REASONING_KEY:-reasoning_content}"
                     export KIMI_MODEL_THINKING_EFFORT="${KIMO_KIMI_EFFORT:-${OM_KIMI_EFFORT:-high}}"
                     echo "${C_DIM}[*] kimi on gemini '${resolved_model}' via ${provider_base} (context ${KIMI_MODEL_MAX_CONTEXT_SIZE})${C_RESET}" >&2
+                    exec "${cli_cmd}" "${cli_passthrough_args[@]}"
+                fi
+                if [[ "${cloud_provider}" == "qwencloud" ]]; then
+                    local qw_models_json="" qw_fetch_rc=0 qw_alias="" qw_ctx=""
+                    qw_models_json=$(abliteration_fetch_models "${!key_var}" "${provider_base}") || qw_fetch_rc=$?
+                    if ((qw_fetch_rc == 2)); then
+                        echo "${C_RED}Error: QwenCloud rejected the credential (HTTP 401/403 on ${provider_base}/models). Check ${key_var}.${C_RESET}" >&2
+                        return 1
+                    fi
+                    if ((qw_fetch_rc == 0)); then
+                        local qw_sync=""
+                        qw_sync=$(qwencloud_sync_kimi "${resolved_model}" "${provider_base}" "${opt_launch_ctx:-}" \
+                            "${KIMO_KIMI_EFFORT:-${OM_KIMI_EFFORT:-high}}" "${qw_models_json}" "${key_var}") || qw_sync=""
+                        if [[ -n "${qw_sync}" ]]; then
+                            { IFS= read -r qw_alias || true; IFS= read -r qw_ctx || true; } <<<"${qw_sync}"
+                        fi
+                        if [[ -n "${qw_alias}" ]]; then
+                            unset KIMI_MODEL_NAME KIMI_MODEL_API_KEY KIMI_MODEL_PROVIDER_TYPE \
+                                KIMI_MODEL_BASE_URL KIMI_MODEL_MAX_CONTEXT_SIZE KIMI_MODEL_CAPABILITIES \
+                                KIMI_MODEL_REASONING_KEY KIMI_MODEL_THINKING_EFFORT \
+                                KIMI_MODEL_MAX_OUTPUT_SIZE KIMI_MODEL_DISPLAY_NAME
+                            export KIMI_DISABLE_TELEMETRY="${KIMI_DISABLE_TELEMETRY:-1}"
+                            export KIMI_CODE_NO_AUTO_UPDATE="${KIMI_CODE_NO_AUTO_UPDATE:-1}"
+                            echo "${C_DIM}[*] kimi on QwenCloud '${resolved_model}' via [providers.qwencloud] (live catalogue, context ${qw_ctx:-${provider_ctx}})${C_RESET}" >&2
+                            exec "${cli_cmd}" -m "${qw_alias}" "${cli_passthrough_args[@]}"
+                        fi
+                        echo "${C_YELLOW}[!] Warning: could not register QwenCloud models in kimi's config; falling back to the KIMI_MODEL_* env channel.${C_RESET}" >&2
+                    else
+                        echo "${C_YELLOW}[!] Warning: could not fetch the QwenCloud catalogue from ${provider_base}/models; falling back to kimi's KIMI_MODEL_* env channel.${C_RESET}" >&2
+                    fi
+                    unset KIMI_MODEL_NAME KIMI_MODEL_API_KEY KIMI_MODEL_PROVIDER_TYPE \
+                        KIMI_MODEL_BASE_URL KIMI_MODEL_MAX_CONTEXT_SIZE KIMI_MODEL_CAPABILITIES \
+                        KIMI_MODEL_REASONING_KEY KIMI_MODEL_THINKING_EFFORT \
+                        KIMI_MODEL_MAX_OUTPUT_SIZE KIMI_MODEL_DISPLAY_NAME
+                    export KIMI_DISABLE_TELEMETRY="${KIMI_DISABLE_TELEMETRY:-1}"
+                    export KIMI_CODE_NO_AUTO_UPDATE="${KIMI_CODE_NO_AUTO_UPDATE:-1}"
+                    export KIMI_MODEL_NAME="${resolved_model}"
+                    export KIMI_MODEL_PROVIDER_TYPE="openai"
+                    export KIMI_MODEL_BASE_URL="${provider_base}"
+                    export KIMI_MODEL_API_KEY="${!key_var}"
+                    export KIMI_MODEL_MAX_CONTEXT_SIZE="${opt_launch_ctx:-${provider_ctx}}"
+                    export KIMI_MODEL_MAX_OUTPUT_SIZE="65536"
+                    export KIMI_MODEL_CAPABILITIES="${KIMO_KIMI_CAPABILITIES:-thinking,tool_use}"
+                    export KIMI_MODEL_REASONING_KEY="${KIMO_KIMI_REASONING_KEY:-reasoning_content}"
+                    export KIMI_MODEL_THINKING_EFFORT="${KIMO_KIMI_EFFORT:-${OM_KIMI_EFFORT:-high}}"
+                    export KIMI_MODEL_DISPLAY_NAME="${resolved_model} (qwencloud)"
+                    echo "${C_DIM}[*] kimi on QwenCloud '${resolved_model}' via ${provider_base} (context ${KIMI_MODEL_MAX_CONTEXT_SIZE})${C_RESET}" >&2
                     exec "${cli_cmd}" "${cli_passthrough_args[@]}"
                 fi
                 if [[ "${cloud_provider}" == "xai" ]]; then
@@ -10158,7 +10406,13 @@ cmd_launch() {
                     exec "${cli_cmd}" "${cli_passthrough_args[@]}"
                 fi
                 if [[ "${cloud_provider}" == "kalidroid" ]]; then
-                    local kd_effort="${KIMO_KIMI_EFFORT:-${OM_KIMI_EFFORT:-high}}"
+                    # Fit the launched model's level before the env fallback: an
+                    # out-of-range effort is rejected by the served template
+                    # ("Unexpected reasoning effort high"), not remapped. The
+                    # sync gets the requested value and fits each served model.
+                    local kd_effort_raw kd_effort
+                    kd_effort_raw="${KIMO_KIMI_EFFORT:-${OM_KIMI_EFFORT:-high}}"
+                    kd_effort=$(kalidroid_fit_effort "${resolved_model}" "${kd_effort_raw}")
                     export KALIDROID_API_KEY="${!key_var}"
                     local kd_models_json="" kd_fetch_rc=0
                     kd_models_json=$(abliteration_fetch_models "${KALIDROID_API_KEY}" "${provider_base}") || kd_fetch_rc=$?
@@ -10169,11 +10423,39 @@ cmd_launch() {
                     if ((kd_fetch_rc == 0)); then
                         local kd_sync="" kd_alias="" kd_ctx=""
                         kd_sync=$(kalidroid_sync_kimi "${resolved_model}" "${kd_models_json}" "${provider_base}" \
-                            "${opt_launch_ctx:-}" "${kd_effort}") || kd_sync=""
+                            "${opt_launch_ctx:-}" "${kd_effort_raw}") || kd_sync=""
                         if [[ -n "${kd_sync}" ]]; then
                             { IFS= read -r kd_alias || true; IFS= read -r kd_ctx || true; } <<<"${kd_sync}"
                         fi
                         if [[ -n "${kd_alias}" ]]; then
+                            # Point the session at a loopback relay: the host
+                            # sends the Qwen3.8 trace inline in `content`, and
+                            # Kimi has no inline-tag parser. The on-disk
+                            # catalogue keeps the direct alias, so plain `kimi`
+                            # is unaffected.
+                            local kd_proxy_port="" kd_proxy_base=""
+                            kd_proxy_port=$(_kimo_chat_proxy_start "${provider_base}") || kd_proxy_port=""
+                            if [[ -n "${kd_proxy_port}" ]]; then
+                                kd_proxy_base="http://127.0.0.1:${kd_proxy_port}/v1"
+                                unset KIMI_MODEL_NAME KIMI_MODEL_API_KEY KIMI_MODEL_PROVIDER_TYPE \
+                                    KIMI_MODEL_BASE_URL KIMI_MODEL_MAX_CONTEXT_SIZE KIMI_MODEL_CAPABILITIES \
+                                    KIMI_MODEL_REASONING_KEY KIMI_MODEL_THINKING_EFFORT \
+                                    KIMI_MODEL_MAX_OUTPUT_SIZE KIMI_MODEL_DISPLAY_NAME
+                                export KIMI_DISABLE_TELEMETRY="${KIMI_DISABLE_TELEMETRY:-1}"
+                                export KIMI_CODE_NO_AUTO_UPDATE="${KIMI_CODE_NO_AUTO_UPDATE:-1}"
+                                export KIMI_MODEL_NAME="${resolved_model}"
+                                export KIMI_MODEL_PROVIDER_TYPE="openai"
+                                export KIMI_MODEL_BASE_URL="${kd_proxy_base}"
+                                export KIMI_MODEL_API_KEY="${!key_var}"
+                                export KIMI_MODEL_MAX_CONTEXT_SIZE="${kd_ctx:-${provider_ctx}}"
+                                export KIMI_MODEL_MAX_OUTPUT_SIZE="32768"
+                                export KIMI_MODEL_CAPABILITIES="${KIMO_KIMI_CAPABILITIES:-thinking,tool_use}"
+                                export KIMI_MODEL_REASONING_KEY="${KIMO_KIMI_REASONING_KEY:-reasoning_content}"
+                                export KIMI_MODEL_THINKING_EFFORT="${kd_effort}"
+                                export KIMI_MODEL_DISPLAY_NAME="${resolved_model} (kalidroid)"
+                                echo "${C_DIM}[*] kimi on Kalidroid '${resolved_model}' via loopback thinking shim ${kd_proxy_base} (context ${KIMI_MODEL_MAX_CONTEXT_SIZE}, effort ${kd_effort})${C_RESET}" >&2
+                                exec "${cli_cmd}" "${cli_passthrough_args[@]}"
+                            fi
                             unset KIMI_MODEL_NAME KIMI_MODEL_API_KEY KIMI_MODEL_PROVIDER_TYPE \
                                 KIMI_MODEL_BASE_URL KIMI_MODEL_MAX_CONTEXT_SIZE KIMI_MODEL_CAPABILITIES \
                                 KIMI_MODEL_REASONING_KEY KIMI_MODEL_THINKING_EFFORT
@@ -10186,6 +10468,10 @@ cmd_launch() {
                     else
                         echo "${C_YELLOW}[!] Warning: could not fetch the Kalidroid catalogue from ${provider_base}/models; falling back to kimi's KIMI_MODEL_* env channel.${C_RESET}" >&2
                     fi
+                    # The env channel cannot declare support_efforts, so a
+                    # persisted out-of-range global effort would still win.
+                    kimi_fit_thinking_effort "${KIMI_CONFIG}" \
+                        "$(kalidroid_model_efforts "${resolved_model}")" "${kd_effort}"
                     unset KIMI_MODEL_NAME KIMI_MODEL_API_KEY KIMI_MODEL_PROVIDER_TYPE \
                         KIMI_MODEL_BASE_URL KIMI_MODEL_MAX_CONTEXT_SIZE KIMI_MODEL_CAPABILITIES \
                         KIMI_MODEL_REASONING_KEY KIMI_MODEL_THINKING_EFFORT
@@ -10894,16 +11180,92 @@ _gh_latest_version() {
         | jq -er '.tag_name | select(test("^v[0-9]+\\.[0-9]+\\.[0-9]+$")) | ltrimstr("v")'
 }
 
+# Which package manager owns <path>: dpkg, rpm or brew. Prints "unknown" when
+# the ownership query cannot be answered, and nothing for a standalone file.
+_gh_package_owner() {
+    local path="$1" output status cellar entry
+    # A path that does not exist yet cannot belong to a package. Querying it
+    # would also trip rpm's "No such file or directory" error, which is not
+    # the same as "not owned by any package".
+    [[ -e "${path}" || -L "${path}" ]] || return 0
+    if command -v dpkg-query >/dev/null 2>&1; then
+        status=0
+        output=$(LC_ALL=C dpkg-query -S "${path}" 2>&1) || status=$?
+        if [[ "${status}" == 0 ]]; then echo dpkg; return 0; fi
+        [[ "${status}" == 1 && "${output}" == "dpkg-query: no path found matching pattern ${path}" ]] \
+            || { echo unknown; return 0; }
+    fi
+    if command -v rpm >/dev/null 2>&1; then
+        status=0
+        output=$(LC_ALL=C rpm -qf "${path}" 2>&1) || status=$?
+        if [[ "${status}" == 0 ]]; then echo rpm; return 0; fi
+        [[ "${status}" == 1 && "${output}" == "file ${path} is not owned by any package" ]] \
+            || { echo unknown; return 0; }
+    fi
+    if command -v brew >/dev/null 2>&1; then
+        cellar=$(brew --cellar 2>/dev/null) && [[ "${cellar}" == /* ]] || { echo unknown; return 0; }
+        if [[ "${path}" == "${cellar}"/* ]]; then echo brew; return 0; fi
+        output=$(brew list --formula --verbose 2>/dev/null) || { echo unknown; return 0; }
+        while IFS= read -r entry; do
+            if [[ "${entry}" == "${path}" || ( "${entry}" == */ && "${path}" == "${entry}"* ) ]]; then
+                echo brew; return 0
+            fi
+        done <<< "${output}"
+    fi
+}
+
+_gh_immutable_store() {
+    case "$1" in
+        /nix/store/*|/gnu/store/*|/snap/*|/var/lib/flatpak/*|*/Cellar/*|*/Caskroom/*) return 0 ;;
+    esac
+    return 1
+}
+
+_gh_package_upgrade_hint() {
+    case "$1" in
+        dpkg) echo "sudo apt-get install --only-upgrade gh" ;;
+        rpm) echo "sudo dnf upgrade gh" ;;
+        brew) echo "brew upgrade gh" ;;
+        *) echo "its package manager" ;;
+    esac
+}
+
+# How 'kimo update gh' can apply a release to <path>: "in-place" for an owned
+# standalone executable, "user-local:<pkg>" for a package-managed binary that
+# must not be overwritten in place. Fails when no safe update exists.
+_gh_update_plan() {
+    local path="$1" owner
+    if _gh_immutable_store "${path}"; then
+        echo "Error: GitHub CLI is in a package-managed system store: ${path}. Use its package manager." >&2
+        return 1
+    fi
+    owner=$(_gh_package_owner "${path}")
+    case "${owner}" in
+        '') echo in-place ;;
+        unknown)
+            echo "Error: could not establish package ownership of ${path}; refusing replacement." >&2
+            return 1 ;;
+        *) echo "user-local:${owner}" ;;
+    esac
+}
+
 _gh_check_destination() {
-    local dest="$1" require_existing="${2:-false}" dir="${1%/*}" parent="$1" output status cellar entry
+    local dest="$1" require_existing="${2:-false}" dir="${1%/*}" parent="$1" owner
     case "${dest}" in
         /*) ;;
         *) echo "Error: GitHub CLI destination must be an absolute path: ${dest}." >&2; return 1 ;;
     esac
     case "${dest}" in
         *'/../'*|*'/./'*|*'//'*) echo "Error: ambiguous GitHub CLI path: ${dest}." >&2; return 1 ;;
-        /bin/*|/sbin/*|/usr/bin/*|/usr/sbin/*|/nix/store/*|/gnu/store/*|/snap/*|/var/lib/flatpak/*|*/Cellar/*|*/Caskroom/*)
-            echo "Error: GitHub CLI is in a package-managed system store: ${dest}. Use its package manager." >&2; return 1 ;;
+    esac
+    owner=$(_gh_package_owner "${dest}")
+    case "${owner}" in
+        unknown)
+            echo "Error: could not establish package ownership of ${dest}; refusing replacement." >&2; return 1 ;;
+        '') ;;
+        *)
+            echo "Error: package-owned GitHub CLI at ${dest}; use its package manager ($(_gh_package_upgrade_hint "${owner}"))." >&2
+            return 1 ;;
     esac
     while [[ "${parent}" != / ]]; do
         if [[ -L "${parent}" ]]; then
@@ -10929,46 +11291,10 @@ _gh_check_destination() {
     [[ -d "${parent}" && -O "${parent}" && -w "${parent}" && -x "${parent}" ]] || {
         echo "Error: GitHub CLI destination directory must be owned and writable by the current user: ${parent}. No sudo is used." >&2; return 1
     }
-    if command -v dpkg-query >/dev/null 2>&1; then
-        status=0
-        output=$(LC_ALL=C dpkg-query -S "${dest}" 2>&1) || status=$?
-        if [[ "${status}" == 0 ]]; then
-            echo "Error: package-owned GitHub CLI at ${dest}; use its package manager." >&2; return 1
-        fi
-        [[ "${status}" == 1 && "${output}" == "dpkg-query: no path found matching pattern ${dest}" ]] || {
-            echo "Error: could not establish dpkg ownership of ${dest}; refusing replacement." >&2; return 1
-        }
-    fi
-    if command -v rpm >/dev/null 2>&1; then
-        status=0
-        output=$(LC_ALL=C rpm -qf "${dest}" 2>&1) || status=$?
-        [[ "${status}" != 0 ]] || {
-            echo "Error: package-owned GitHub CLI at ${dest}; use its package manager." >&2; return 1
-        }
-        [[ "${status}" == 1 && "${output}" == "file ${dest} is not owned by any package" ]] || {
-            echo "Error: could not establish RPM ownership of ${dest}; refusing replacement." >&2; return 1
-        }
-    fi
-    if command -v brew >/dev/null 2>&1; then
-        cellar=$(brew --cellar 2>/dev/null) && [[ "${cellar}" == /* ]] || {
-            echo "Error: could not locate Homebrew's store; refusing replacement." >&2; return 1
-        }
-        [[ "${dest}" != "${cellar}"/* ]] || {
-            echo "Error: GitHub CLI is in Homebrew's store; use brew upgrade gh." >&2; return 1
-        }
-        output=$(brew list --formula --verbose 2>/dev/null) || {
-            echo "Error: could not establish Homebrew ownership of ${dest}; refusing replacement." >&2; return 1
-        }
-        while IFS= read -r entry; do
-            if [[ "${entry}" == "${dest}" || ( "${entry}" == */ && "${dest}" == "${entry}"* ) ]]; then
-                echo "Error: Homebrew-owned GitHub CLI at ${dest}; use brew upgrade gh." >&2; return 1
-            fi
-        done <<< "${output}"
-    fi
 }
 
 _install_gh() (
-    local force="$1" update="$2" cur_bin dest dir os arch ext version asset base tmp expected actual staged backup="" require_existing=false
+    local force="$1" update="$2" cur_bin dest dir os arch ext version asset base tmp expected actual staged backup="" require_existing=false plan shadow_owner="" resolved
     dir="${HOME}/.local/bin"
     dest="${dir}/gh"
     cur_bin=$(type -P gh 2>/dev/null || true)
@@ -10981,9 +11307,17 @@ _install_gh() (
             echo "Error: refusing to replace or shadow GitHub CLI at ${cur_bin}. For an owned standalone executable, use 'kimo update gh'; package-managed gh must use its package manager (see https://cli.github.com/manual/installation)." >&2
             return 1
         fi
-        dest="${cur_bin}"
-        dir="${dest%/*}"
-        require_existing=true
+        plan=$(_gh_update_plan "${cur_bin}") || return 1
+        if [[ "${plan}" == in-place ]]; then
+            dest="${cur_bin}"
+            dir="${dest%/*}"
+            require_existing=true
+        else
+            # Package-managed: never touch the package-owned file. Install the
+            # official release in kimo's own prefix instead.
+            shadow_owner="${plan#user-local:}"
+            echo "Warning: GitHub CLI at ${cur_bin} is managed by ${shadow_owner}; installing the official release at ${dest} instead and leaving the package file untouched." >&2
+        fi
     fi
     _gh_check_destination "${dest}" "${require_existing}" || return 1
     case "$(uname -s)" in
@@ -11065,6 +11399,11 @@ _install_gh() (
     fi
     if [[ ":${PATH}:" != *":${dir}:"* ]]; then
         echo "Add ${dir} to PATH to use gh."
+    elif [[ -n "${shadow_owner}" ]]; then
+        resolved=$(type -P gh 2>/dev/null || true)
+        if [[ "${resolved}" != "${dest}" ]]; then
+            echo "Warning: 'gh' still resolves to ${resolved}; put ${dir} before ${resolved%/*} in PATH to use ${version}." >&2
+        fi
     fi
 )
 
@@ -11561,7 +11900,8 @@ install_usage() {
 ${C_BOLD}kimo install${C_RESET} – Install and manage external CLIs (including GitHub CLI: gh)
 
 GitHub CLI uses official checksum-verified Linux/macOS releases in ~/.local/bin.
-Updates/--force refuse system, package-manager and symlink installations; use their package manager.
+Updates/--force refuse package-manager and symlink installations; named 'update gh'
+installs the official release in ~/.local/bin instead, leaving package files untouched.
 GitHub CLI is not Copilot and is not routed to Ollama.
 
 ${C_YELLOW}Usage:${C_RESET}
@@ -12011,7 +12351,7 @@ _process_present_cli_updates() {
     local apply="$1" target="${2:-all}"
     local clis=(claude codex qwen grok kimi cursor opencode cyberstrike agy openclaw hermes gh)
     [[ "${target}" != all ]] && clis=("${target}")
-    local c bin current latest state after
+    local c bin current latest state after gh_path plan
     local present=0 available=0 skipped=0 unknown=0 attempts=0 verified=0 failures=0
     printf '  %-12s %-24s %-24s %s\n' CLI CURRENT LATEST STATUS
     for c in "${clis[@]}"; do
@@ -12032,6 +12372,16 @@ _process_present_cli_updates() {
         else
             state=$(_compare_cli_versions "${c}" "${current}" "${latest}")
             state="${state:-lookup failed/unknown}"
+        fi
+        # Batch updates never shadow a package-managed gh: the named
+        # 'update gh' target is the opt-in that installs the official release
+        # in ~/.local/bin. Report it as skipped instead of attempting a
+        # replacement that the package ownership guard would refuse anyway.
+        if [[ "${c}" == gh && "${target}" != gh && "${state}" == 'update available' ]] \
+            && gh_path=$(type -P gh 2>/dev/null) \
+            && plan=$(_gh_update_plan "${gh_path}" 2>/dev/null) \
+            && [[ "${plan}" == user-local:* ]]; then
+            state="package-managed (${plan#user-local:}); use '${0##*/} update gh'"
         fi
         printf '  %-12s %-24s %-24s %s\n' "${c}" "${current}" "${latest:--}" "${state}"
         if [[ "${state}" != 'update available' ]]; then
@@ -12089,8 +12439,10 @@ ${C_YELLOW}Options:${C_RESET}
   ${C_CYAN}-c, --check${C_RESET}   Check for updates without installing (default behavior when no CLI is specified)
   ${C_CYAN}--allow-system-path${C_RESET}  Only with named gh: implied by 'update gh' and 'update all'; validates the PATH executable up front
   ${C_CYAN}-h, --help${C_RESET}    Show this help message
-  GitHub CLI rejects package-owned files, symlinks (including parents), and unowned/unwritable directories.
-  No sudo or shadowing; keeps a backup until the new version verifies, and rolls back if it fails.
+  GitHub CLI never overwrites package-owned files or follows symlinks (including parents).
+  Named 'update gh' installs the official release in ~/.local/bin when the PATH gh is
+  package-managed; batch updates report that case as skipped. No sudo.
+  In-place updates keep a backup until the new version verifies, and roll back if it fails.
 
 ${C_YELLOW}Examples:${C_RESET}
   ${0##*/} update             # Check updates for all present CLIs
@@ -12098,7 +12450,7 @@ ${C_YELLOW}Examples:${C_RESET}
   ${0##*/} update all --check  # Read-only check; cannot combine --check and --apply
   ${0##*/} update qwen        # Update only Qwen Code CLI when confirmed newer
   ${0##*/} update agy         # Update Antigravity CLI with its native updater
-  ${0##*/} update gh          # Update gh in place (~/.local/bin or an owned standalone like /usr/local/bin/gh; also done by 'update all')
+  ${0##*/} update gh          # Update gh (~/.local/bin or an owned standalone like /usr/local/bin/gh; package-managed gh gets the official release in ~/.local/bin)
   ${0##*/} update gh --allow-system-path --check # Read-only eligibility and release check
   ${0##*/} update --apply     # Update all installed CLIs with available updates
 EOF
@@ -12142,18 +12494,25 @@ cmd_update() {
         [[ "${target}" == gh ]] || {
             echo "Error: --allow-system-path is only valid for the named 'update gh' target, not batch updates." >&2; return 1
         }
-        local gh_path
+        local gh_path gh_plan
         gh_path=$(type -P gh 2>/dev/null) || {
             echo "Error: --allow-system-path requires an existing GitHub CLI in PATH." >&2; return 1
         }
-        _gh_check_destination "${gh_path}" true || return 1
+        gh_plan=$(_gh_update_plan "${gh_path}") || return 1
         if ${opt_check}; then
-            echo "GitHub CLI at ${gh_path} is eligible for an in-place update (--check: no files changed)."
+            case "${gh_plan}" in
+                in-place)
+                    echo "GitHub CLI at ${gh_path} is eligible for an in-place update (--check: no files changed)." ;;
+                user-local:*)
+                    echo "GitHub CLI at ${gh_path} is managed by ${gh_plan#user-local:}; '${0##*/} update gh' installs the official release at ${HOME}/.local/bin/gh and leaves the package file untouched (--check: no files changed)." ;;
+            esac
         fi
     fi
-    # 'update gh' and batch updates replace the gh found in PATH in place (e.g. a
-    # standalone /usr/local/bin/gh). _install_gh still runs _gh_check_destination,
-    # which refuses package-owned, symlinked and unowned paths.
+    # Named 'update gh' replaces an owned standalone gh in place (e.g. a
+    # standalone /usr/local/bin/gh) and installs the official release in
+    # ~/.local/bin for a package-managed gh. Batch updates only apply the
+    # in-place path; _install_gh still runs _gh_check_destination, which
+    # refuses package-owned, symlinked and unowned destinations.
     case "${target}" in ''|all|gh) gh_allow_system_path=true ;; esac
     if ${opt_check} || { [[ -z "${target}" ]] && ! ${opt_apply}; }; then
         _check_updates_for_present_clis "${target:-all}"
@@ -12928,7 +13287,7 @@ _kimo() {
         cword=$COMP_CWORD
     fi
 
-    local commands="list ls search find ps top warm preload stop unload tune set-ctx param bench eval benchmark info show tag alias rm delete pull download sync run launch install setup update upgrade doctor diagnose diag config cfg completion freetier free-tier kimi-sync quota quotas quote tunnel claude claude-sync kimi-claude gemini gemini-sync kimi-gemini codex codex-sync kimi-codex kimi-provider kimi-providers provider providers version status health hosts init scan discover check ping stream logs status-report report rotate-token web help"
+    local commands="list ls search find ps top warm preload stop unload tune set-ctx param bench eval benchmark info show tag alias rm delete pull download sync run launch install setup update upgrade doctor diagnose diag config cfg completion freetier free-tier kimi-sync quota quotas quote tunnel claude claude-sync kimi-claude gemini gemini-sync kimi-gemini codex codex-sync kimi-codex grok grok-sync xai kimi-grok kimi-provider kimi-providers provider providers version status health hosts init scan discover check ping stream logs status-report report rotate-token web help"
     local global_opts="--remote --local --host --json --no-color -v --version -h --help"
     local supported_clis="claude grok kimi agy codex qwen cursor opencode cyberstrike openclaw hermes gh"
     local config_subcmds="get set unset list show path validate help"
@@ -12975,10 +13334,12 @@ _kimo() {
                     dashscope/qwen-plus qwen-plus \
                     dashscope/qwen-turbo qwen-turbo \
                     dashscope/qwen-max qwen-max \
+                    dashscope/deepseek-4.1-pro deepseek-4.1-pro \
                     dashscope/deepseek-v4.1-flash-1017 deepseek-v4.1-flash-1017
                 ;;
             qwencloud)
                 printf '%s\n' \
+                    qwencloud/qwen4-max-preview qwen4-max-preview \
                     qwencloud/qwen3.8-max qwen3.8-max \
                     qwencloud/qwen3.8-flash qwen3.8-flash \
                     qwencloud/qwen3-coder-plus qwen3-coder-plus \
@@ -13107,9 +13468,9 @@ _kimo() {
                 return 0
             fi
             if [[ "${prev}" == "--provider" ]]; then
-                local launch_providers="ollama ollama-cloud abliteration codex openai dashscope alibaba modelscope qwencloud xai anthropic claude gemini kalidroid vllm grok"
+                local launch_providers="ollama ollama-cloud abliteration codex openai dashscope alibaba modelscope qwencloud qwen xai anthropic claude gemini kalidroid vllm grok"
                 if [[ "${words[cmd_idx+1]:-}" == kimi ]]; then
-                    launch_providers="ollama-cloud abliteration codex openai dashscope alibaba modelscope qwencloud xai anthropic claude gemini kalidroid grok"
+                    launch_providers="ollama-cloud abliteration codex openai dashscope alibaba modelscope qwencloud qwen xai anthropic claude gemini kalidroid grok"
                 fi
                 COMPREPLY=( $(compgen -W "${launch_providers}" -- "${cur}") )
                 return 0
@@ -13245,7 +13606,7 @@ _kimo() {
             ;;
         gemini|gemini-sync|kimi-gemini)
             if [[ "${cur}" == -* ]]; then
-                COMPREPLY=( $(compgen -W "--status --token --export --json --dry-run --list-only --output-json --from-json --save-json --verify --verify-prune --verify-timeout --jobs --stable-only --all --include --exclude --min-context --sort --limit --set-default --context-window --max-output --provider --base-url --api-key --api-key-env --config --verbose -h --help" -- "${cur}") )
+                COMPREPLY=( $(compgen -W "--status --token --export --json --dry-run --list-only --output-json --from-json --save-json --verify --verify-prune --verify-timeout --jobs --stable-only --all --include --exclude --min-context --sort --limit --set-default --context-window --max-output --provider --base-url --config --verbose -h --help" -- "${cur}") )
             elif [[ $cword -eq $((cmd_idx + 1)) ]]; then
                 COMPREPLY=( $(compgen -W "status token export sync" -- "${cur}") )
             fi
@@ -13260,6 +13621,13 @@ _kimo() {
         freetier|free-tier|kimi-sync)
             if [[ "${cur}" == -* ]]; then
                 COMPREPLY=( $(compgen -W "--check-auth --dry-run --from-json --save-json --min-remaining --min-days-left --qwen-only --include --exclude --sort --limit --verify --verify-prune --verify-timeout --jobs --set-default --context-window --max-output --base-url --api-key --config --list-only --output-json --verbose -h --help" -- "${cur}") )
+            fi
+            ;;
+        grok|grok-sync|xai|xai-sync|kimi-grok|kimi-xai)
+            if [[ "${cur}" == -* ]]; then
+                COMPREPLY=( $(compgen -W "--status --token --export --sync --set-default --json -h --help" -- "${cur}") )
+            elif [[ $cword -eq $((cmd_idx + 1)) ]]; then
+                COMPREPLY=( $(compgen -W "status token export sync set-default help" -- "${cur}") )
             fi
             ;;
         codex|codex-sync|kimi-codex)
@@ -13331,10 +13699,12 @@ _kimo_hosted_models() {
                 dashscope/qwen-plus qwen-plus \
                 dashscope/qwen-turbo qwen-turbo \
                 dashscope/qwen-max qwen-max \
+                dashscope/deepseek-4.1-pro deepseek-4.1-pro \
                 dashscope/deepseek-v4.1-flash-1017 deepseek-v4.1-flash-1017
             ;;
         qwencloud)
             printf '%s\n' \
+                qwencloud/qwen4-max-preview qwen4-max-preview \
                 qwencloud/qwen3.8-max qwen3.8-max \
                 qwencloud/qwen3.8-flash qwen3.8-flash \
                 qwencloud/qwen3-coder-plus qwen3-coder-plus \
@@ -13456,6 +13826,7 @@ _kimo() {
         'claude:Claude OAuth and session token bridge for Kimi Code and Claude CLI'
         'gemini:Gemini OAuth tokens and API models in Kimi config'
         'codex:Codex OAuth and session token bridge for Kimi Code and Codex CLI'
+        'grok:xAI Grok OAuth token (not API key) bridge for Kimi Code, Codex and Claude'
         'run:Run an Ollama model directly'
         'launch:Launch external agent CLI'
         'install:Install external LLM CLIs'
@@ -13507,9 +13878,9 @@ _kimo() {
                     ;;
                 launch)
                     local -a launch_providers
-                    launch_providers=(ollama ollama-cloud abliteration codex openai dashscope alibaba modelscope qwencloud xai anthropic claude gemini kalidroid vllm grok)
+                    launch_providers=(ollama ollama-cloud abliteration codex openai dashscope alibaba modelscope qwencloud qwen xai anthropic claude gemini kalidroid vllm grok)
                     if [[ " ${words[*]} " == *" launch kimi "* ]]; then
-                        launch_providers=(ollama-cloud abliteration codex openai dashscope alibaba modelscope qwencloud xai anthropic claude gemini kalidroid grok)
+                        launch_providers=(ollama-cloud abliteration codex openai dashscope alibaba modelscope qwencloud qwen xai anthropic claude gemini kalidroid grok)
                     fi
                     _arguments \
                         '(-m --model)'{-m,--model}'[Target model name]:model:_kimo_models' \
@@ -13549,7 +13920,7 @@ _kimo() {
                 gemini|gemini-sync|kimi-gemini)
                     _arguments \
                         '--status[Display status snapshot]' \
-                        '--token[Print resolved GEMINI_AUTH_TOKEN / GEMINI_API_KEY]' \
+                        '--token[Print resolved GEMINI_AUTH_TOKEN]' \
                         '--export[Print export command for shell eval]' \
                         '--json[Output in JSON format]' \
                         '--dry-run[Plan and print, write nothing]' \
@@ -13573,8 +13944,6 @@ _kimo() {
                         '--max-output[Override max_output_size]:n:' \
                         '--provider[Provider id / alias prefix]:name:' \
                         '--base-url[Gemini API base URL]:url:' \
-                        '--api-key[API key]:key:' \
-                        '--api-key-env[Write api_key_env instead of the key]:var:' \
                         '--config[Target config.toml]:file:_files' \
                         '--verbose[Verbose progress]' \
                         '(-h --help)'{-h,--help}'[Show help]' && return 0
@@ -13606,6 +13975,17 @@ _kimo() {
                         '--output-json[Emit JSON rows]' \
                         '--verbose[Verbose progress]' \
                         '(-h --help)'{-h,--help}'[Show help]' && return 0
+                    ;;
+                grok|grok-sync|xai|xai-sync|kimi-grok|kimi-xai)
+                    _arguments \
+                        '--status[Display status snapshot]' \
+                        '--token[Print resolved XAI_AUTH_TOKEN / XAI_API_KEY]' \
+                        '--export[Print export command for shell eval]' \
+                        '--sync[Synchronize xAI provider and models into Kimi config]' \
+                        '--set-default[Set default model in Kimi config]:model:' \
+                        '--json[Output in JSON format]' \
+                        '(-h --help)'{-h,--help}'[Show help]' \
+                        '1:action:(status token export sync set-default help)' && return 0
                     ;;
                 codex|codex-sync|kimi-codex)
                     _arguments \
@@ -14233,8 +14613,8 @@ cmd_freetier() {
 }
 
 # -----------------------------------------------------------------------------
-# Command: gemini  (Google Gemini API token models -> Kimi Code)
-# List every model the Gemini API key can see (GET /v1beta/models, paginated)
+# Command: gemini  (Google Gemini OAuth token models -> Kimi Code)
+# List every model the Gemini OAuth token can see (GET /v1beta/models, paginated)
 # and rewrite the managed [providers.gemini] / [models."gemini/..."] block of
 # the Kimi Code config.toml. Kimi drives them natively through its
 # 'google-genai' provider type, using each model's real token limits
@@ -14250,63 +14630,49 @@ KIMI_GM_DOTENV="${HOME:-/root}/.gemini/.env"
 KIMI_GM_NONCHAT_RE='embed|aqa|imagen|veo|lyria|tts|image|banana|native-audio|live|transcribe|robotics|computer-use|deep-research|learnlm'
 KIMI_GM_PREVIEW_RE='preview|exp(erimental)?([-_]|$)'
 
-# _gemini_curl_key KEY CURL_ARGS... - run curl with the key sent as the
-# Authorization: Bearer or x-goog-api-key header via a stdin config, so it
-# never shows up in argv/ps.
-_gemini_curl_key() {
-    local key="$1"
+# _gemini_curl_bearer TOKEN CURL_ARGS... - send the OAuth token via a stdin
+# curl config so it never appears in argv/ps.
+_gemini_curl_bearer() {
+    local token="$1"
     shift
-    if [[ "${key}" == ya29.* || "${key}" != AIza* ]]; then
-        printf 'header = "Authorization: Bearer %s"\n' "${key}" | curl -K - "$@"
-    else
-        printf 'header = "x-goog-api-key: %s"\n' "${key}" | curl -K - "$@"
-    fi
+    token="${token//\\/\\\\}"
+    token="${token//\"/\\\"}"
+    printf 'header = "Authorization: Bearer %s"\n' "${token}" | curl -K - "$@"
 }
-export -f _gemini_curl_key
+export -f _gemini_curl_bearer
 
-# Key order: --api-key, --api-key-env VAR, GEMINI_AUTH_TOKEN, GOOGLE_OAUTH_TOKEN,
-# GEMINI_API_KEY, GOOGLE_API_KEY, GOOGLE_GENERATIVE_AI_API_KEY, then ~/.gemini/.env.
-# The literal "ollama" is skipped: that is the placeholder kimo's agy launch exports.
-_gemini_resolve_key() {
-    if [[ -n "${KIMI_GM_API_KEY}" ]]; then
-        printf '%s' "${KIMI_GM_API_KEY}"
-        return 0
-    fi
-    local k="" var
-    if [[ -n "${KIMI_GM_API_KEY_ENV}" ]]; then
-        k="${!KIMI_GM_API_KEY_ENV:-}"
-        if [[ -z "${k}" ]]; then
-            echo "${C_RED}Error: --api-key-env ${KIMI_GM_API_KEY_ENV} is not set in this shell.${C_RESET}" >&2
-            return 1
-        fi
-        printf '%s' "${k}"
-        return 0
-    fi
-    for var in GEMINI_AUTH_TOKEN GOOGLE_OAUTH_TOKEN GEMINI_API_KEY GOOGLE_API_KEY GOOGLE_GENERATIVE_AI_API_KEY; do
+# Resolve GEMINI_AUTH_TOKEN / GOOGLE_OAUTH_TOKEN, stored OAuth credentials, or
+# their entries in ~/.gemini/.env. API-key variables are deliberately ignored.
+_gemini_resolve_token() {
+    local token="" var
+    for var in GEMINI_AUTH_TOKEN GOOGLE_OAUTH_TOKEN; do
         if [[ -n "${!var:-}" && "${!var}" != "ollama" ]]; then
-            k="${!var}"
+            token="${!var}"
             break
         fi
     done
-    if [[ -z "${k}" ]]; then
+    if [[ -z "${token}" ]]; then
         _resolve_gemini_auth
         for var in GEMINI_AUTH_TOKEN GOOGLE_OAUTH_TOKEN; do
             if [[ -n "${!var:-}" && "${!var}" != "ollama" ]]; then
-                k="${!var}"
+                token="${!var}"
                 break
             fi
         done
     fi
-    if [[ -z "${k}" && -f "${KIMI_GM_DOTENV}" ]]; then
-        k=$(sed -n -E "s/^[[:space:]]*(export[[:space:]]+)?(GEMINI_API_KEY|GOOGLE_API_KEY|GEMINI_AUTH_TOKEN|GOOGLE_OAUTH_TOKEN)[[:space:]]*=[[:space:]]*[\"']?([^\"'[:space:]]+).*/\\3/p" \
-            "${KIMI_GM_DOTENV}" 2>/dev/null | head -1) || k=""
+    if [[ -z "${token}" && -f "${KIMI_GM_DOTENV}" ]]; then
+        token=$(sed -n -E "s/^[[:space:]]*(export[[:space:]]+)?(GEMINI_AUTH_TOKEN|GOOGLE_OAUTH_TOKEN)[[:space:]]*=[[:space:]]*[\"']?([^\"'[:space:]]+).*/\\3/p" \
+            "${KIMI_GM_DOTENV}" 2>/dev/null | head -1) || token=""
     fi
-    if [[ -z "${k}" ]]; then
-        echo "${C_RED}Error: no Gemini API key or OAuth token found (pass --api-key, set GEMINI_AUTH_TOKEN/GEMINI_API_KEY, or sign in with 'agy').${C_RESET}" >&2
-        echo "${C_RED}  Create one at https://aistudio.google.com/apikey${C_RESET}" >&2
+    if [[ -z "${token}" ]]; then
+        echo "${C_RED}Error: no Gemini OAuth token found (set GEMINI_AUTH_TOKEN / GOOGLE_OAUTH_TOKEN, or sign in with 'agy').${C_RESET}" >&2
         return 1
     fi
-    printf '%s' "${k}"
+    if [[ "${token}" == AIza* ]]; then
+        echo "${C_RED}Error: Gemini API keys are not supported; use an OAuth bearer token in GEMINI_AUTH_TOKEN.${C_RESET}" >&2
+        return 1
+    fi
+    printf '%s' "${token}"
 }
 
 # _gemini_fetch_models KEY -> raw .models[] array (all pages) on stdout
@@ -14317,7 +14683,7 @@ _gemini_fetch_models() {
     while :; do
         page_arg=()
         if [[ -n "${token}" ]]; then page_arg=(--data-urlencode "pageToken=${token}"); fi
-        code=$(_gemini_curl_key "${key}" -sS -G -m "${KIMI_GM_TIMEOUT}" -o "${body}" -w '%{http_code}' \
+        code=$(_gemini_curl_bearer "${key}" -sS -G -m "${KIMI_GM_TIMEOUT}" -o "${body}" -w '%{http_code}' \
             "${KIMI_GM_BASE_URL}/v1beta/models" --data-urlencode "pageSize=1000" "${page_arg[@]}" \
             2>/dev/null) || code="000"
         if [[ "${code}" != "200" ]]; then
@@ -14361,16 +14727,7 @@ _gemini_load_rows() {
         fi
         raw=$(cat "${KIMI_GM_FROM_JSON}")
     else
-        raw=$(_gemini_fetch_models "${key}" 2>/dev/null) || raw=""
-        if [[ -z "${raw}" ]]; then
-            raw='[
-              {"name":"models/gemini-2.5-flash","displayName":"Gemini 2.5 Flash","inputTokenLimit":1048576,"outputTokenLimit":65536,"supportedGenerationMethods":["generateContent"],"thinking":true},
-              {"name":"models/gemini-2.5-pro","displayName":"Gemini 2.5 Pro","inputTokenLimit":1048576,"outputTokenLimit":65536,"supportedGenerationMethods":["generateContent"],"thinking":true},
-              {"name":"models/gemini-2.0-flash","displayName":"Gemini 2.0 Flash","inputTokenLimit":1048576,"outputTokenLimit":8192,"supportedGenerationMethods":["generateContent"],"thinking":true},
-              {"name":"models/gemini-1.5-pro","displayName":"Gemini 1.5 Pro","inputTokenLimit":2097152,"outputTokenLimit":8192,"supportedGenerationMethods":["generateContent"],"thinking":true},
-              {"name":"models/gemini-1.5-flash","displayName":"Gemini 1.5 Flash","inputTokenLimit":1048576,"outputTokenLimit":8192,"supportedGenerationMethods":["generateContent"],"thinking":true}
-            ]'
-        fi
+        raw=$(_gemini_fetch_models "${key}") || return 1
     fi
     if [[ -n "${KIMI_GM_SAVE_JSON}" ]]; then
         printf '%s\n' "${raw}" | jq '.' > "${KIMI_GM_SAVE_JSON}"
@@ -14411,7 +14768,7 @@ _gemini_probe_one() {
     safe="${model//\//_}"
     body=$(mktemp) || return 1
     for attempt in 1 2 3; do
-        code=$(_gemini_curl_key "${key}" -sS -m "${tout}" -o "${body}" -w '%{http_code}' \
+        code=$(_gemini_curl_bearer "${key}" -sS -m "${tout}" -o "${body}" -w '%{http_code}' \
             -X POST "${base}/v1beta/models/${model}:generateContent" \
             -H 'Content-Type: application/json' \
             -d '{"contents":[{"role":"user","parts":[{"text":"ping"}]}],"generationConfig":{"maxOutputTokens":16}}' \
@@ -14449,12 +14806,11 @@ _gemini_run_verify() {
     rm -rf "${outdir}"
 }
 
-# rows JSON on stdin; $1 = key (ignored when KIMI_GM_API_KEY_ENV is set).
-# Strings go through tojson: a JSON string literal is a valid TOML basic string.
+# rows JSON on stdin. Strings go through tojson: a JSON string literal is a
+# valid TOML basic string. The credential is always an environment reference.
 _gemini_emit_block() {
     jq -r --arg provider "${KIMI_GM_PROVIDER}" --arg prefix "${KIMI_GM_ALIAS_PREFIX}" \
-       --arg base "${KIMI_GM_BASE_URL}" --arg key "$1" --arg key_env "${KIMI_GM_API_KEY_ENV}" \
-       --arg marker "${KIMI_GM_MARKER}" \
+       --arg base "${KIMI_GM_BASE_URL}" --arg marker "${KIMI_GM_MARKER}" \
        --argjson ctx "${KIMI_GM_CONTEXT_WINDOW}" --argjson maxout "${KIMI_GM_MAX_OUTPUT}" '
     def caps:
       [ "tool_use" ]
@@ -14466,9 +14822,7 @@ _gemini_emit_block() {
     "[providers." + $provider + "]",
     "type = \"google-genai\"",
     "base_url = " + ($base | tojson),
-    (if $key_env != "" then "api_key_env = " + ($key_env | tojson)
-     elif ($key | test("^AIza")) then "api_key = " + ($key | tojson)
-     else "api_key_env = \"GEMINI_AUTH_TOKEN\"" end),
+    "api_key_env = \"GEMINI_AUTH_TOKEN\"",
     "",
     ( .[] |
       "[models." + (($prefix + .model) | tojson) + "]",
@@ -14522,7 +14876,7 @@ _gemini_set_default_model() {
 
 # rows JSON (selected) on stdin
 _gemini_write_config() {
-    local rows key="" n default_alias="" candidate rc=0
+    local rows n default_alias="" candidate rc=0
     rows=$(cat)
     n=$(printf '%s' "${rows}" | jq length)
     case "${KIMI_GM_SET_DEFAULT}" in
@@ -14544,9 +14898,7 @@ _gemini_write_config() {
         return 0
     fi
 
-    if [[ -z "${KIMI_GM_API_KEY_ENV}" ]]; then
-        key=$(_gemini_resolve_key) || return 1
-    fi
+    _gemini_resolve_token >/dev/null || return 1
 
     mkdir -p "$(dirname "${KIMI_GM_CONFIG}")"
     if command -v flock >/dev/null 2>&1; then
@@ -14562,7 +14914,7 @@ _gemini_write_config() {
     else
         printf '# %s\n\n' "${KIMI_GM_CONFIG}" > "${candidate}"
     fi
-    printf '%s' "${rows}" | _gemini_emit_block "${key}" >> "${candidate}"
+    printf '%s' "${rows}" | _gemini_emit_block >> "${candidate}"
     if [[ -n "${default_alias}" ]]; then
         _gemini_set_default_model "${candidate}" "${default_alias}"
     fi
@@ -14624,13 +14976,13 @@ ${C_YELLOW}Description:${C_RESET}
 ${C_YELLOW}Usage:${C_RESET}
   ${0##*/} gemini [options]
   ${0##*/} gemini status            ${C_DIM}# Display Gemini authentication and model status${C_RESET}
-  ${0##*/} gemini token             ${C_DIM}# Print resolved GEMINI_AUTH_TOKEN / GEMINI_API_KEY${C_RESET}
+  ${0##*/} gemini token             ${C_DIM}# Print resolved GEMINI_AUTH_TOKEN${C_RESET}
   ${0##*/} gemini export            ${C_DIM}# Print export command for shell eval${C_RESET}
   ${0##*/} gemini sync [opts...]    ${C_DIM}# Synchronize Gemini models into Kimi configuration${C_RESET}
 
-${C_YELLOW}Source:${C_RESET} GET ${KIMI_GM_BASE_URL_DEFAULT}/v1beta/models  (every page the key can see)
-  Key: --api-key, --api-key-env VAR, GEMINI_AUTH_TOKEN, GEMINI_API_KEY, GOOGLE_API_KEY,
-       GOOGLE_GENERATIVE_AI_API_KEY, then ${KIMI_GM_DOTENV}
+${C_YELLOW}Source:${C_RESET} GET ${KIMI_GM_BASE_URL_DEFAULT}/v1beta/models  (every page the token can see)
+  Auth: GEMINI_AUTH_TOKEN, GOOGLE_OAUTH_TOKEN, stored OAuth credentials,
+        then ${KIMI_GM_DOTENV}
 
 ${C_YELLOW}Writes${C_RESET} (surgical edit, timestamped backup first, everything else preserved):
   [providers.gemini] (type = "google-genai") + one [models."gemini/<id>"] per
@@ -14642,7 +14994,7 @@ ${C_YELLOW}Writes${C_RESET} (surgical edit, timestamped backup first, everything
 
 ${C_YELLOW}Options:${C_RESET}
   --status                Display status snapshot (default when no sync options given)
-  --token                 Print resolved GEMINI_AUTH_TOKEN (renewed if stale) or GEMINI_API_KEY
+  --token                 Print resolved GEMINI_AUTH_TOKEN (renewed if stale)
   --export                Print export command for shell eval
   --dry-run               Plan and print selected models; write nothing
   --list-only             Print selected model ids and exit
@@ -14665,8 +15017,6 @@ ${C_YELLOW}Options:${C_RESET}
   --max-output N          Override max_output_size for every model (default: API value)
   --provider NAME         Provider id / alias prefix (default gemini -> "gemini/<id>")
   --base-url URL          Gemini API base URL (default ${KIMI_GM_BASE_URL_DEFAULT})
-  --api-key KEY           API key to fetch with and embed in config.toml
-  --api-key-env VAR       Write api_key_env = "VAR" instead of embedding the key
   --config FILE           Target config.toml (default: ${KIMI_CONFIG})
   --json                  Output in JSON format (for status/token)
   --verbose               Per-model details on stderr
@@ -14679,7 +15029,7 @@ ${C_YELLOW}Examples:${C_RESET}
   ${0##*/} gemini --dry-run
   ${0##*/} gemini --verify --verify-prune
   ${0##*/} gemini --stable-only --set-default gemini/gemini-2.5-pro
-  ${0##*/} gemini --api-key-env GEMINI_API_KEY      # keep the secret out of config.toml
+  GEMINI_AUTH_TOKEN=... ${0##*/} gemini --verify --verify-prune
   kimi -m gemini/gemini-2.5-flash
 EOF
     return 0
@@ -14710,7 +15060,7 @@ cmd_gemini() {
             [[ "${1:-}" == "--json" ]] && opt_json=true
             _resolve_gemini_auth
             _ensure_gemini_token || return 1
-            local tok="${GEMINI_AUTH_TOKEN:-${GOOGLE_OAUTH_TOKEN:-${GEMINI_API_KEY:-${GOOGLE_API_KEY:-}}}}"
+            local tok="${GEMINI_AUTH_TOKEN:-${GOOGLE_OAUTH_TOKEN:-}}"
             if ${opt_json}; then
                 python3 -c 'import json,sys; print(json.dumps({"token": sys.argv[1]}))' "${tok}"
             else
@@ -14722,12 +15072,8 @@ cmd_gemini() {
             shift
             _resolve_gemini_auth
             _ensure_gemini_token || return 1
-            local tok="${GEMINI_AUTH_TOKEN:-${GOOGLE_OAUTH_TOKEN:-${GEMINI_API_KEY:-${GOOGLE_API_KEY:-}}}}"
-            if [[ "${tok}" == AIzaSy* ]]; then
-                printf 'export GEMINI_API_KEY=%q\n' "${tok}"
-            else
-                printf 'export GEMINI_AUTH_TOKEN=%q\n' "${tok}"
-            fi
+            local tok="${GEMINI_AUTH_TOKEN:-${GOOGLE_OAUTH_TOKEN:-}}"
+            printf 'export GEMINI_AUTH_TOKEN=%q\n' "${tok}"
             return 0
             ;;
         status|--status)
@@ -14755,8 +15101,6 @@ cmd_gemini() {
     KIMI_GM_CONFIG="${KIMI_CONFIG}"
     KIMI_GM_BASE_URL="${KIMO_GEMINI_BASE_URL:-${KIMI_GM_BASE_URL_DEFAULT}}"
     KIMI_GM_PROVIDER="gemini"
-    KIMI_GM_API_KEY=""
-    KIMI_GM_API_KEY_ENV=""
     KIMI_GM_FROM_JSON=""
     KIMI_GM_SAVE_JSON=""
     KIMI_GM_ALL=0
@@ -14781,7 +15125,7 @@ cmd_gemini() {
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            --config|--base-url|--api-key|--api-key-env|--from-json|--save-json|--include|--exclude|--min-context|--sort|--limit|--verify-timeout|--jobs|--set-default|--context-window|--max-output|--provider)
+            --config|--base-url|--from-json|--save-json|--include|--exclude|--min-context|--sort|--limit|--verify-timeout|--jobs|--set-default|--context-window|--max-output|--provider)
                 if [[ $# -lt 2 ]]; then
                     echo "${C_RED}Error: $1 requires a value.${C_RESET}" >&2
                     return 1
@@ -14791,8 +15135,6 @@ cmd_gemini() {
         case "$1" in
             --config) KIMI_GM_CONFIG="$2"; shift 2 ;;
             --base-url) KIMI_GM_BASE_URL="$2"; shift 2 ;;
-            --api-key) KIMI_GM_API_KEY="$2"; shift 2 ;;
-            --api-key-env) KIMI_GM_API_KEY_ENV="$2"; shift 2 ;;
             --from-json) KIMI_GM_FROM_JSON="$2"; shift 2 ;;
             --save-json) KIMI_GM_SAVE_JSON="$2"; shift 2 ;;
             --all) KIMI_GM_ALL=1; shift ;;
@@ -14834,10 +15176,6 @@ cmd_gemini() {
         echo "${C_RED}Error: --provider must match [A-Za-z0-9_-]+ (got '${KIMI_GM_PROVIDER}').${C_RESET}" >&2
         return 1
     fi
-    if [[ -n "${KIMI_GM_API_KEY_ENV}" && ! "${KIMI_GM_API_KEY_ENV}" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
-        echo "${C_RED}Error: --api-key-env must be an environment variable name.${C_RESET}" >&2
-        return 1
-    fi
     case "${KIMI_GM_SORT}" in
         name|context|output) ;;
         *) echo "${C_RED}Error: --sort must be name, context or output.${C_RESET}" >&2; return 1 ;;
@@ -14852,7 +15190,7 @@ cmd_gemini() {
     # plan/list keyless, and the writer resolves its own key later.
     local key=""
     if [[ -z "${KIMI_GM_FROM_JSON}" || "${KIMI_GM_VERIFY}" -eq 1 ]]; then
-        key=$(_gemini_resolve_key) || return 1
+        key=$(_gemini_resolve_token) || return 1
     fi
 
     local rows selected n total models_file results ok_ids
@@ -14903,11 +15241,6 @@ cmd_gemini() {
         return 0
     fi
 
-    # Reuse the key already resolved for the fetch, so the writer embeds the
-    # same one (it resolves on its own for keyless --from-json runs).
-    if [[ -n "${key}" && -z "${KIMI_GM_API_KEY}" && -z "${KIMI_GM_API_KEY_ENV}" ]]; then
-        KIMI_GM_API_KEY="${key}"
-    fi
     printf '%s' "${selected}" | _gemini_write_config
 }
 
@@ -15389,7 +15722,7 @@ def resolve_claude_token():
     return None, None
 
 def resolve_gemini_token():
-    for var in ("GEMINI_AUTH_TOKEN", "GOOGLE_OAUTH_TOKEN", "GEMINI_API_KEY", "GOOGLE_API_KEY", "GOOGLE_GENERATIVE_AI_API_KEY"):
+    for var in ("GEMINI_AUTH_TOKEN", "GOOGLE_OAUTH_TOKEN"):
         val = os.environ.get(var, "")
         if val and val != "ollama":
             return val, f"env:{var}"
@@ -15495,7 +15828,7 @@ def resolve_key(prov):
             tok, src = resolve_claude_token()
             if tok:
                 return tok, src
-        if env_name in ("GEMINI_AUTH_TOKEN", "GOOGLE_OAUTH_TOKEN", "GEMINI_API_KEY", "GOOGLE_API_KEY") or ptype == "google-genai" or pid == "gemini":
+        if env_name in ("GEMINI_AUTH_TOKEN", "GOOGLE_OAUTH_TOKEN") or ptype == "google-genai" or pid == "gemini":
             tok, src = resolve_gemini_token()
             if tok:
                 return tok, src
@@ -15613,10 +15946,8 @@ def fetch_models_anthropic(base_url, key, tmo):
     return models
 
 def fetch_models_google(base_url, key, tmo):
-    # x-goog-api-key header for API keys; Bearer header for OAuth tokens
     base = (base_url or "https://generativelanguage.googleapis.com/v1beta").rstrip("/")
-    is_oauth = key.startswith("ya29.") or ("." in key and not key.startswith("AIza"))
-    hdr = {"Authorization": f"Bearer {key}"} if is_oauth else {"x-goog-api-key": key}
+    hdr = {"Authorization": f"Bearer {key}"}
     try:
         data = get_json(base + "/models", hdr, tmo)
         models = []
@@ -17239,7 +17570,7 @@ cmd_quota() {
         echo "Error: python3 is required for quota checks." >&2
         return 1
     fi
-    local helper gemini_key="" opt_offline=false quota_providers="" quota_cli=false
+    local helper gemini_token="" opt_offline=false quota_providers="" quota_cli=false
     local options=()
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -17266,15 +17597,15 @@ cmd_quota() {
         echo "Error: kimo-quota.py is missing; reinstall kimo or set KIMO_QUOTA_HELPER." >&2
         return 1
     fi
-    # Resolve the Gemini key only when the gemini provider will be queried.
+    # Resolve the Gemini token only when the gemini provider will be queried.
     if ! ${opt_offline} && ! ${quota_cli} && [[ -z "${quota_providers}" || ",${quota_providers// /}," =~ ,(all|gemini), ]]; then
         _resolve_gemini_auth
-        gemini_key=$(_gemini_resolve_key 2>/dev/null) || gemini_key=""
+        gemini_token=$(_gemini_resolve_token 2>/dev/null) || gemini_token=""
     fi
     ${OPT_JSON} && options+=(--json)
     [[ -n "${C_RESET}" ]] && options+=(--color)
     # Keep secrets out of argv. Native adapters resolve their own account auth.
-    KIMO_VERSION="${KIMO_VERSION}" KIMO_QUOTA_GEMINI_KEY="${gemini_key}" python3 "${helper}" \
+    KIMO_VERSION="${KIMO_VERSION}" KIMO_QUOTA_GEMINI_TOKEN="${gemini_token}" python3 "${helper}" \
         --local-url "${LOCAL_HOST_URL}" --remote-url "${REMOTE_HOST_URL}" \
         --web-url "${WEBBRIDGE_URL}" --host-mode "${HOST_MODE}" \
         --target-host "${TARGET_HOST}" --multi-hosts "${MULTI_HOSTS}" \
@@ -17302,7 +17633,7 @@ fi
 # first --host).
 if [[ "${HOST_MODE}" == "multi" ]] && command_needs_remote "${COMMAND}"; then
     case "${COMMAND}" in
-        check|ping|hosts|init|scan|discover|ps|top|list|ls|search|find|stop|unload|info|show|status|health|status-report|report|logs|log|rotate-token|rotate|install|setup|update|upgrade|doctor|diagnose|diag|config|cfg|completion|sync|freetier|free-tier|kimi-sync|gemini|gemini-sync|kimi-gemini|claude|claude-sync|kimi-claude|codex|codex-sync|kimi-codex|web|version|help|-h|--help|tunnel|quota|quotas|quote) ;;
+        check|ping|hosts|init|scan|discover|ps|top|list|ls|search|find|stop|unload|info|show|status|health|status-report|report|logs|log|rotate-token|rotate|install|setup|update|upgrade|doctor|diagnose|diag|config|cfg|completion|sync|freetier|free-tier|kimi-sync|gemini|gemini-sync|kimi-gemini|claude|claude-sync|kimi-claude|codex|codex-sync|kimi-codex|grok|grok-sync|xai|xai-sync|kimi-grok|kimi-xai|web|version|help|-h|--help|tunnel|quota|quotas|quote) ;;
         # rm finds each model's host itself (exact names, several models).
         rm|delete) ;;
         *)

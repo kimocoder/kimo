@@ -65,9 +65,11 @@ PROVIDER_MODELS: dict[str, list[tuple[str, str, int]]] = {
         ("qwen-plus", "Qwen Plus", 131072),
         ("qwen-turbo", "Qwen Turbo", 131072),
         ("qwen-max", "Qwen Max", 32768),
+        ("deepseek-4.1-pro", "DeepSeek 4.1 Pro", 500000),
         ("deepseek-v4.1-flash-1017", "DeepSeek V4.1 Flash", 500000),
     ],
     "qwencloud": [
+        ("qwen4-max-preview", "Qwen 4 Max Preview", 1000000),
         ("qwen3.8-max", "Qwen 3.8 Max", 1000000),
         ("qwen3.8-flash", "Qwen 3.8 Flash", 1000000),
         ("qwen3-coder-plus", "Qwen 3 Coder Plus", 1000000),

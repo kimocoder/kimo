@@ -12,6 +12,9 @@
 #       - 'kimo install gh' reports existing binary when already installed.
 #       - 'kimo install --force gh' refuses to replace/shadow an external system binary.
 #       - 'kimo update gh' and 'kimo update all' update an owned standalone gh in place.
+#       - a package-managed (dpkg/rpm/brew) gh is never overwritten: named
+#         'update gh' installs the official release in ~/.local/bin, and
+#         'update all' reports it as skipped.
 #   * Update flag contract:
 #       - rejects combining --check and --apply
 #       - restricts --allow-system-path strictly to named 'update gh' (not batch 'update all')
@@ -206,6 +209,39 @@ FAKE
         KIMO_ENFORCE_PATH=0 "${KIMO}" update all 2>&1 || true)"
     check_contains "update all updates a standalone gh" "Installed GitHub CLI 2.100.0 at ${UPGRADE_DIR}/gh." "${BATCH_OUT}"
     check "update all leaves the new gh release in place" "gh version 2.100.0 (2026-02-01)" "$("${UPGRADE_DIR}/gh" --version)"
+
+    # A package-managed gh (dpkg owns it) is never overwritten in place: the
+    # named update installs the official release in ~/.local/bin instead, and
+    # batch updates report it as skipped rather than attempting a refusal.
+    PKG_DIR="${TMPDIR_GH}/pkg_bin"
+    PKG_HOME="${TMPDIR_GH}/pkg_home"
+    mkdir -p "${PKG_DIR}" "${PKG_HOME}"
+    printf '#!/usr/bin/env bash\necho "gh version 2.46.0 (2025-12-13)"\n' > "${PKG_DIR}/gh"
+    cp "${UPGRADE_DIR}/curl" "${PKG_DIR}/curl"
+    cat > "${PKG_DIR}/dpkg-query" <<FAKE
+#!/usr/bin/env bash
+if [[ "\$1" == "-S" && "\$2" == "${PKG_DIR}/gh" ]]; then
+    echo "gh: \$2"
+    exit 0
+fi
+echo "dpkg-query: no path found matching pattern \${2:-}" >&2
+exit 1
+FAKE
+    chmod +x "${PKG_DIR}/gh" "${PKG_DIR}/curl" "${PKG_DIR}/dpkg-query"
+    PKG_SUM="$(sha256sum "${PKG_DIR}/gh")"
+    PKG_RC=0
+    PKG_OUT="$(HOME="${PKG_HOME}" PATH="${PKG_HOME}/.local/bin:${PKG_DIR}:/usr/bin:/bin" GH_FAKE_RELEASE="${RELEASE_DIR}" \
+        "${KIMO}" update gh 2>&1)" || PKG_RC=$?
+    check "named update gh succeeds for a package-managed gh" "0" "${PKG_RC}"
+    check_contains "package-managed gh warns instead of overwriting" "is managed by dpkg; installing the official release at ${PKG_HOME}/.local/bin/gh" "${PKG_OUT}"
+    check_contains "package-managed gh installs the official release in ~/.local/bin" "Installed GitHub CLI 2.100.0 at ${PKG_HOME}/.local/bin/gh." "${PKG_OUT}"
+    check "package-owned gh file is left untouched" "${PKG_SUM}" "$(sha256sum "${PKG_DIR}/gh")"
+    check "user-local gh runs the new release" "gh version 2.100.0 (2026-02-01)" "$("${PKG_HOME}/.local/bin/gh" --version)"
+
+    BATCH_PKG_OUT="$(HOME="${TMPDIR_GH}/pkg_batch_home" PATH="${PKG_DIR}:/usr/bin:/bin" GH_FAKE_RELEASE="${RELEASE_DIR}" \
+        KIMO_ENFORCE_PATH=0 "${KIMO}" update all 2>&1 || true)"
+    check_contains "update all reports package-managed gh as skipped" "package-managed (dpkg); use 'kimo update gh'" "${BATCH_PKG_OUT}"
+    check_not_contains "update all never installs over a package-managed gh" "Installed GitHub CLI 2.100.0 at ${TMPDIR_GH}/pkg_batch_home/.local/bin/gh." "${BATCH_PKG_OUT}"
 fi
 
 UPDATE_HELP="$("${KIMO}" update --help)"
@@ -291,9 +327,11 @@ if [[ "${LIVE}" -eq 1 ]]; then
             bad "kimo version resolution (${PARSED_VER}) does not match live gh (${LIVE_VER})"
         fi
 
-        # Check update eligibility test turn with --check
+        # Check update eligibility test turn with --check: an owned standalone
+        # path is updated in place, a package-managed one gets the official
+        # release in ~/.local/bin.
         UPDATE_ELIGIBLE="$("${KIMO}" update gh --allow-system-path --check 2>&1 || true)"
-        check_contains "kimo reports update eligibility for standalone gh" "eligible for an in-place update" "${UPDATE_ELIGIBLE}"
+        check_match "kimo reports update eligibility for gh" "(eligible for an in-place update|is managed by (dpkg|rpm|brew); 'kimo update gh' installs the official release)" "${UPDATE_ELIGIBLE}"
     fi
     echo
     echo "total: ${pass} passed, ${fail} failed"
