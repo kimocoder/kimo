@@ -11433,6 +11433,35 @@ _install_single_cli() {
                 echo "${C_DIM}    Run '${0##*/} install kimi --update' to update to latest version.${C_RESET}"
                 return 0
             fi
+            if [[ -n "${cur_bin}" && "${update}" == "true" ]]; then
+                local cur_ver_for_upgrade="" kimi_pkg=""
+                cur_ver_for_upgrade=$(_get_cli_version kimi)
+                kimi_pkg=$(_npm_package_for_bin "${cur_bin}" 2>/dev/null || true)
+                if [[ "${kimi_pkg}" == "@moonshot-ai/kimi-code" ]]; then
+                    echo "${C_CYAN}[*] Updating Kimi Code CLI via npm (@moonshot-ai/kimi-code)...${C_RESET}"
+                    if ! _npm_global_install @moonshot-ai/kimi-code; then
+                        echo "${C_RED}[!] Kimi Code CLI npm update failed (npm install -g @moonshot-ai/kimi-code).${C_RESET}" >&2
+                        return 1
+                    fi
+                    _npm_bin_on_path kimi "Kimi Code" || return 1
+                    echo "${C_GREEN}[✓] Successfully updated Kimi Code CLI ($(_get_cli_version kimi))!${C_RESET}"
+                    return 0
+                fi
+                if [[ "${cur_ver_for_upgrade}" =~ ^[0-9] ]]; then
+                    echo "${C_CYAN}[*] Updating Kimi Code CLI via 'kimi upgrade -y'...${C_RESET}"
+                    local update_status=0
+                    kimi upgrade -y </dev/null 2>&1 || update_status=$?
+                    if [[ "${update_status}" -eq 0 ]]; then
+                        local new_ver
+                        new_ver=$(_get_cli_version kimi)
+                        if [[ "${new_ver}" =~ ^[0-9] ]] && [[ "$(_compare_cli_versions kimi "${cur_ver_for_upgrade}" "${new_ver}")" != "ahead" ]]; then
+                            echo "${C_GREEN}[✓] Successfully updated Kimi Code CLI (${new_ver})!${C_RESET}"
+                            return 0
+                        fi
+                    fi
+                    echo "${C_YELLOW}[*] 'kimi upgrade -y' did not complete the upgrade; falling back to installer...${C_RESET}"
+                fi
+            fi
             echo "${C_CYAN}[*] Installing Kimi Code CLI (via code.kimi.com)...${C_RESET}"
             if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
                 echo "${C_RED}Error: curl or wget is required to install Kimi Code CLI.${C_RESET}" >&2
@@ -12072,12 +12101,31 @@ _grok_latest_version() {
 }
 
 _kimi_latest_version() {
-    local latest
-    # Same feed the official installer resolves. It redirects to a CDN, so a
-    # cold DNS/TLS handshake on both hops can exceed a 2s connect timeout.
-    latest=$(curl -fsSL --connect-timeout 5 -m 10 --retry 1 --retry-delay 1 \
+    local cdn_raw npm_raw cdn_ver="" npm_ver=""
+    # Check both the official standalone CDN pointer and the official scoped
+    # npm package (@moonshot-ai/kimi-code): Moonshot publishes new releases to
+    # npm before promoting the CDN's /latest pointer, which otherwise makes an
+    # up-to-date local install look 'ahead' of latest.
+    cdn_raw=$(curl -fsSL --connect-timeout 5 -m 10 --retry 1 --retry-delay 1 \
         https://code.kimi.com/kimi-code/latest 2>/dev/null | tr -d '[:space:]' || true)
-    _plain_version "${latest#v}" || true
+    cdn_ver=$(_plain_version "${cdn_raw#v}" || true)
+    npm_raw=$(_bounded_update_lookup npm view @moonshot-ai/kimi-code version 2>/dev/null || true)
+    if [[ -z "${npm_raw}" ]] && command -v curl >/dev/null 2>&1; then
+        npm_raw=$(curl -fsSL --connect-timeout 2 -m 4 https://registry.npmjs.org/@moonshot-ai/kimi-code/latest 2>/dev/null \
+            | grep -oE '"version"[[:space:]]*:[[:space:]]*"[^"]+"' | head -n 1 | cut -d'"' -f4 || true)
+    fi
+    npm_ver=$(_plain_version "${npm_raw#v}" || true)
+    if [[ -n "${cdn_ver}" && -n "${npm_ver}" ]]; then
+        if [[ "$(_compare_cli_versions kimi "${cdn_ver}" "${npm_ver}")" == "update available" ]]; then
+            printf '%s\n' "${npm_ver}"
+        else
+            printf '%s\n' "${cdn_ver}"
+        fi
+    elif [[ -n "${npm_ver}" ]]; then
+        printf '%s\n' "${npm_ver}"
+    elif [[ -n "${cdn_ver}" ]]; then
+        printf '%s\n' "${cdn_ver}"
+    fi
 }
 
 # True when <bin> resolves into the release tree of OpenAI's standalone
